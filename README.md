@@ -100,6 +100,7 @@ python3 scripts/install.py \
 | GPU kernel 或带 benchmark 的本地优化 | `kersor` skill → `compose optimize` → 当前 `commands/optimize.md` | Session v2、Attempt Result、实测 benchmark |
 | 通用本地任务的固定验证循环 | `kersor-task-v1` → `commands/evolve.md` | `output.json` 与 verifier evidence |
 | 自主 Workflow / Mission | `kersor-mission-v1` → `commands/evolve.md` | `result.json`、artifact receipts、独立 verifier |
+| 固定 HF 模型到 ApxInf 部署 | `kersor` adapter → KerSor `deploy-hf-model-to-apxinf` skill → 静态 Mission task | Host model/deployment gates、`result.json`、独立 verifier |
 | 状态、恢复、诊断 | 先调用 `kersor_status`，再读取相应 command protocol | 当前磁盘 Session，不依赖聊天记忆 |
 
 不要把 CUDA Workflow 硬套到 Python、VLIW、Verilog 或普通工程任务。任务类型不匹配时，稳定 `optimize` 路径应先确定性拒绝不兼容的已发布 Workflow，再通过有界 workflow authoring 创作 task-native Proposal；workflow evolution 只属于显式 research runner。任务自己的测试命令始终是唯一验收门。
