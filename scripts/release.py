@@ -1329,12 +1329,22 @@ def _seal_read_only(root: Path) -> None:
 
 def _make_tree_writable(root: Path) -> None:
     """Restore owner write permission so a failed staging tree is removable."""
-    if not root.exists():
+    try:
+        root_metadata = root.lstat()
+    except OSError:
+        return
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
         return
     paths = list(_walk_without_links(root))
     for path in paths:
         try:
-            path.chmod(0o700 if path.is_dir() else 0o600)
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                continue
+            if stat.S_ISDIR(metadata.st_mode):
+                path.chmod(0o700)
+            elif stat.S_ISREG(metadata.st_mode):
+                path.chmod(0o600)
         except OSError:
             pass
     try:
@@ -1379,7 +1389,7 @@ def prepare_release(
         authority_snapshot = stage / ".authority-source"
         materialize_git_snapshot(personal_repository, personal_commit, personal)
         materialize_git_snapshot(core_repository, core_commit, core)
-        materialize_git_snapshot(
+        _materialize_authority_git_snapshot(
             authority_repository,
             authority_commit,
             authority_snapshot,
@@ -1908,20 +1918,136 @@ def _require_commit(repository: Path, commit: str) -> None:
         raise ReleaseError(f"Git object is not the requested commit: {commit}")
 
 
-def _extract_git_archive(archive: bytes, destination: Path) -> None:
+def _internal_link_target(
+    link: PurePosixPath,
+    raw_target: str,
+) -> PurePosixPath:
+    """Normalize one relative archive link target without leaving its root."""
+    if not raw_target or PurePosixPath(raw_target).is_absolute():
+        raise ReleaseError(f"Git archive link target escapes its snapshot: {raw_target}")
+    parts = list(link.parent.parts)
+    for part in PurePosixPath(raw_target).parts:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if not parts:
+                raise ReleaseError(
+                    f"Git archive link target escapes its snapshot: {raw_target}"
+                )
+            parts.pop()
+            continue
+        parts.append(part)
+    return PurePosixPath(*parts)
+
+
+def _validated_archive_links(
+    links: dict[PurePosixPath, str],
+    entries: dict[PurePosixPath, str],
+) -> dict[PurePosixPath, tuple[PurePosixPath, bool]]:
+    """Resolve archive links against its declared tree and reject unsafe graphs."""
+    result: dict[PurePosixPath, tuple[PurePosixPath, bool]] = {}
+    for link, raw_target in links.items():
+        current = _internal_link_target(link, raw_target)
+        for length in range(1, len(current.parts) + 1):
+            prefix = PurePosixPath(*current.parts[:length])
+            if prefix in links:
+                raise ReleaseError(
+                    f"Git archive link cycle or chain is not allowed: {link}"
+                )
+        kind = entries.get(current)
+        if kind not in {"file", "directory"}:
+            raise ReleaseError(
+                f"Git archive link target is dangling: {link} -> {raw_target}"
+            )
+        if kind == "directory" \
+                and link.parts[:len(current.parts)] == current.parts:
+            raise ReleaseError(f"Git archive link cycle: {link}")
+        result[link] = (current, kind == "directory")
+
+    graph: dict[PurePosixPath, list[PurePosixPath]] = {}
+    for link, (target, target_is_directory) in result.items():
+        graph[link] = []
+        if not target_is_directory:
+            continue
+        graph[link] = sorted(
+            nested
+            for nested in links
+            if nested.parts[:len(target.parts)] == target.parts
+        )
+    visiting: set[PurePosixPath] = set()
+    visited: set[PurePosixPath] = set()
+
+    def visit(link: PurePosixPath) -> None:
+        if link in visiting:
+            raise ReleaseError(f"Git archive link cycle: {link}")
+        if link in visited:
+            return
+        visiting.add(link)
+        for nested in graph[link]:
+            visit(nested)
+        visiting.remove(link)
+        visited.add(link)
+
+    for link in sorted(links):
+        visit(link)
+    return result
+
+
+def _extract_git_archive(
+    archive: bytes,
+    destination: Path,
+    *,
+    allow_internal_symlinks: bool = False,
+) -> None:
     destination.mkdir(parents=True, exist_ok=False)
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as stream:
+        members: dict[PurePosixPath, tarfile.TarInfo] = {}
+        entries: dict[PurePosixPath, str] = {PurePosixPath(): "directory"}
+        links: dict[PurePosixPath, str] = {}
         for member in stream.getmembers():
             relative = _safe_relative(member.name.rstrip("/"), "Git archive entry")
-            target = destination / relative
+            archive_path = PurePosixPath(relative.as_posix())
+            if archive_path in members:
+                raise ReleaseError(f"Git archive contains a duplicate entry: {member.name}")
+            members[archive_path] = member
+            if member.isdir():
+                entries[archive_path] = "directory"
+                continue
+            if member.isfile():
+                entries[archive_path] = "file"
+                continue
+            if member.issym() and allow_internal_symlinks:
+                entries[archive_path] = "symlink"
+                links[archive_path] = member.linkname
+                continue
+            if member.islnk() or member.issym() or not member.isfile():
+                raise ReleaseError(
+                    f"Git archive contains a link or special file: {member.name}"
+                )
+
+        for archive_path, kind in tuple(entries.items()):
+            if not archive_path.parts:
+                continue
+            for length in range(1, len(archive_path.parts)):
+                parent = PurePosixPath(*archive_path.parts[:length])
+                parent_kind = entries.setdefault(parent, "directory")
+                if parent_kind != "directory":
+                    raise ReleaseError(
+                        f"Git archive entry has a non-directory parent: {archive_path}"
+                    )
+        resolved_links = _validated_archive_links(links, entries)
+
+        for archive_path, member in sorted(
+            members.items(),
+            key=lambda item: (len(item[0].parts), item[0].as_posix()),
+        ):
+            target = destination.joinpath(*archive_path.parts)
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
                 target.chmod(0o755)
                 continue
-            if not member.isfile():
-                raise ReleaseError(
-                    f"Git archive contains a link or special file: {member.name}"
-                )
+            if member.issym():
+                continue
             target.parent.mkdir(parents=True, exist_ok=True)
             extracted = stream.extractfile(member)
             if extracted is None:
@@ -1929,6 +2055,21 @@ def _extract_git_archive(archive: bytes, destination: Path) -> None:
             with target.open("xb") as output:
                 shutil.copyfileobj(extracted, output)
             target.chmod(0o755 if member.mode & 0o111 else 0o644)
+
+        for archive_path, member in sorted(
+            ((path, members[path]) for path in links),
+            key=lambda item: item[0].as_posix(),
+        ):
+            target = destination.joinpath(*archive_path.parts)
+            _, target_is_directory = resolved_links[archive_path]
+            target.symlink_to(member.linkname, target_is_directory=target_is_directory)
+            try:
+                physical = target.resolve(strict=True)
+                physical.relative_to(destination.resolve(strict=True))
+            except (OSError, RuntimeError, ValueError) as error:
+                raise ReleaseError(
+                    f"Git archive link does not resolve inside its snapshot: {archive_path}"
+                ) from error
 
 
 def _gitlinks(repository: Path, commit: str) -> list[tuple[Path, str]]:
@@ -1955,6 +2096,8 @@ def _materialize_git_snapshot(
     commit: str,
     destination: Path,
     seen: set[tuple[Path, str]],
+    *,
+    allow_internal_symlinks: bool,
 ) -> None:
     repository = repository.resolve()
     _require_commit(repository, commit)
@@ -1964,7 +2107,11 @@ def _materialize_git_snapshot(
     seen.add(identity)
     try:
         archive = _git_bytes(repository, "archive", "--format=tar", commit)
-        _extract_git_archive(archive, destination)
+        _extract_git_archive(
+            archive,
+            destination,
+            allow_internal_symlinks=allow_internal_symlinks,
+        )
         for relative, child_commit in _gitlinks(repository, commit):
             child_repository = repository / relative
             try:
@@ -1984,6 +2131,7 @@ def _materialize_git_snapshot(
                 child_commit,
                 target,
                 seen,
+                allow_internal_symlinks=allow_internal_symlinks,
             )
     finally:
         seen.remove(identity)
@@ -1997,7 +2145,30 @@ def materialize_git_snapshot(
     """Materialize one commit and every pinned submodule from Git objects."""
     if destination.exists():
         raise ReleaseError(f"snapshot destination already exists: {destination}")
-    _materialize_git_snapshot(repository, commit, destination, set())
+    _materialize_git_snapshot(
+        repository,
+        commit,
+        destination,
+        set(),
+        allow_internal_symlinks=False,
+    )
+
+
+def _materialize_authority_git_snapshot(
+    repository: Path,
+    commit: str,
+    destination: Path,
+) -> None:
+    """Materialize one build-only authority snapshot with safe internal links."""
+    if destination.exists():
+        raise ReleaseError(f"snapshot destination already exists: {destination}")
+    _materialize_git_snapshot(
+        repository,
+        commit,
+        destination,
+        set(),
+        allow_internal_symlinks=True,
+    )
 
 
 def _read_json(path: Path, label: str) -> dict[str, object]:

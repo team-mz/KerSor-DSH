@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -193,6 +195,121 @@ class ReleaseParityTests(unittest.TestCase):
             (destination / "value.txt").read_text(encoding="utf-8"),
             "committed\n",
         )
+
+    def test_default_materializer_still_rejects_internal_links(self) -> None:
+        repository = self.root / "strict-links"
+        init_repository(repository)
+        write(repository / "target.txt", "committed\n")
+        (repository / "alias.txt").symlink_to("target.txt")
+        commit = commit_all(repository)
+
+        with self.assertRaisesRegex(release.ReleaseError, "link or special file"):
+            release.materialize_git_snapshot(
+                repository,
+                commit,
+                self.root / "strict-link-snapshot",
+            )
+
+    def test_authority_materializer_rejects_unsafe_internal_links(self) -> None:
+        fixtures = {
+            "absolute": ("alias", "/tmp/not-authority", "escapes"),
+            "escape": ("nested/alias", "../../outside", "escapes"),
+            "dangling": ("alias", "missing", "dangling"),
+            "ancestor-cycle": ("nested/alias", "..", "cycle"),
+        }
+        for name, (link_name, target, error) in fixtures.items():
+            with self.subTest(name=name):
+                repository = self.root / f"unsafe-{name}"
+                init_repository(repository)
+                write(repository / "nested" / "keep.txt", "committed\n")
+                link = repository / link_name
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.symlink_to(target)
+                commit = commit_all(repository)
+
+                with self.assertRaisesRegex(release.ReleaseError, error):
+                    release._materialize_authority_git_snapshot(
+                        repository,
+                        commit,
+                        self.root / f"unsafe-{name}-snapshot",
+                    )
+
+        repository = self.root / "unsafe-cycle"
+        init_repository(repository)
+        (repository / "first").symlink_to("second")
+        (repository / "second").symlink_to("first")
+        commit = commit_all(repository)
+        with self.assertRaisesRegex(release.ReleaseError, "cycle"):
+            release._materialize_authority_git_snapshot(
+                repository,
+                commit,
+                self.root / "unsafe-cycle-snapshot",
+            )
+
+        repository = self.root / "unsafe-chain"
+        init_repository(repository)
+        write(repository / "target.txt", "committed\n")
+        (repository / "second").symlink_to("target.txt")
+        (repository / "first").symlink_to("second")
+        commit = commit_all(repository)
+        with self.assertRaisesRegex(release.ReleaseError, "chain"):
+            release._materialize_authority_git_snapshot(
+                repository,
+                commit,
+                self.root / "unsafe-chain-snapshot",
+            )
+
+        repository = self.root / "unsafe-directory-cycle"
+        init_repository(repository)
+        write(repository / "first" / "keep.txt", "first\n")
+        write(repository / "second" / "keep.txt", "second\n")
+        (repository / "first" / "back").symlink_to("../second")
+        (repository / "second" / "back").symlink_to("../first")
+        commit = commit_all(repository)
+        with self.assertRaisesRegex(release.ReleaseError, "cycle"):
+            release._materialize_authority_git_snapshot(
+                repository,
+                commit,
+                self.root / "unsafe-directory-cycle-snapshot",
+            )
+
+    def test_authority_archive_rejects_hardlinks_and_special_files(self) -> None:
+        for name, kind in (
+            ("hardlink", tarfile.LNKTYPE),
+            ("fifo", tarfile.FIFOTYPE),
+        ):
+            with self.subTest(name=name):
+                buffer = io.BytesIO()
+                with tarfile.open(fileobj=buffer, mode="w") as archive:
+                    target = tarfile.TarInfo("target.txt")
+                    target.size = 1
+                    archive.addfile(target, io.BytesIO(b"x"))
+                    invalid = tarfile.TarInfo(name)
+                    invalid.type = kind
+                    invalid.linkname = "target.txt"
+                    archive.addfile(invalid)
+
+                with self.assertRaisesRegex(
+                    release.ReleaseError,
+                    "link or special file",
+                ):
+                    release._extract_git_archive(
+                        buffer.getvalue(),
+                        self.root / f"archive-{name}",
+                        allow_internal_symlinks=True,
+                    )
+
+    def test_failed_stage_cleanup_never_chmods_a_link_target(self) -> None:
+        outside = self.root / "outside.txt"
+        write(outside, "must remain read-only\n")
+        outside.chmod(0o400)
+        stage = self.root / "failed-stage"
+        stage.mkdir()
+        (stage / "outside-link").symlink_to(outside)
+
+        release._make_tree_writable(stage)
+
+        self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o400)
 
     def test_expands_every_pinned_submodule_from_git_objects(self) -> None:
         child = self.root / "child"
@@ -694,6 +811,34 @@ class ReleaseWorkflowTests(unittest.TestCase):
         for package in packages:
             tarball = self.release_root / package["tarball"]
             self.assertEqual(file_sha256(tarball), tarball_hashes[package["name"]])
+
+    def test_prepare_accepts_internal_authority_links_but_drops_them(self) -> None:
+        write(
+            self.authority / ".agents" / "skills" / "fixture" / "SKILL.md",
+            "# authority-only fixture\n",
+        )
+        (self.authority / ".claude").mkdir()
+        (self.authority / ".claude" / "skills").symlink_to("../.agents/skills")
+        self.authority_commit = commit_all(
+            self.authority,
+            "add internal authority link",
+        )
+        manifest_path = self.personal / "plugins" / "dsh-mirror.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["authority"]["revision"] = self.authority_commit
+        write(manifest_path, json.dumps(manifest, indent=2) + "\n")
+        self.personal_commit = commit_all(
+            self.personal,
+            "bind authority link commit",
+        )
+
+        self.prepare()
+
+        self.assertFalse((self.release_root / ".authority-source").exists())
+        self.assertEqual(
+            release.filesystem_alias_violations([self.release_root], []),
+            [],
+        )
 
     def test_sync_accepts_only_receipted_ignored_build_outputs(self) -> None:
         with mock.patch.multiple(
