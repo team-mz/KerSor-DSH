@@ -132,8 +132,8 @@ def manifest_violations(root: Path = ROOT, path: Path = MANIFEST) -> list[str]:
             character not in "0123456789abcdef" for character in revision
         ):
             violations.append(f"{path}: authority.revision must be a full Git SHA")
-        if not isinstance(authority.get("reconciled"), bool):
-            violations.append(f"{path}: authority.reconciled must be boolean")
+        if authority.get("reconciled") is not True:
+            violations.append(f"{path}: authority.reconciled must be true")
 
     files = manifest.get("files")
     if not isinstance(files, list):
