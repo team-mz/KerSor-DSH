@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +20,13 @@ SPEC = importlib.util.spec_from_file_location("dsh_plugin_install", ROOT / "scri
 assert SPEC is not None and SPEC.loader is not None
 INSTALLER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(INSTALLER)
+BRIDGE_SPEC = importlib.util.spec_from_file_location(
+    "dsh_kersor_bridge",
+    ROOT / "presets" / "kersor" / "bin" / "kersor_bridge.py",
+)
+assert BRIDGE_SPEC is not None and BRIDGE_SPEC.loader is not None
+BRIDGE = importlib.util.module_from_spec(BRIDGE_SPEC)
+BRIDGE_SPEC.loader.exec_module(BRIDGE)
 
 
 STANDARD = """# The `standard` agent preset.
@@ -103,7 +111,13 @@ class InstallTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def run_install(self, *, force: bool = False):
+    def run_install(
+        self,
+        *,
+        force: bool = False,
+        claude_command: Path | None = None,
+        claude_model: str | None = None,
+    ):
         """Install into the isolated DSH home."""
         return INSTALLER.install(
             dsh_home=self.dsh_home,
@@ -111,6 +125,8 @@ class InstallTests(unittest.TestCase):
             kersor_root=self.kersor,
             force=force,
             dry_run=False,
+            claude_command=claude_command,
+            claude_model=claude_model,
         )
 
     def test_install_renders_delta_and_local_root(self) -> None:
@@ -121,15 +137,82 @@ class InstallTests(unittest.TestCase):
         self.assertIn("The `kersor` agent preset", composition)
         self.assertIn(INSTALLER.KERSOR_LINE, composition)
         self.assertIn("name: './plugins/kersor-status.mjs'", composition)
+        self.assertIn("name: './plugins/kersor-evolve.mjs'", composition)
         self.assertIn("name: '@deepseek-ai/dsh-kersor/control'", composition)
         self.assertIn("customSkillDirs:", composition)
         self.assertIn(str((destination / "skills").resolve()), composition)
         self.assertNotIn(str(self.kersor), composition)
         self.assertTrue((destination / "plugins" / "kersor-status.mjs").is_file())
+        self.assertTrue((destination / "plugins" / "kersor-evolve.mjs").is_file())
         self.assertEqual(
             (destination / ".local" / "kersor-root").read_text(encoding="utf-8"),
             f"{self.kersor.resolve()}\n",
         )
+        runtime_tools = json.loads(
+            (destination / ".local" / "runtime-tools.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(runtime_tools["schema_version"], 1)
+        self.assertEqual(
+            runtime_tools["expected_outer_filesystem_policy"],
+            "workspace-write",
+        )
+        self.assertTrue(Path(runtime_tools["tools"]["bash"]).is_absolute())
+        self.assertTrue(Path(runtime_tools["tools"]["python3"]).is_absolute())
+
+    def test_runtime_tool_snapshot_freezes_an_absolute_claude_path(self) -> None:
+        fake_claude = self.root / "bin" / "claude"
+        fake_claude.parent.mkdir()
+        fake_claude.write_text("#!/bin/sh\n", encoding="utf-8")
+        with mock.patch.object(
+            INSTALLER.shutil,
+            "which",
+            return_value=str(fake_claude),
+        ):
+            tools = INSTALLER.resolve_runtime_tools()
+        self.assertEqual(tools["claude"], str(fake_claude.absolute()))
+
+    def test_install_freezes_an_explicit_claude_compatible_route(self) -> None:
+        wrapper = self.root / "trusted-bin" / "claude-infini"
+        wrapper.parent.mkdir()
+        wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        wrapper.chmod(0o700)
+
+        destination, _, _ = self.run_install(
+            claude_command=wrapper,
+            claude_model="deepseek-v4-flash",
+        )
+        manifest = json.loads(
+            (destination / ".local" / "runtime-tools.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(manifest["tools"]["claude"], str(wrapper.resolve()))
+        self.assertEqual(manifest["models"]["claude"], "deepseek-v4-flash")
+
+        workspace = self.root / "route-workspace"
+        workspace.mkdir()
+        self.prepare_installed_generic_tools(destination)
+        with mock.patch.object(
+            BRIDGE,
+            "RUNTIME_TOOLS_FILE",
+            destination / ".local" / "runtime-tools.json",
+        ):
+            tools = BRIDGE.trusted_runtime_tools(workspace, "claude")
+        environment = BRIDGE.generic_evolve_environment(tools, runtime="claude")
+        self.assertEqual(environment["KERSOR_CLAUDE_COMMAND"], str(wrapper.resolve()))
+        self.assertEqual(environment["KERSOR_CLAUDE_MODEL"], "deepseek-v4-flash")
+
+    def test_install_rejects_an_invalid_explicit_claude_route(self) -> None:
+        missing = self.root / "missing-claude"
+        with self.assertRaisesRegex(RuntimeError, "not an executable"):
+            self.run_install(
+                claude_command=missing,
+                claude_model="deepseek-v4-flash",
+            )
+        with self.assertRaisesRegex(RuntimeError, "without whitespace"):
+            self.run_install(claude_model="deepseek v4 flash")
 
     def test_identical_reinstall_is_a_noop(self) -> None:
         destination, _, _ = self.run_install()
@@ -151,6 +234,1365 @@ class InstallTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout.strip(), str(self.kersor.resolve()))
+
+    def test_installed_bridge_can_resolve_recorded_checkout_despite_override(self) -> None:
+        destination, _, _ = self.run_install()
+        environment = dict(os.environ)
+        environment["KERSOR_ROOT"] = str(self.root / "untrusted-override")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "root",
+                "--recorded",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), str(self.kersor.resolve()))
+
+    def prepare_generic_evolve_checkout(self) -> None:
+        """Install deterministic generic runner stubs in the fake checkout."""
+        (self.kersor / "config").mkdir(exist_ok=True)
+        for name, sandbox in (
+            ("runtime-codex.json", "workspace-write"),
+            ("runtime-codex-autonomous.json", "read-only"),
+            ("runtime-codex-autonomous-write.json", "workspace-write"),
+        ):
+            (self.kersor / "config" / name).write_text(
+                json.dumps({
+                    "contract_version": "akw-js-runtime-v1",
+                    "budget": {"total_tokens": 4_000_000},
+                    "broker": {
+                        "type": "codex-exec",
+                        "sandbox": sandbox,
+                        "approval_policy": "never",
+                    },
+                }),
+                encoding="utf-8",
+            )
+        (self.kersor / "config" / "runtime-claude-autonomous.json").write_text(
+            json.dumps({
+                "contract_version": "akw-js-runtime-v1",
+                "budget": {"total_tokens": 4_000_000},
+                "broker": {
+                    "type": "claude-code-exec",
+                    "command": "claude",
+                    "permission_mode": "dontAsk",
+                    "read_only_tools": ["Read", "Glob", "Grep"],
+                    "mutation_tools": ["Read", "Glob", "Grep", "Edit", "Write"],
+                    "safe_mode": True,
+                    "no_session_persistence": True,
+                    "preflight": True,
+                    "filesystem_sandbox": "required",
+                },
+            }),
+            encoding="utf-8",
+        )
+        (self.kersor / "config" / "runtime-dsh-autonomous.json").write_text(
+            json.dumps({
+                "contract_version": "akw-js-runtime-v1",
+                "budget": {"total_tokens": 4_000_000},
+                "broker": {
+                    "type": "dsh-host-rpc",
+                    "protocol": "kersor-dsh-host-rpc-v1",
+                    "socket_env": "KERSOR_DSH_RPC_SOCKET",
+                    "nonce_env": "KERSOR_DSH_RPC_NONCE",
+                    "max_frame_bytes": 16 * 1024 * 1024,
+                    "provider": "deepseek-official",
+                    "model": "deepseek-v4-flash",
+                    "timeout_seconds": 900,
+                },
+            }),
+            encoding="utf-8",
+        )
+        (self.kersor / "scripts" / "create-session.py").write_text(
+            "import json, pathlib, sys\n"
+            "payload = json.load(sys.stdin)\n"
+            "target = pathlib.Path(sys.argv[1])\n"
+            "(target / 'session-config.json').write_text(json.dumps(payload['config']))\n"
+            "(target / 'state.json').write_text(json.dumps(payload['state']))\n",
+            encoding="utf-8",
+        )
+        (self.kersor / "scripts" / "evolve.sh").write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "contract=$1\n"
+            "  printf '%s\\n' \"${KERSOR_ROOT-unset}\" "
+            "\"${KERSOR_AUTONOMOUS_RUNNER-unset}\" "
+            "\"${KERSOR_NODE_BIN-unset}\" \"${KERSOR_CODEX_COMMAND-unset}\" "
+            "\"${KERSOR_CODEX_AUTH_HOME-unset}\" "
+            "\"${BASH_ENV-unset}\" \"${PYTHONPATH-unset}\" "
+            "\"${NODE_OPTIONS-unset}\" \"${PATH-unset}\" "
+            "\"${HOME-unset}\" \"${TMPDIR-unset}\" "
+            "\"${KERSOR_CODEX_OUTER_SANDBOX-unset}\" "
+            "\"${KERSOR_CLAUDE_COMMAND-unset}\" "
+            "\"${KERSOR_CLAUDE_MODEL-unset}\" "
+            "\"${KERSOR_CLAUDE_EFFORT-unset}\" "
+            "\"${CLAUDECODE-unset}\" "
+            "\"${CLAUDE_CONFIG_DIR-unset}\" "
+            "\"${ANTHROPIC_MODEL-unset}\" "
+            "\"${ANTHROPIC_BASE_URL-unset}\" "
+            "> \"${contract}.env\"\n"
+            "printf '%s\\n' \"$@\" > \"${contract}.argv\"\n",
+            encoding="utf-8",
+        )
+        (self.kersor / "scripts" / "run-autonomous-workflow.py").write_text(
+            "raise SystemExit(0)\n",
+            encoding="utf-8",
+        )
+
+    def prepare_installed_generic_tools(self, destination: Path) -> None:
+        """Keep generic bridge tests independent of a developer Codex install."""
+        path = destination / ".local" / "runtime-tools.json"
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        for name in ("bash", "python3", "node", "jq", "codex", "claude"):
+            manifest["tools"].setdefault(name, sys.executable)
+        auth_home = destination / ".local" / "test-codex-auth"
+        auth_home.mkdir()
+        (auth_home / "auth.json").write_text("{}\n", encoding="utf-8")
+        test_home = destination / ".local" / "test-home"
+        test_home.mkdir()
+        manifest["environment"]["home"] = str(test_home)
+        manifest["environment"]["codex_auth_home"] = str(auth_home)
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def generic_mission(self, mission_id: str) -> dict[str, object]:
+        """Return a complete minimal Mission header for bridge security tests."""
+        return {
+            "mission_id": mission_id,
+            "goal": f"exercise {mission_id}",
+            "authority": [],
+            "required_artifacts": [],
+            "required_facts": {},
+            "max_revisions": 1,
+        }
+
+    def candidate_verifier_capabilities(self) -> list[dict[str, object]]:
+        """Return one DSH-admissible transactional agent and sealed verifier."""
+        return [
+            {
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": ["candidate.py"],
+                "candidate_verifier": "verify",
+            },
+            {
+                "name": "verify",
+                "side_effect": "read",
+                "produces_artifacts": ["verification.json"],
+                "produces_facts": ["passed"],
+                "execution": {
+                    "kind": "host_evaluator",
+                    "retryable": False,
+                    "request": {
+                        "protocol": "command-v1",
+                        "argv": ["python3", "-m", "unittest"],
+                        "filesystem_policy": "read-only",
+                        "network_policy": "denied",
+                        "output_policy": "sealed",
+                        "timeout_seconds": 120,
+                        "max_output_bytes": 4_194_304,
+                    },
+                    "fact_projections": [
+                        {"output_name": "passed", "result_path": "passed"},
+                        {"output_name": "code", "result_path": "exit_code"},
+                        {"output_name": "timeout", "result_path": "timed_out"},
+                        {
+                            "output_name": "artifacts",
+                            "result_path": "artifact_set_sha256",
+                        },
+                    ],
+                },
+            },
+        ]
+
+    def test_generic_host_evaluator_has_one_sealed_candidate_call_surface(
+        self,
+    ) -> None:
+        capabilities = self.candidate_verifier_capabilities()
+        self.assertTrue(BRIDGE.mission_needs_write({"capabilities": capabilities}))
+        without_output_limit = json.loads(json.dumps(capabilities))
+        without_output_limit[1]["execution"]["request"].pop("max_output_bytes")
+        self.assertTrue(
+            BRIDGE.mission_needs_write({"capabilities": without_output_limit})
+        )
+
+        standalone = json.loads(json.dumps(capabilities))
+        standalone[0].pop("candidate_verifier")
+        with self.assertRaisesRegex(RuntimeError, "exactly one"):
+            BRIDGE.mission_needs_write({"capabilities": standalone})
+
+        duplicate = json.loads(json.dumps(capabilities))
+        duplicate.insert(1, {
+            "name": "second_mutator",
+            "side_effect": "write",
+            "transaction_artifacts": ["other.py"],
+            "candidate_verifier": "verify",
+        })
+        with self.assertRaisesRegex(RuntimeError, "exactly one"):
+            BRIDGE.mission_needs_write({"capabilities": duplicate})
+
+        wrong_kind = json.loads(json.dumps(capabilities))
+        wrong_kind[0]["candidate_verifier"] = "another_agent"
+        wrong_kind.insert(1, {"name": "another_agent", "side_effect": "read"})
+        with self.assertRaisesRegex(RuntimeError, "must reference a Host evaluator"):
+            BRIDGE.mission_needs_write({"capabilities": wrong_kind})
+
+    def test_generic_host_evaluator_rejects_unsealed_or_unbounded_requests(
+        self,
+    ) -> None:
+        cases = [
+            (("request", "network_policy"), None, "network_policy=denied"),
+            (("request", "network_policy"), "allowed", "network_policy=denied"),
+            (("request", "output_policy"), None, "output_policy=sealed"),
+            (("request", "output_policy"), "raw", "output_policy=sealed"),
+            (("request", "timeout_seconds"), None, "timeout_seconds"),
+            (("request", "timeout_seconds"), 0, "timeout_seconds"),
+            (("request", "timeout_seconds"), 121, "timeout_seconds"),
+            (("request", "timeout_seconds"), True, "timeout_seconds"),
+            (("request", "max_output_bytes"), 0, "max_output_bytes"),
+            (("request", "max_output_bytes"), 4_194_305, "max_output_bytes"),
+            (("request", "max_output_bytes"), True, "max_output_bytes"),
+            (("projection", "result_path"), "stdout_json.passed", "fact_projections"),
+            (("projection", "result_path"), "stderr", "fact_projections"),
+        ]
+        for path_spec, replacement, message in cases:
+            with self.subTest(path=path_spec, replacement=replacement):
+                capabilities = self.candidate_verifier_capabilities()
+                execution = capabilities[1]["execution"]
+                assert isinstance(execution, dict)
+                if path_spec[0] == "request":
+                    request = execution["request"]
+                    assert isinstance(request, dict)
+                    request[path_spec[1]] = replacement
+                else:
+                    projections = execution["fact_projections"]
+                    assert isinstance(projections, list)
+                    projections[0][path_spec[1]] = replacement
+                with self.assertRaisesRegex(RuntimeError, message):
+                    BRIDGE.mission_needs_write({"capabilities": capabilities})
+
+    def test_outer_sandbox_attestation_is_host_only_and_leaves_no_probes(
+        self,
+    ) -> None:
+        workspace = self.root / "probe-workspace"
+        trusted_home = self.root / "probe-home"
+        workspace.mkdir()
+        trusted_home.mkdir()
+        tools = {
+            name: sys.executable for name in BRIDGE.GENERIC_TOOL_NAMES
+        }
+        tools.update({
+            "environment_home": str(trusted_home),
+            "environment_temp_dir": str(self.root),
+            "expected_outer_filesystem_policy": "workspace-write",
+            "model_claude": "deepseek-v4-flash",
+        })
+        probe_glob = f"{BRIDGE.OUTER_SANDBOX_PROBE_PREFIX}*"
+
+        self.assertIsNone(
+            BRIDGE.attest_outer_workspace_write(workspace, tools)
+        )
+        self.assertEqual(list(workspace.glob(probe_glob)), [])
+        self.assertEqual(list(trusted_home.glob(probe_glob)), [])
+
+        real_open = BRIDGE.os.open
+
+        def deny_home(path, flags, mode=0o777):
+            if Path(path).parent == trusted_home:
+                raise PermissionError(1, "denied")
+            return real_open(path, flags, mode)
+
+        with mock.patch.object(BRIDGE.os, "open", side_effect=deny_home):
+            attested = BRIDGE.attest_outer_workspace_write(workspace, tools)
+        self.assertEqual(attested, "workspace-write")
+        self.assertEqual(list(workspace.glob(probe_glob)), [])
+        self.assertEqual(list(trusted_home.glob(probe_glob)), [])
+
+        def deny_workspace(path, flags, mode=0o777):
+            if Path(path).parent == workspace:
+                raise PermissionError(1, "denied")
+            return real_open(path, flags, mode)
+
+        with mock.patch.object(BRIDGE.os, "open", side_effect=deny_workspace):
+            with self.assertRaisesRegex(RuntimeError, "workspace write denied"):
+                BRIDGE.attest_outer_workspace_write(workspace, tools)
+        self.assertEqual(list(workspace.glob(probe_glob)), [])
+        self.assertEqual(list(trusted_home.glob(probe_glob)), [])
+
+        with mock.patch.object(
+            BRIDGE.os,
+            "write",
+            side_effect=OSError("probe write failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "probe write failed"):
+                BRIDGE.attest_outer_workspace_write(workspace, tools)
+        self.assertEqual(list(workspace.glob(probe_glob)), [])
+        self.assertEqual(list(trusted_home.glob(probe_glob)), [])
+
+        without_installed_policy = dict(tools)
+        without_installed_policy.pop("expected_outer_filesystem_policy")
+        self.assertIsNone(
+            BRIDGE.attest_outer_workspace_write(
+                workspace,
+                without_installed_policy,
+            )
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                BRIDGE.OUTER_SANDBOX_ENV: "danger-full-access",
+                "AWS_SECRET_ACCESS_KEY": "ambient-aws-secret",
+                "GITHUB_TOKEN": "ambient-github-secret",
+                "SSH_AUTH_SOCK": str(workspace / "ambient-ssh.sock"),
+                "OPENAI_API_KEY": "ambient-openai-secret",
+            },
+        ):
+            clean = BRIDGE.generic_evolve_environment(tools, runtime="codex")
+            asserted = BRIDGE.generic_evolve_environment(
+                tools,
+                runtime="codex",
+                attested_outer_sandbox=attested,
+            )
+            claude_asserted = BRIDGE.generic_evolve_environment(
+                tools,
+                runtime="claude",
+                attested_outer_sandbox=attested,
+            )
+        self.assertNotIn(BRIDGE.OUTER_SANDBOX_ENV, clean)
+        for forbidden in (
+            "AWS_SECRET_ACCESS_KEY",
+            "GITHUB_TOKEN",
+            "SSH_AUTH_SOCK",
+            "OPENAI_API_KEY",
+        ):
+            self.assertNotIn(forbidden, clean)
+            self.assertNotIn(forbidden, asserted)
+            self.assertNotIn(forbidden, claude_asserted)
+        self.assertEqual(
+            asserted[BRIDGE.OUTER_SANDBOX_ENV],
+            "workspace-write",
+        )
+        self.assertNotIn(BRIDGE.OUTER_SANDBOX_ENV, claude_asserted)
+        self.assertEqual(
+            claude_asserted["KERSOR_CLAUDE_COMMAND"],
+            tools["claude"],
+        )
+        self.assertEqual(
+            claude_asserted["KERSOR_CLAUDE_MODEL"],
+            "deepseek-v4-flash",
+        )
+        self.assertNotIn("KERSOR_CODEX_COMMAND", claude_asserted)
+
+    def test_generic_evolve_rejects_a_workspace_owned_recorded_checkout(
+        self,
+    ) -> None:
+        workspace = self.root / "workspace-owned-core"
+        workspace.mkdir()
+        core = workspace / "KerSor"
+        core.mkdir()
+        with self.assertRaisesRegex(RuntimeError, "cannot be owned"):
+            BRIDGE.require_checkout_outside_workspace(core, workspace)
+
+        trusted_core = self.root / "trusted-core"
+        trusted_core.mkdir()
+        BRIDGE.require_checkout_outside_workspace(trusted_core, workspace)
+
+    def test_generic_evolve_bootstraps_session_and_forwards_frozen_contract(self) -> None:
+        self.prepare_generic_evolve_checkout()
+        destination, _, _ = self.run_install()
+        self.prepare_installed_generic_tools(destination)
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        session = workspace / ".kersor-autonomous" / "memo"
+        contract = workspace / "mission.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-mission-v1",
+                "workspace": str(workspace),
+                "session": str(session),
+                "runtime": "codex",
+                "mission": {
+                    "mission_id": "memo",
+                    "goal": "write a memo",
+                    "authority": ["read workspace"],
+                    "required_artifacts": ["memo"],
+                    "required_facts": {"done": True},
+                    "max_revisions": 2,
+                },
+                "capabilities": [{
+                    "name": "analyze",
+                    "side_effect": "read",
+                    "required_authorities": ["read workspace"],
+                    "produces_artifacts": ["memo"],
+                    "produces_facts": ["done"],
+                }],
+            }),
+            encoding="utf-8",
+        )
+        capture = Path(f"{contract}.argv")
+        environment = dict(os.environ)
+        environment.pop("KERSOR_ROOT", None)
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "evolve",
+                "--host-execution",
+                "--contract",
+                str(contract),
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            capture.read_text(encoding="utf-8").splitlines(),
+            [
+                str(contract.resolve()),
+                "--expected-contract-sha256",
+                hashlib.sha256(contract.read_bytes()).hexdigest(),
+                "--expected-runtime-config-sha256",
+                hashlib.sha256(
+                    (
+                        self.kersor
+                        / "config"
+                        / "runtime-codex-autonomous.json"
+                    ).read_bytes()
+                ).hexdigest(),
+            ],
+        )
+        session_config = json.loads((session / "session-config.json").read_text())
+        session_state = json.loads((session / "state.json").read_text())
+        self.assertEqual(session_config["input_mode"], "task_dir")
+        self.assertEqual(session_config["retrieval_mode"], "off")
+        self.assertEqual(session_state["session_id"], "dsh-autonomous-memo")
+        self.assertIsNone(session_state["target_speedup"])
+
+    def test_generic_evolve_uses_installed_root_and_sanitized_runtime_chain(self) -> None:
+        self.prepare_generic_evolve_checkout()
+        destination, _, _ = self.run_install()
+        self.prepare_installed_generic_tools(destination)
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        session = workspace / ".kersor-autonomous" / "sanitized"
+        contract = workspace / "mission.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-mission-v1",
+                "workspace": str(workspace),
+                "session": str(session),
+                "runtime": "codex",
+                "mission": {
+                    "mission_id": "sanitized",
+                    "goal": "inspect safely",
+                    "authority": ["read workspace"],
+                    "required_artifacts": ["report"],
+                    "required_facts": {"done": True},
+                    "max_revisions": 1,
+                },
+                "capabilities": [{
+                    "name": "inspect",
+                    "side_effect": "read",
+                    "produces_artifacts": ["report"],
+                    "produces_facts": ["done"],
+                }],
+            }),
+            encoding="utf-8",
+        )
+        injection = self.root / "bash-env.sh"
+        marker = self.root / "bash-env-ran"
+        injection.write_text(f"touch {marker}\n", encoding="utf-8")
+        capture = Path(f"{contract}.argv")
+        environment_capture = Path(f"{contract}.env")
+        environment = dict(os.environ)
+        environment.update({
+            "KERSOR_ROOT": str(workspace / "fake-checkout"),
+            "KERSOR_AUTONOMOUS_RUNNER": str(workspace / "fake-runner.py"),
+            "KERSOR_NODE_BIN": str(workspace / "fake-node"),
+            "KERSOR_CODEX_COMMAND": str(workspace / "fake-codex"),
+            "KERSOR_CODEX_AUTH_HOME": str(workspace / "fake-codex-home"),
+            "KERSOR_CODEX_OUTER_SANDBOX": "danger-full-access",
+            "BASH_ENV": str(injection),
+            "PYTHONPATH": str(workspace),
+            "NODE_OPTIONS": "--require=/tmp/injected.js",
+            "HOME": str(workspace),
+            "TMPDIR": str(workspace),
+        })
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "evolve",
+                "--host-execution",
+                "--contract",
+                str(contract),
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertFalse(marker.exists())
+        captured = environment_capture.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(captured[0:2], ["unset", "unset"])
+        manifest = json.loads(
+            (destination / ".local" / "runtime-tools.json").read_text()
+        )
+        trusted = manifest["tools"]
+        self.assertEqual(captured[2], trusted["node"])
+        self.assertEqual(captured[3], trusted["codex"])
+        self.assertEqual(
+            captured[4], manifest["environment"]["codex_auth_home"]
+        )
+        self.assertEqual(captured[5:8], ["unset", "unset", "unset"])
+        self.assertNotIn(str(workspace), captured[8])
+        self.assertEqual(captured[9], manifest["environment"]["home"])
+        self.assertEqual(captured[10], manifest["environment"]["temp_dir"])
+        self.assertEqual(captured[11], "unset")
+        self.assertEqual(captured[12:19], ["unset"] * 7)
+
+    def test_generic_claude_read_route_uses_only_the_installed_command(
+        self,
+    ) -> None:
+        self.prepare_generic_evolve_checkout()
+        destination, _, _ = self.run_install()
+        self.prepare_installed_generic_tools(destination)
+        workspace = self.root / "claude-read-workspace"
+        workspace.mkdir()
+        session = workspace / ".kersor-autonomous" / "claude-read"
+        contract = workspace / "mission.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-mission-v1",
+                "workspace": str(workspace),
+                "session": str(session),
+                "runtime": "claude",
+                "mission": self.generic_mission("claude-read"),
+                "capabilities": [{
+                    "name": "inspect",
+                    "side_effect": "read",
+                }],
+            }),
+            encoding="utf-8",
+        )
+        capture = Path(f"{contract}.argv")
+        environment_capture = Path(f"{contract}.env")
+        environment = dict(os.environ)
+        environment.update({
+            "KERSOR_CLAUDE_COMMAND": str(workspace / "fake-claude"),
+            "KERSOR_CLAUDE_MODEL": "ambient-model",
+            "KERSOR_CLAUDE_EFFORT": "low",
+            "KERSOR_CODEX_OUTER_SANDBOX": "workspace-write",
+            "CLAUDECODE": "outer-controller",
+            "CLAUDE_CONFIG_DIR": str(workspace / "fake-claude-home"),
+            "ANTHROPIC_MODEL": "ambient-anthropic-model",
+            "ANTHROPIC_BASE_URL": "https://ambient.invalid",
+        })
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "evolve",
+                "--host-execution",
+                "--contract",
+                str(contract),
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        runtime_config = (
+            self.kersor / "config" / "runtime-claude-autonomous.json"
+        )
+        self.assertEqual(
+            capture.read_text(encoding="utf-8").splitlines(),
+            [
+                str(contract.resolve()),
+                "--expected-contract-sha256",
+                hashlib.sha256(contract.read_bytes()).hexdigest(),
+                "--expected-runtime-config-sha256",
+                hashlib.sha256(runtime_config.read_bytes()).hexdigest(),
+            ],
+        )
+        manifest = json.loads(
+            (destination / ".local" / "runtime-tools.json").read_text()
+        )
+        captured = environment_capture.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(captured[2], manifest["tools"]["node"])
+        self.assertEqual(captured[3:5], ["unset", "unset"])
+        self.assertEqual(captured[11], "unset")
+        self.assertEqual(captured[12], manifest["tools"]["claude"])
+        self.assertEqual(captured[13:19], ["unset"] * 6)
+        self.assertTrue(session.is_dir())
+
+    def test_mutating_claude_host_route_does_not_require_outer_proof(self) -> None:
+        self.prepare_generic_evolve_checkout()
+        destination, _, _ = self.run_install()
+        self.prepare_installed_generic_tools(destination)
+        workspace = self.root / "claude-write-workspace"
+        workspace.mkdir()
+        session = workspace / ".kersor-autonomous" / "claude-write"
+        contract = workspace / "mission.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-mission-v1",
+                "workspace": str(workspace),
+                "session": str(session),
+                "runtime": "claude",
+                "mission": self.generic_mission("claude-write"),
+                "capabilities": [{
+                    "name": "mutate",
+                    "side_effect": "write",
+                    "transaction_artifacts": ["answer.py"],
+                }],
+            }),
+            encoding="utf-8",
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "evolve",
+                "--host-execution",
+                "--contract",
+                str(contract),
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(session.exists())
+        manifest = json.loads(
+            (destination / ".local" / "runtime-tools.json").read_text()
+        )
+        probe_glob = f"{BRIDGE.OUTER_SANDBOX_PROBE_PREFIX}*"
+        self.assertEqual(list(workspace.glob(probe_glob)), [])
+        self.assertEqual(
+            list(Path(manifest["environment"]["home"]).glob(probe_glob)),
+            [],
+        )
+
+    def test_generic_claude_config_is_canonical_and_exactly_restricted(
+        self,
+    ) -> None:
+        self.prepare_generic_evolve_checkout()
+        workspace = self.root / "claude-config-workspace"
+        workspace.mkdir()
+        contract = workspace / "mission.json"
+        contract.write_text("{}\n", encoding="utf-8")
+        config_path = (
+            self.kersor / "config" / "runtime-claude-autonomous.json"
+        )
+        original = json.loads(config_path.read_text(encoding="utf-8"))
+
+        observed_path, observed_hash = BRIDGE.validate_claude_runtime_config(
+            self.kersor,
+            contract,
+            {},
+            needs_write=False,
+        )
+        self.assertEqual(observed_path, config_path.resolve())
+        self.assertEqual(
+            observed_hash,
+            hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        )
+        BRIDGE.validate_claude_runtime_config(
+            self.kersor,
+            contract,
+            {},
+            needs_write=True,
+        )
+
+        variants = [
+            (("budget", "total_tokens"), float("inf"), "finite positive"),
+            (("broker", "type"), "codex-exec", "claude-code-exec"),
+            (("broker", "safe_mode"), False, "safe_mode"),
+            (("broker", "permission_mode"), "acceptEdits", "permission_mode"),
+            (
+                ("broker", "no_session_persistence"),
+                False,
+                "no_session_persistence",
+            ),
+            (("broker", "preflight"), False, "preflight"),
+            (
+                ("broker", "filesystem_sandbox"),
+                "best-effort",
+                "filesystem_sandbox",
+            ),
+            (
+                ("broker", "read_only_tools"),
+                ["Read", "Glob", "Grep", "Bash"],
+                "read-only tool allowlist",
+            ),
+            (
+                ("broker", "mutation_tools"),
+                ["Read", "Glob", "Grep", "Edit", "Write", "Bash"],
+                "mutation tool allowlist",
+            ),
+            (("broker", "extra_args"), ["--verbose"], "cannot add"),
+        ]
+        try:
+            for path, replacement, message in variants:
+                with self.subTest(path=path):
+                    candidate = json.loads(json.dumps(original))
+                    candidate[path[0]][path[1]] = replacement
+                    config_path.write_text(json.dumps(candidate), encoding="utf-8")
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        BRIDGE.validate_claude_runtime_config(
+                            self.kersor,
+                            contract,
+                            {},
+                            needs_write=False,
+                        )
+        finally:
+            config_path.write_text(json.dumps(original), encoding="utf-8")
+
+        local_config = workspace / "runtime-claude.json"
+        local_config.write_text(json.dumps(original), encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "trusted KerSor"):
+            BRIDGE.validate_claude_runtime_config(
+                self.kersor,
+                contract,
+                {"runtime_config": str(local_config)},
+                needs_write=False,
+            )
+
+    def test_generic_evolve_requires_the_host_rpc_for_dsh_runtime(self) -> None:
+        self.prepare_generic_evolve_checkout()
+        destination, _, _ = self.run_install()
+        self.prepare_installed_generic_tools(destination)
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        contract = workspace / "mission.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-mission-v1",
+                "workspace": str(workspace),
+                "session": str(workspace / ".kersor-autonomous" / "unsupported"),
+                "runtime": "dsh",
+                "mission": self.generic_mission("unsupported"),
+                "capabilities": [],
+            }),
+            encoding="utf-8",
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "evolve",
+                "--host-execution",
+                "--contract",
+                str(contract),
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("requires a Host-owned absolute RPC socket", completed.stderr)
+        self.assertFalse((workspace / ".kersor-autonomous").exists())
+
+    def test_generic_evolve_rejects_contract_bytes_changed_after_host_admission(self) -> None:
+        destination, _, _ = self.run_install()
+        workspace = self.root / "changed-contract-workspace"
+        workspace.mkdir()
+        contract = workspace / "mission.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-mission-v1",
+                "workspace": str(workspace),
+                "runtime": "dsh",
+            }),
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "evolve",
+                "--host-execution",
+                "--contract",
+                str(contract),
+                "--expected-contract-sha256",
+                "0" * 64,
+                "--expected-runtime",
+                "dsh",
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("contract changed after Host admission", completed.stderr)
+        self.assertFalse((workspace / ".kersor-autonomous").exists())
+
+    def test_generic_mission_refuses_the_nested_shell_route(self) -> None:
+        destination, _, _ = self.run_install()
+        workspace = self.root / "shell-mission-workspace"
+        workspace.mkdir()
+        contract = workspace / "mission.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-mission-v1",
+                "workspace": str(workspace),
+                "runtime": "codex",
+            }),
+            encoding="utf-8",
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "evolve",
+                "--contract",
+                str(contract),
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("Host-side kersor_evolve tool", completed.stderr)
+        self.assertIn("nested shell execution is refused", completed.stderr)
+
+    def test_generic_evolve_rejects_mutation_under_read_only_runtime(self) -> None:
+        self.prepare_generic_evolve_checkout()
+        destination, _, _ = self.run_install()
+        self.prepare_installed_generic_tools(destination)
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        session = workspace / ".kersor-autonomous" / "write"
+        contract = workspace / "mission.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-mission-v1",
+                "workspace": str(workspace),
+                "session": str(session),
+                "runtime": "codex",
+                "mission": self.generic_mission("write"),
+                "capabilities": [{
+                    "name": "mutate",
+                    "side_effect": "write",
+                    "transaction_artifacts": ["answer.py"],
+                }],
+            }),
+            encoding="utf-8",
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "evolve",
+                "--host-execution",
+                "--contract",
+                str(contract),
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn(
+            "must use the trusted KerSor runtime-codex-autonomous-write.json",
+            completed.stderr,
+        )
+        self.assertFalse(session.exists())
+
+    def test_generic_evolve_rejects_read_only_mission_under_write_runtime(self) -> None:
+        self.prepare_generic_evolve_checkout()
+        destination, _, _ = self.run_install()
+        self.prepare_installed_generic_tools(destination)
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        session = workspace / ".kersor-autonomous" / "read"
+        contract = workspace / "mission.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-mission-v1",
+                "workspace": str(workspace),
+                "session": str(session),
+                "runtime": "codex",
+                "runtime_config": str(
+                    self.kersor / "config" / "runtime-codex.json"
+                ),
+                "mission": self.generic_mission("read"),
+                "capabilities": [{
+                    "name": "inspect",
+                    "side_effect": "read",
+                    "produces_artifacts": ["report"],
+                }],
+            }),
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "evolve",
+                "--host-execution",
+                "--contract",
+                str(contract),
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("must use the trusted KerSor", completed.stderr)
+        self.assertFalse(session.exists())
+
+    def test_generic_evolve_rejects_workspace_local_runtime_config(self) -> None:
+        self.prepare_generic_evolve_checkout()
+        destination, _, _ = self.run_install()
+        self.prepare_installed_generic_tools(destination)
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        local_config = workspace / "runtime.json"
+        local_config.write_text(
+            (self.kersor / "config" / "runtime-codex-autonomous-write.json")
+            .read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        contract = workspace / "mission.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-mission-v1",
+                "workspace": str(workspace),
+                "session": str(workspace / ".kersor-autonomous" / "local-config"),
+                "runtime": "codex",
+                "runtime_config": str(local_config),
+                "mission": self.generic_mission("local-config"),
+                "capabilities": [{
+                    "name": "mutate",
+                    "side_effect": "write",
+                    "transaction_artifacts": ["answer.py"],
+                }],
+            }),
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "evolve",
+                "--host-execution",
+                "--contract",
+                str(contract),
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("must use the trusted KerSor", completed.stderr)
+
+    def test_generic_evolve_rejects_unsandboxed_read_only_host_evaluator(self) -> None:
+        self.prepare_generic_evolve_checkout()
+        destination, _, _ = self.run_install()
+        self.prepare_installed_generic_tools(destination)
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        contract = workspace / "mission.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-mission-v1",
+                "workspace": str(workspace),
+                "session": str(workspace / ".kersor-autonomous" / "host-read"),
+                "runtime": "codex",
+                "mission": self.generic_mission("host-read"),
+                "capabilities": [{
+                    "name": "unsafe_verifier",
+                    "side_effect": "read",
+                    "execution": {
+                        "kind": "host_evaluator",
+                        "request": {
+                            "protocol": "command-v1",
+                            "argv": ["python3", "-c", "open('leak','w').write('x')"],
+                        },
+                    },
+                }],
+            }),
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "evolve",
+                "--host-execution",
+                "--contract",
+                str(contract),
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("require filesystem_policy=read-only", completed.stderr)
+        self.assertFalse((workspace / "leak").exists())
+
+    def test_generic_evolve_rejects_host_materialization(self) -> None:
+        self.prepare_generic_evolve_checkout()
+        destination, _, _ = self.run_install()
+        self.prepare_installed_generic_tools(destination)
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        contract = workspace / "mission.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-mission-v1",
+                "workspace": str(workspace),
+                "session": str(workspace / ".kersor-autonomous" / "materialize"),
+                "runtime": "codex",
+                "runtime_config": str(
+                    self.kersor / "config" / "runtime-codex-autonomous-write.json"
+                ),
+                "mission": self.generic_mission("materialize"),
+                "capabilities": [
+                    {
+                        "name": "mutate",
+                        "side_effect": "write",
+                        "transaction_artifacts": ["answer.py"],
+                    },
+                    {
+                        "name": "unsafe_verifier",
+                        "side_effect": "read",
+                        "execution": {
+                            "kind": "host_evaluator",
+                            "request": {
+                                "protocol": "command-v1",
+                                "filesystem_policy": "read-only",
+                                "argv": ["python3", "-m", "unittest"],
+                                "materialize": [{"path": "leak", "content": "x"}],
+                            },
+                        },
+                    },
+                ],
+            }),
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "evolve",
+                "--host-execution",
+                "--contract",
+                str(contract),
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("cannot materialize", completed.stderr)
+        self.assertFalse((workspace / "leak").exists())
+
+    def test_generic_task_rejects_run_dir_outside_workspace(self) -> None:
+        self.prepare_generic_evolve_checkout()
+        destination, _, _ = self.run_install()
+        self.prepare_installed_generic_tools(destination)
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        contract = workspace / "task.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-task-v1",
+                "workspace": str(workspace),
+                "runtime": "codex",
+                "objective": "repair the ledger",
+                "max_rounds": 1,
+                "verifier": {"command": ["python3", "-m", "unittest"]},
+            }),
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "evolve",
+                "--contract",
+                str(contract),
+                "--run-dir",
+                str(self.root / "outside-run"),
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("Task run-dir must stay inside", completed.stderr)
+
+    def test_generic_task_requires_owned_run_namespace(self) -> None:
+        self.prepare_generic_evolve_checkout()
+        destination, _, _ = self.run_install()
+        self.prepare_installed_generic_tools(destination)
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        contract = workspace / "task.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-task-v1",
+                "workspace": str(workspace),
+                "runtime": "codex",
+                "objective": "repair the ledger",
+                "max_rounds": 1,
+                "verifier": {"argv": ["python3", "-m", "unittest"]},
+            }),
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "evolve",
+                "--contract",
+                str(contract),
+                "--run-dir",
+                str(workspace / "ordinary-directory"),
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("direct child of workspace/.kersor", completed.stderr)
+
+    def test_generic_session_bootstrap_failure_is_atomic(self) -> None:
+        self.prepare_generic_evolve_checkout()
+        (self.kersor / "scripts" / "create-session.py").write_text(
+            "import pathlib, sys\n"
+            "target = pathlib.Path(sys.argv[1])\n"
+            "(target / 'session-config.json').write_text('{}')\n"
+            "print('creator failed', file=sys.stderr)\n"
+            "raise SystemExit(7)\n",
+            encoding="utf-8",
+        )
+        destination, _, _ = self.run_install()
+        self.prepare_installed_generic_tools(destination)
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        session = workspace / ".kersor-autonomous" / "atomic"
+        contract = workspace / "mission.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-mission-v1",
+                "workspace": str(workspace),
+                "session": str(session),
+                "runtime": "codex",
+                "mission": self.generic_mission("atomic"),
+                "capabilities": [{
+                    "name": "inspect",
+                    "side_effect": "read",
+                }],
+            }),
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "evolve",
+                "--host-execution",
+                "--contract",
+                str(contract),
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("cannot create generic Mission Session", completed.stderr)
+        self.assertFalse(session.exists())
+        self.assertEqual(list(session.parent.glob(".atomic.bootstrap-*")), [])
+
+    def test_generic_core_schema_rejection_precedes_session_publication(self) -> None:
+        self.prepare_generic_evolve_checkout()
+        (self.kersor / "scripts" / "run-autonomous-workflow.py").write_text(
+            "import sys\n"
+            "print('deep Mission schema rejected', file=sys.stderr)\n"
+            "raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        destination, _, _ = self.run_install()
+        self.prepare_installed_generic_tools(destination)
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        session = workspace / ".kersor-autonomous" / "schema"
+        contract = workspace / "mission.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-mission-v1",
+                "workspace": str(workspace),
+                "session": str(session),
+                "runtime": "codex",
+                "mission": {
+                    "mission_id": "schema",
+                    "goal": "validate first",
+                    "authority": ["read workspace"],
+                    "required_artifacts": ["report"],
+                    "required_facts": {"done": True},
+                    "max_revisions": 1,
+                },
+                "capabilities": [{
+                    "name": "inspect",
+                    "side_effect": "read",
+                    "produces_artifacts": ["report"],
+                    "produces_facts": ["done"],
+                }],
+            }),
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "evolve",
+                "--host-execution",
+                "--contract",
+                str(contract),
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("deep Mission schema rejected", completed.stderr)
+        self.assertFalse(session.exists())
+
+    def test_generic_evolve_rejects_foreign_existing_session_identity(self) -> None:
+        self.prepare_generic_evolve_checkout()
+        destination, _, _ = self.run_install()
+        self.prepare_installed_generic_tools(destination)
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        session = workspace / ".kersor-autonomous" / "foreign"
+        session.mkdir(parents=True)
+        (session / "session-config.json").write_text(
+            json.dumps({
+                "input_mode": "task_dir",
+                "task_dir": str(self.root / "another-workspace"),
+                "retrieval_mode": "off",
+                "transfer_mode": "off",
+                "experience_mode": "off",
+                "kernelwiki_experience_export_mode": "off",
+            }),
+            encoding="utf-8",
+        )
+        (session / "state.json").write_text(
+            json.dumps({
+                "session_id": "some-other-session",
+                "target_speedup": None,
+                "seed_origin": "provided_task",
+            }),
+            encoding="utf-8",
+        )
+        contract = workspace / "mission.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-mission-v1",
+                "workspace": str(workspace),
+                "session": str(session),
+                "runtime": "codex",
+                "mission": self.generic_mission("foreign"),
+                "capabilities": [{
+                    "name": "inspect",
+                    "side_effect": "read",
+                }],
+            }),
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "evolve",
+                "--host-execution",
+                "--contract",
+                str(contract),
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("task_dir does not match", completed.stderr)
+
+    def test_skill_routes_generic_contracts_without_optimization_rewrite(self) -> None:
+        skill = (
+            ROOT / "presets" / "kersor" / "skills" / "kersor" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("bridge\" evolve --contract <contract-path>", skill)
+        self.assertIn("For a frozen `kersor-mission-v1`, call `kersor_evolve`", skill)
+        self.assertIn("first and only tool call of the turn", skill)
+        self.assertIn("A Mission is deliberately rejected from the Bash", skill)
+        self.assertIn("Fixed Tasks support only `runtime=codex`", skill)
+        self.assertIn("Never translate a generic contract", skill)
+        self.assertIn("never call `kersor_start` for it", skill)
+        self.assertIn("the user must not prepare Session JSON by hand", skill)
+        self.assertIn("first DSH-native Mission slice", skill)
+        self.assertIn("`side_effect=none|read`", skill)
+        self.assertIn("no Host evaluator or", skill)
+        self.assertIn("`deepseek-official/deepseek-v4-flash`", skill)
+        self.assertIn("outside the workspace", skill)
+        self.assertIn("external product-stack route", skill)
+        self.assertIn("The Host tool owns the foreground process", skill)
+        self.assertIn("matching Mission Host tool or fixed Task bridge route", skill)
 
     def test_same_size_local_edit_is_not_mistaken_for_identical(self) -> None:
         destination, _, _ = self.run_install()
@@ -187,11 +1629,11 @@ class InstallTests(unittest.TestCase):
         self.assertIn("--integration-pattern custom_simulator", skill)
         self.assertIn("--allow-workflow-authoring", skill)
         self.assertIn("--workflow-authoring-budget 1", skill)
-        self.assertIn('--workflow-authoring-budget "$WORKFLOW_AUTHORING_BUDGET"', skill)
-        self.assertIn('--max-workflows "$MAX_WORKFLOWS"', skill)
-        self.assertIn('--transfer-mode "$TRANSFER_MODE"', skill)
+        self.assertIn("complete canonical\n`setup-session.sh` command", skill)
+        self.assertIn("Host's durable transfer/import chain", skill)
         self.assertNotIn("--max-workflows 1", skill)
-        self.assertIn("explicit `measured-only` transfer", skill)
+        self.assertIn("Fresh isolation resolves all four modes to `off`", skill)
+        self.assertNotIn("explicit `measured-only` transfer", skill)
         self.assertIn("selection must\nremain `STALLED`", skill)
         self.assertIn("research-only\nworkflow evolution", skill)
         self.assertIn('--store "$SESSION_DIR/workflow-authoring/proposals"', skill)
@@ -200,6 +1642,9 @@ class InstallTests(unittest.TestCase):
         self.assertIn("transition the Session to `stalled`", skill)
         self.assertIn("prove candidate binding", skill)
         self.assertIn("same Session-local candidate", skill)
+        self.assertIn("evaluation_status=pending_host_verification", skill)
+        self.assertIn("host-verification.json` with `verdict=pass", skill)
+        self.assertIn("invoke `candidate-ownership.py verify` manually", skill)
         self.assertIn("foreground `session-synthesizer` is the sole writer", skill)
         self.assertIn("Only\n`normalize-transfer.py` may atomically advance", skill)
         self.assertIn("Never\ncall `kersor-state.sh ... set current_round ...`", skill)
@@ -224,15 +1669,18 @@ class InstallTests(unittest.TestCase):
         )
         self.assertIn("never reuse a sibling round's attempt owners", skill)
         self.assertIn("Save exactly once with `--handoff`", skill)
+        self.assertIn("`dirname(--from)/author-handoff.json`", skill)
+        self.assertIn("retry with `--force`", skill)
+        self.assertIn("overwrite an existing\nProposal", skill)
         self.assertIn("must never repair them", skill)
         self.assertIn("file or directory is mixed provenance", skill)
         self.assertIn("canonical `stalled`, not a patch or retry", skill)
         self.assertIn("Do not accept a prose-only baseline", skill)
-        self.assertIn("scripts/baseline-witness.py", skill)
-        self.assertIn("baseline-witness.py\" init", skill)
-        self.assertIn('--correctness-command "$CORRECTNESS_COMMAND"', skill)
-        self.assertIn("baseline-witness.py\" record", skill)
-        self.assertIn('--session "$SESSION_DIR" --project-root "$TASK_DIR"', skill)
+        self.assertIn("`baseline-witness.py init`, then `record`, then", skill)
+        self.assertIn("controller prompt's literal", skill)
+        self.assertIn("canonical bridge/root expression", skill)
+        self.assertIn("Each\ncall is exact-once", skill)
+        self.assertIn("never abbreviate these commands", skill)
         self.assertIn("Output produced before Session creation", skill)
         self.assertIn("Never parse `session-config.json` directly", skill)
         self.assertIn("scripts/profile-handoff.py\" context", skill)
@@ -255,22 +1703,12 @@ class InstallTests(unittest.TestCase):
             '"$kersor_root/scripts/profile-handoff.py"',
             skill,
         )
-        self.assertIn('kersor_python="${KERSOR_PYTHON:-python3}"', skill)
-        self.assertIn(
-            "The DSH controller prompt freezes the Host's validated absolute "
-            "interpreter\npath.",
-            skill,
-        )
-        self.assertIn(
-            "never use `which`, PATH search, filesystem search, or\nversion "
-            "substitution",
-            skill,
-        )
-        self.assertIn(
-            '"$kersor_python" "$kersor_root/scripts/baseline-witness.py" init',
-            skill,
-        )
-        self.assertIn('--python-interpreter "$kersor_python"', skill)
+        self.assertIn("`KERSOR_PYTHON='<absolute path>'; export KERSOR_PYTHON;`", skill)
+        self.assertIn("The Host has already frozen and exported", skill)
+        self.assertIn("do not export, echo, inspect, list, or resolve", skill)
+        self.assertIn("never\ncall `env`, `which`, PATH search", skill)
+        self.assertIn("three exact Host-frozen DSH commands", skill)
+        self.assertNotIn('--python-interpreter "$kersor_python"', skill)
         self.assertIn(
             "must invoke an existing task-owned authoritative harness directly",
             skill,
@@ -305,8 +1743,8 @@ class InstallTests(unittest.TestCase):
             skill,
         )
         self.assertIn("or any other tool after that status", skill)
-        self.assertIn('bash "$kersor_root/scripts/setup-session.sh" "$TASK_DIR"', skill)
-        self.assertIn("Never call it from `commands/`", skill)
+        self.assertIn("complete canonical\n`setup-session.sh` command", skill)
+        self.assertIn("Never call setup from\n`commands/`", skill)
         self.assertIn('kersor-state.sh" "$SESSION_DIR" get fresh_session_required', skill)
         self.assertIn('get kernelwiki_experience_export_mode', skill)
         self.assertIn("scripts/prepare-dsh-workflow.mjs", skill)
@@ -315,12 +1753,15 @@ class InstallTests(unittest.TestCase):
         self.assertIn("Call `kersor_workflow` exactly once", skill)
         self.assertIn('`{"exp_dir":"<exact absolute RUN_DIR>"}`', skill)
         self.assertIn("Never call raw `workflow`", skill)
-        self.assertIn("candidate-ownership.py\" seal", skill)
-        self.assertIn("candidate-ownership.py\" verify", skill)
+        self.assertIn("exact Host-frozen DSH seal command", skill)
+        self.assertIn("invoke `candidate-ownership.py verify` manually", skill)
+        self.assertIn("`glob`/`grep`/`read` tools", skill)
+        self.assertIn("exclusively writes\n`candidate-ownership.json`", skill)
+        self.assertIn("publishes no\n`output.json`", skill)
         self.assertIn('check-runtime-budget.sh"', skill)
         self.assertIn('mark-dispatch-start.sh" "$RUN_DIR"', skill)
         self.assertIn("canonical distinction between a\nprepared run", skill)
-        self.assertIn("first parent action", skill)
+        self.assertIn("Before any raw result is returned", skill)
         self.assertIn("Never pass `scriptPath`", skill)
         self.assertIn("not rewrite the author-owned script, retry dispatch, or optimize directly", skill)
         self.assertIn("immutable oracles", skill)

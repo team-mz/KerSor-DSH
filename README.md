@@ -18,7 +18,7 @@
 
 3. **重启 DSH Web 进程**。已经运行的 Host 不会自动采用新 preset composition 或新的浏览器 bundle。
 4. 在 DSH 中添加目标工作区，新建会话，把 agent preset 从“标准模式”切换为 **KerSor**。
-5. 用任务合同描述目标、基线、权威验证命令、禁止修改的文件和停止条件。顶层 Agent 加载 `kersor` skill 后调用 `kersor_start`；已有磁盘 Session 用 `kersor_attach`，之后只用 `kersor_resume` 恢复原 controller child。
+5. 用任务合同描述目标、基线、权威验证命令、禁止修改的文件和停止条件。顶层 Agent 加载 `kersor` skill 后，将 GPU／benchmark 优化交给 `kersor_start`；固定 `task-v1` 通过 workspace-confined bridge，适应性 `mission-v1` 只通过 Host 侧 `kersor_evolve` 工具，不能改写成优化合同。已有优化 Session 用 `kersor_attach`，之后只用 `kersor_resume` 恢复原 controller child。
 6. Chat 中的 KerSor Experiment 卡显示九阶段进度和下一动作；点击「查看 DSH 执行对话」进入完整控制器对话。会话标题下的 `KerSor` 标签继续提供跨工作区总览、Workflow 执行图与候选选择。
 
 ## 为什么安装时生成 composition
@@ -27,11 +27,29 @@
 
 ## 安装或更新
 
-需要 Python 3.10+、已安装的 DSH，以及一个 KerSor checkout：
+需要 Python 3.10+、已安装的 DSH，以及一个 KerSor checkout。若要使用
+generic evolve，安装时还必须能解析 Bash、Node、jq；只有选择外部兼容 runtime
+时才需要 Codex 或 Claude Code。安装器会冻结这些命令的
+绝对路径，缺失或随后移动时 bridge 会要求重新安装，而不会回退到会话 PATH：
 
 ```bash
 python3 scripts/install.py --kersor-root /absolute/path/to/KerSor
 ```
+
+若把可选的 Claude-compatible 后端接到 Infini-AI，可在可信安装阶段同时冻结
+wrapper 和模型 ID；密钥仍由 wrapper 从本机凭据存储读取，不会写入 preset：
+
+```bash
+python3 scripts/install.py \
+  --kersor-root /absolute/path/to/KerSor \
+  --claude-command /absolute/path/to/claude-infini \
+  --claude-model deepseek-v4-flash \
+  --force
+```
+
+这只是 `runtime=claude` 的兼容路径：Claude Code 在这里充当 agent CLI，实际模型
+是 Infini-AI 的 `deepseek-v4-flash`。它不等同于 DSH-native Mission，也不应被描述
+为“Claude 模型执行”。
 
 如果 `${DSH_HOME:-$HOME/.dsh}/.agent-presets/kersor` 已存在，先预览，再显式覆盖：
 
@@ -41,6 +59,51 @@ python3 scripts/install.py --kersor-root /absolute/path/to/KerSor --force
 ```
 
 覆盖前，安装器会把旧目录移动到同级时间戳备份。KerSor 的机器路径只写入已安装 preset 的 `.local/kersor-root`，不会进入 Git。
+
+上面的 `--kersor-root` 和直接安装 `file:<checkout>` 适合本地开发，但不构成冻结发布证据：pnpm 的目录依赖可以让 checkout 与 profile 中的文件共享 inode，修改源码会同时改变正在使用的 Web package。正式测试或发布必须先从三个明确的 Git commit 构建只读 release；构建只读取 commit objects，展开 Core 记录的每个 submodule commit，要求 `dsh-mirror.json` 已与同一 DeepSeek Harness commit reconciled，并把四个 package 制作为本地 tarball：
+
+```bash
+python3 scripts/release.py prepare \
+  --personal-root /path/to/dsh-personal-plugins \
+  --personal-commit <40-hex-personal-commit> \
+  --core-root /path/to/KerSor \
+  --core-commit <40-hex-core-commit> \
+  --authority-root /path/to/deepseek-harness \
+  --authority-commit <40-hex-harness-commit> \
+  --pnpm /absolute/path/to/pnpm \
+  --output /path/to/immutable-kersor-release
+```
+
+Release 模式的 preset 指针只能指向该 release 内的只读 Core，不会探测 Codex 凭据目录，并会写入安装 receipt：
+
+```bash
+python3 scripts/install.py \
+  --release /path/to/immutable-kersor-release \
+  --force
+```
+
+Web package 继续通过 DSH 自己的 plugin manager 安装，但输入改为 release 内的 bundle tarball；安装器把 profile 的 pnpm import method 固定为 `copy`，并实测每个安装文件均非 symlink、`nlink=1`、不与源码共享 inode：
+
+```bash
+python3 scripts/release.py install-web \
+  --release /path/to/immutable-kersor-release \
+  --dsh-home /path/to/.dsh \
+  --profile web \
+  --node /absolute/path/to/node \
+  --pnpm /absolute/path/to/pnpm \
+  --dsh-bin /absolute/path/to/dsh/apps/cli/lib/bin.js
+```
+
+最终只读门禁同时核验 Core、preset、四个 Web package、profile manifest／lock、工具身份和 receipt。任一字节、pointer、依赖形式、inode 或 mode 漂移都会失败；通过后仍须重启 DSH，已经运行的 Host 不能为新安装字节作证：
+
+```bash
+python3 scripts/release.py verify-installed \
+  --release /path/to/immutable-kersor-release \
+  --dsh-home /path/to/.dsh \
+  --profile web
+```
+
+Release lock 内的 bundle 依赖绑定其 tarball 绝对路径，因此 release 目录不得移动、覆盖或删除。验证器提供的是 commit 来源与本机漂移检测；它不能防止拥有同一账户写权限的人同时伪造文件和 receipt。
 
 为 Web profile 安装 run viewer 与 KerSor conversation view（建议先安装上面的 preset，让两者共享同一份 checkout 指针）：
 
@@ -63,7 +126,7 @@ dsh plugin --profile web add "file:$PWD/bundles/kersor-web"
 
 ## 公开分发
 
-本仓库当前是包含多个本地 package 的源码分发包，而不是可以从仓库根直接安装的单一 npm package。最可靠的公开安装方式是把 GitHub 仓库设为 public、发布一个不可变 tag，并让使用者 clone 后通过 `file:` 安装 bundle：
+本仓库当前是包含多个本地 package 的源码分发包，而不是可以从仓库根直接安装的单一 npm package。clone 后通过 `file:` 安装 bundle 只提供简便的开发体验；需要可复现发布证据时，必须锁定不可变 tag／commit 并使用上面的 release tarball 流程，不能把 live checkout 当作 installed artifact：
 
 ```bash
 git clone --branch <release-tag> https://github.com/qhy991/dsh-personal-plugins.git
@@ -100,8 +163,9 @@ python3 scripts/install.py \
 | 任务 | 建议入口 | 权威状态／证据 |
 |---|---|---|
 | GPU kernel 或带 benchmark 的本地优化 | 顶层 `kersor_start` → continuable DSH controller → `runtime=dsh` optimize | 父 Experiment 绑定、Session v2、Attempt Result、实测 benchmark |
-| 通用本地任务的固定验证循环 | `kersor-task-v1` → `commands/evolve.md` | `output.json` 与 verifier evidence |
-| 自主 Workflow / Mission | `kersor-mission-v1` → `commands/evolve.md` | `result.json`、artifact receipts、独立 verifier |
+| 通用本地任务的固定验证循环 | KerSor preset → `kersor_bridge.py evolve --contract <task-v1>` → 外部 Codex worker | `output.json` 与 verifier evidence |
+| 只读自主 Workflow / Mission | KerSor preset → Host `kersor_evolve` → `runtime=dsh` → DSH `spawn` child | 固定 `deepseek-official/deepseek-v4-flash` route receipt、完整 usage、`result.json` |
+| 需要事务写入的自主 Workflow / Mission | KerSor preset → Host `kersor_evolve` → 外部 Codex／Claude-compatible worker | `result.json`、artifact receipts、独立 verifier |
 | 状态、恢复、诊断 | child 调用 `kersor_status`；父对话用 `kersor_resume` 恢复同一 child | 当前磁盘 Session + 原 DSH child，不依赖聊天记忆 |
 
 不要把 CUDA Workflow 硬套到 Python、VLIW、Verilog 或普通工程任务。任务类型不匹配时，稳定 `optimize` 路径应先确定性拒绝不兼容的已发布 Workflow，再通过有界 workflow authoring 创作 task-native Proposal；workflow evolution 只属于显式 research runner。任务自己的测试命令始终是唯一验收门。
@@ -143,6 +207,14 @@ parent 代写、字段不规范、integration pattern 漂移或 seal 后修改�
 
 在 DSH 中新建 task 并选择 `KerSor` preset。遇到 kernel 优化、通用本地任务演化、KerSor 状态或恢复请求时，加载 `kersor` skill。skill 会读取 KerSor checkout 中当前的 `AGENTS.md` 与 command protocol；KerSor 仓库仍是行为和参数的唯一权威来源。
 
+通用任务与优化控制面是两条独立路径。自然语言通用请求由 agent 先只读分析工作区，再把最小权限、Completion 和既有确定性 verifier 冻结到工作区内的 `kersor-task-v1` 或 `kersor-mission-v1`。固定 Task 只支持 Codex，并保留 workspace-confined bridge 与外层写权限证明；Mission 的第一且唯一执行动作必须是 Host 侧 `kersor_evolve`，它从安装目录冻结 Python 和 bridge、以前台进程处理取消／超时／有界输出，只接受当前顶层 DSH 工作区内的绝对合同路径和唯一 JSON terminal。Mission 的 shell 启动会 fail closed，避免继承调用 agent 的嵌套 Seatbelt；安装记录的 KerSor core 也必须物理位于工作区外，Host tool 与 bridge 会分别复核。安装器会把当时可信的 Bash／Python／Node／jq 以及 Codex／Claude 可执行文件绝对路径、可选的 Codex auth home 路径写入 preset 私有清单（不复制凭据）；generic bridge 仍会完整校验安装记录 checkout、合同 hash、runtime config、Session 身份与权限。
+
+仅固定 Task 的 Codex shell 路径会用唯一、必清理的 `O_EXCL` 文件证明 workspace 可写且 HOME 根不可写，并在证明与安装记录一致时发布 `KERSOR_CODEX_OUTER_SANDBOX=workspace-write`。Host Mission 不发布该 marker，也不依赖外层证明；其每个不可信 Codex／Claude-compatible agent 与 evaluator 都必须由 core 的 canonical config 在每次 activation 建立真实 OS sandbox。Host 与 core 子进程环境都从空 allowlist 构造，只发布冻结的 HOME／TMP／PATH 与必要 KerSor 路由；不会继承 AWS、GitHub、SSH、OpenAI 或其他 ambient token。Codex 可使用冻结 HOME 中的本地 CLI 登录；Claude-compatible 路径可由安装时冻结的 wrapper 自行从 Host-owned 凭据存储加载路由与密钥。安装器还能冻结该路径的模型 ID，bridge 会把它作为 `KERSOR_CLAUDE_MODEL` 传给 core。canonical broker 仍精确要求 `filesystem_sandbox=required` 与 preflight。
+
+Host evaluator 必须使用 `command-v1` 的 `filesystem_policy: "read-only"`、`network_policy: "denied"`、`output_policy: "sealed"`，timeout 必须在 `(0,120]`，可选输出上限必须在 `[1,4194304]`，且不得 `materialize`。每个 evaluator 必须由恰好一个 agent capability 的 `candidate_verifier` 引用，禁止 standalone 或共享调用；fact projection 也只能读取 `passed`、`exit_code`、`timed_out` 或 `artifact_set_sha256`，不能投影 stdout／stderr／解析输出。其 argv 与所有后代进程会进入 fail-closed 的真实只读文件系统边界。外部 `runtime=codex|claude` 继续使用这些规则；Claude-compatible 路径只接受 KerSor canonical `config/runtime-claude-autonomous.json`，并依据 capability/transaction artifacts 在精确只读工具集与精确 mutation 工具集之间切换。
+
+首个 DSH-native 切片只接受 `runtime=dsh` 的只读 agent capability：`side_effect` 只能是 `none|read`，不得声明 transaction，也不得使用 Host evaluator 或 `command-v1`。Host 与 bridge 用同一合同 SHA 和 runtime 绑定一次读取，core 只能通过 owner-only AF_UNIX RPC 请求激活；每次激活固定调用 DSH `spawn`，provider/model 固定为 `deepseek-official/deepseek-v4-flash`。Child 只看见 `read/glob/grep` 和按需生成的 `structured_output`，同步 guard 同时拒绝 Bash、写入、subagent、Workflow、递归 KerSor、workspace 外路径及 symlink escape。每个完成结果必须有完整 usage 和 route receipt；断连、取消、缺 usage 或路由漂移都会 fail closed 并等待 child dispose。写入型 DSH-native transaction 尚未开放，必须继续选用已实现的外部 runtime。每个顶层 DSH session 仍只能调用一次 `kersor_evolve`，失败、取消或 resume 都必须换新 session。
+
 推荐提示词至少包含：
 
 ```text
@@ -160,7 +232,7 @@ Profile 只有在 KerSor 的权威 `profile-handoff.py verify` 通过且 seal �
 
 Web 侧栏同时显示最近 20 个经典／Session-v2 优化会话摘要，以及 autonomous run 的实时进度。它自动读取 DSH 已登记工作区，并扫描各工作区的 `.kersor/`，无需为当前项目重复配置路径；额外的集中式 Session 根仍可通过 viewer `roots` 配置。Session 卡会直接显示 `language/backend`、integration pattern、fresh／baseline／DSH compatibility／candidate ownership gates、selector 结果与 workflow authoring 预算；展开卡片可查看 artifact 派生的阶段时间线、authoring／seal／save、Proposal validation、dispatch／measurement，以及密封后的 metadata、文件 hash、rationale 和 `workflow.js`。seal 前或 hash 不匹配时不暴露 staging 内容。经典状态由 KerSor 自己的 `SessionStore`／`AttemptResultStore` 解析，并把规范 phase 与建议性 health 分开。Host 用一个原子 `snapshot` 同时发布 Session、run 清单和结构化来源健康，后续只在状态变化时推送替换事件；选中 run 才读取 `runBacklog`，展开经典 Session 才读取 `classicSessionDetail`。`waiting` 按本次 invocation 的终态处理；断连后重读同一 snapshot 路径恢复。viewer 优先使用 `KERSOR_ROOT`，否则复用 preset 的 `.local/kersor-root`。
 
-环境变量 `KERSOR_ROOT` 可以临时覆盖安装时记录的 checkout：
+环境变量 `KERSOR_ROOT` 可以临时覆盖 status／compose 等经典入口所用的 checkout；安全敏感的 generic `evolve` 路径始终只使用安装时记录值，若要切换必须重新安装 preset：
 
 ```bash
 KERSOR_ROOT=/another/KerSor dsh

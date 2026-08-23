@@ -16,14 +16,18 @@ bridge="${DSH_HOME:-$HOME/.dsh}/.agent-presets/kersor/bin/kersor_bridge.py"
 kersor_root="$("${KERSOR_PYTHON:-python3}" "$bridge" root)"
 ```
 
-`KERSOR_ROOT` overrides the checkout recorded by the installer. If resolution fails, stop and report the bridge diagnostic instead of guessing a path.
+`KERSOR_ROOT` overrides the checkout recorded by the installer for classic
+optimize/status/compose operations. Generic evolve is security-sensitive: before
+creating its contract, resolve
+`"${KERSOR_PYTHON:-python3}" "$bridge" root --recorded` and use only that checkout
+for its trusted runtime config. If resolution fails, stop and report the bridge
+diagnostic instead of guessing a path.
 `KERSOR_PYTHON` is the Python 3.10+ interpreter used by every bridge call; when
-unset, the DSH Host's `python3` is used. Do not replace the resolved interpreter
-with a different `python3` later in the session.
-The DSH controller prompt freezes the Host's validated absolute interpreter
-path. Export that exact value before the first shell action and carry it into
-every later command; never use `which`, PATH search, filesystem search, or
-version substitution to select another Python.
+unset, the DSH Host's `python3` is used. The Host has already frozen and exported
+`DSH_HOME` and `KERSOR_PYTHON` before this turn. Use the expressions above
+directly: do not export, echo, inspect, list, or resolve either value, and never
+call `env`, `which`, PATH search, filesystem search, or a version probe to select
+another Python. The bridge validates the inherited interpreter itself.
 
 Before changing a KerSor checkout, read `$kersor_root/AGENTS.md`. Before running a workflow, read the relevant current command protocol under `$kersor_root/commands/` and any file it directly names.
 
@@ -36,6 +40,19 @@ workspace Session with `kersor_attach`, and continue a bound experiment with
 binding before a continuable DSH child starts, so the full controller dialog
 and Workflow tree remain inspectable after a turn ends. `kersor_resume` always
 targets the original child and never creates another dispatch.
+
+Those controls are optimization-only. A `kersor-task-v1`, a
+`kersor-mission-v1`, or a general non-benchmark problem must use the generic
+evolve route below. Never translate a generic contract into backend, language,
+speedup, correctness, or benchmark fields and never call `kersor_start` for it.
+
+`kersor_start` requires the complete typed launch. `kersor_attach` requires the
+exact durable origin Experiment id and an exact copy of that origin's typed
+launch; it cannot infer authority from a Session directory. Attach persists a
+recoverable intent, transfers and freezes the source controller authority, and
+imports the bounded source event prefix into one stable attached controller.
+If materialization is interrupted, use `kersor_resume` to complete that same
+intent idempotently instead of issuing another attach or recreating receipts.
 
 After any successful `kersor_start`, `kersor_attach`, or `kersor_resume` call,
 end the parent turn immediately. The parent must not call `kersor_status`,
@@ -57,11 +74,96 @@ wrong.
 
 ## Route the request
 
+- For a frozen `kersor-mission-v1`, call `kersor_evolve` with
+  `{"contract":"<absolute-contract-path>"}`. When the user supplied that exact
+  path, this must be the first and only tool call of the turn: do not invoke
+  Bash, pre-read, list, parse, or summarize the contract, Session, runtime
+  config, source, or tests. The Host tool owns the foreground process, timeout,
+  cancellation, bounded output, install-recorded checkout and Python, contract
+  hash, Session admission, and terminal JSON. The recorded checkout must be
+  physically outside the workspace, and the Host passes only frozen HOME, TMP,
+  PATH, and KerSor routing values; ambient cloud, provider, and SSH tokens are
+  never inherited. Provider CLIs use their install-recorded local login. Resume only on a later user turn
+  in a new top-level DSH session with the same absolute `run_dir` and
+  `resume:true`; every session may call `kersor_evolve` only once, including a
+  failed or cancelled call. After any completed or
+  blocked result, report that exact result and stop; never inspect, retry, or
+  fall back in the same turn. A Mission is deliberately rejected from the Bash
+  bridge route so it cannot inherit the calling agent's nested Seatbelt.
+- For a frozen `kersor-task-v1`, run
+  `"${KERSOR_PYTHON:-python3}" "$bridge" evolve --contract <contract-path>`.
+  Fixed Tasks support only `runtime=codex` and retain the workspace-confined
+  Codex shell route and outer workspace-write attestation. Make this foreground
+  invocation the first and only shell action; do not pre-read or inspect its
+  inputs, add environment assignments, background it, or poll it. An explicit
+  Task run directory must be one direct child of `workspace/.kersor`. Report
+  the exact terminal JSON/status and stop after the invocation returns.
 - For a kernel file or task directory, preflight the direct route with `"${KERSOR_PYTHON:-python3}" "$bridge" compose optimize --path <path> --json`.
 - For a bundled case, list or match cases first, then use `"${KERSOR_PYTHON:-python3}" "$bridge" compose build --case <id> --json`.
 - For environment diagnosis, use `"${KERSOR_PYTHON:-python3}" "$bridge" doctor --runtime dsh`.
 - For status, call `kersor_status` first with an empty argument object. It always reads the current DSH workspace; never pass the KerSor checkout or another filesystem path. It reads canonical Session and Attempt Result stores and renders the live round, workflow, best measured speedup, target, fit, and recent decisions.
 - For resume, trace, campaign, research, export, or a named workflow, read the matching `$kersor_root/commands/<name>.md` protocol. Use `kersor_status` before resume or diagnosis so the current session—not chat memory—sets the starting point.
+
+For a natural-language general problem without a contract, inspect the current
+workspace read-only and choose the smallest profile that can satisfy the
+request. Use `kersor-task-v1` for one bounded mutate/verify loop. Use
+`kersor-mission-v1` only when the workflow topology must adapt across evidence,
+branches, checkpoints, or feedback. Write the frozen contract under the current
+workspace (for example `.kersor-contracts/<mission-id>.json`) and then use the
+matching Mission Host tool or fixed Task bridge route above;
+the user must not prepare Session JSON by hand.
+
+For a Mission, the capability registry may contain only authority already
+granted by the user's request. The planner may choose and revise nodes but may
+not invent permissions, verifier commands, output names, or Completion facts.
+For an external runtime, bind acceptance to an existing workspace-owned
+deterministic command through a Host evaluator; declare `side_effect: "read"`, use `command-v1` with
+`filesystem_policy: "read-only"`, `network_policy: "denied"`,
+`output_policy: "sealed"`, `timeout_seconds` in `(0,120]`, an optional
+`max_output_bytes` in `[1,4194304]`, and never use `materialize`. Every Host
+evaluator must be referenced by exactly one agent capability's
+`candidate_verifier`; standalone and shared evaluators are forbidden. Its fact
+projections may read only `passed`, `exit_code`, `timed_out`, or
+`artifact_set_sha256`, never raw stdout/stderr or parsed output. This policy is a
+real fail-closed Host filesystem boundary for the evaluator and all descendants,
+not a prompt-only promise. Do not create a new test oracle merely to make the
+Mission pass. Put its new Session below the workspace, such as
+`.kersor-autonomous/<mission-id>`. A read-only Mission may omit
+`runtime_config`. Every agent capability must explicitly declare
+`side_effect` as `none`, `read`, or `write`; every `write` capability must also
+declare its exact transaction artifacts. Under `runtime=codex`, a mutating
+Mission must bind
+`$kersor_root/config/runtime-codex-autonomous-write.json`; a read-only Mission
+uses `runtime-codex-autonomous.json`. Under `runtime=claude`, both profiles use
+the sole canonical `runtime-claude-autonomous.json`: the broker maps read-only
+capabilities to exactly `Read,Glob,Grep` and transaction-backed writes to exactly
+`Read,Glob,Grep,Edit,Write`, requires its per-activation OS filesystem sandbox,
+and fails preflight if that boundary is unavailable. Declare every intended
+transaction artifact and
+keep unrelated files and tests immutable. Do not use a workspace-local runtime
+config; the bridge accepts only the matching trusted KerSor config.
+
+The first DSH-native Mission slice accepts only `runtime=dsh` agent capabilities
+with `side_effect=none|read`, no transaction artifacts, and no Host evaluator or
+`command-v1` execution. It binds the admitted contract bytes and runtime before
+the bridge starts, then routes every activation through the Host-owned AF_UNIX
+endpoint to a fresh DSH `spawn` child pinned to
+`deepseek-official/deepseek-v4-flash`. The child receives only
+`read`/`glob`/`grep` plus schema-scoped `structured_output`; a synchronous guard
+also denies Bash, edits, writes, subagents, Workflows, recursive KerSor, paths
+outside the workspace, and symlink escapes. Missing usage, route drift,
+disconnect, or cancellation fails closed and disposes the child. Do not put a
+write capability, Host verifier, or arbitrary command into `runtime=dsh`; use an
+implemented external runtime until a later transaction slice opens that
+authority.
+
+For `runtime=claude`, the bridge removes ambient `CLAUDE*`, `ANTHROPIC*`, and
+KerSor routing controls and publishes only the Claude-compatible executable and
+optional model id frozen at install time. A wrapper may therefore route this
+optional backend to Infini-AI `deepseek-v4-flash`; in that configuration Claude
+Code is the agent CLI, not the model provider. `runtime=codex|claude` remains an
+external product-stack route; do not describe its results as a pure Harness
+comparison with the DSH-native path.
 
 For a direct task, preserve an explicit typed contract as composer flags such as
 `--backend python --language python_reference`; do not hide those fields in
@@ -82,35 +184,23 @@ or measurement. If setup finds prior Session history, stop and create the
 physical isolation before continuing. Prompt instructions alone are not an
 acceptable freshness boundary.
 
-Session bootstrap has one executable entrypoint. Resolve the checkout first,
-pass the task path as the required first positional argument, and invoke the
-owner script exactly. When the controller prompt carries a typed launch
-contract, bind every uppercase value below from that contract verbatim; do not
-replace it with the illustrative defaults elsewhere in this skill:
+Session bootstrap has one Host-owned executable boundary. For a created DSH
+Experiment, the controller prompt supplies the complete canonical
+`setup-session.sh` command derived from its effective typed launch. Execute
+that command byte-for-byte exactly once. Do not synthesize a shorter command,
+omit/add/reorder flags, substitute paths or Python, change the environment
+prefix, or retry after failure. The Host independently checks the new canonical
+workspace-local Session config, initial state, workflow Catalog, adapter,
+config-selected kernel, and frozen interpreter before exclusively writing
+`session-initialization-receipt.json` and its matching durable event. Only
+consume `SESSION_DIR` after that boundary succeeds.
 
-```bash
-bash "$kersor_root/scripts/setup-session.sh" "$TASK_DIR" \
-  --runtime dsh \
-  --fresh-session \
-  --integration-pattern "$INTEGRATION_PATTERN" \
-  --allow-workflow-authoring \
-  --workflow-authoring-budget "$WORKFLOW_AUTHORING_BUDGET" \
-  --max-workflows "$MAX_WORKFLOWS" \
-  --mode "$MODE" \
-  --target-speedup "$TARGET_SPEEDUP" \
-  --backend "$BACKEND" \
-  --language "$LANGUAGE" \
-  --retrieval-mode "$RETRIEVAL_MODE" \
-  --transfer-mode "$TRANSFER_MODE" \
-  --experience-mode "$EXPERIENCE_MODE" \
-  --kernelwiki-experience-export-mode "$KERNELWIKI_EXPERIENCE_EXPORT_MODE"
-```
-
-Never call it from `commands/`: that directory owns Markdown command
-protocols, not executable setup scripts. Never omit or reorder `$TASK_DIR`.
-Only consume `SESSION_DIR` after this command exits successfully; a missing
-entrypoint or non-zero setup is a hard stop, not permission to guess another
-path.
+An attached controller must not call `setup-session.sh`: it receives authority
+only from the Host's durable transfer/import chain. Never call setup from
+`commands/`; that directory owns Markdown protocols, not executable scripts.
+A missing entrypoint, non-zero setup, absent Host receipt/event, or conflicting
+existing receipt is a hard stop, not permission to guess another path or edit
+Session JSON.
 
 ### Task-native authoring
 
@@ -154,10 +244,9 @@ bash "$kersor_root/scripts/kersor-state.sh" "$SESSION_DIR" get kernelwiki_experi
 ```
 
 For a fresh task-native authoring run the expected values are respectively
-`true`, `true`, `true`, the grounded integration pattern, then the exact typed
-retrieval, experience, transfer, and KernelWiki export modes. Fresh isolation
-defaults all four to `off`; an explicit `measured-only` transfer is permitted
-only for evidence produced between rounds of this new physical Session. A
+`true`, `true`, `true`, the grounded integration pattern, then `off`, `off`,
+`off`, and `off`. Fresh isolation resolves all four modes to `off` before the
+durable launch is written; conflicting request prose is not authority. A
 mismatch is a hard stop; do not repair raw Session JSON.
 
 After the baseline witness passes and before selection, build the canonical
@@ -242,24 +331,24 @@ seal; any hash, syntax, metadata, taxonomy, or semantic failure means
 `needs_revision` and canonical `stalled`, not a patch or retry. Any extra staging
 file or directory is mixed provenance. Proposal persistence remains shared at
 `workflow-authoring/proposals`; never reuse a sibling round's attempt owners.
+The authored saver resolves both paths and requires that `--handoff` be exactly
+`dirname(--from)/author-handoff.json`. A missing handoff, a newly sealed sibling
+path, any post-seal hash mismatch, or `--force` is terminal: never re-seal,
+omit/change the handoff argument, retry with `--force`, or overwrite an existing
+Proposal to recover from that authoring attempt.
 
 Do not accept a prose-only baseline. After Session creation and before
 selection or authoring, create the minimal task-native test method through the
 deterministic initializer when the exact commands are already known, then
 record and verify the baseline through KerSor's Session-owned witness:
 
-```bash
-kersor_python="${KERSOR_PYTHON:-python3}"
-"$kersor_python" "$kersor_root/scripts/baseline-witness.py" init \
-  --session "$SESSION_DIR" \
-  --python-interpreter "$kersor_python" \
-  --correctness-command "$CORRECTNESS_COMMAND" \
-  --benchmark-command "$BENCHMARK_COMMAND"
-"$kersor_python" "$kersor_root/scripts/baseline-witness.py" record \
-  --session "$SESSION_DIR" --project-root "$TASK_DIR"
-"$kersor_python" "$kersor_root/scripts/baseline-witness.py" verify \
-  --session "$SESSION_DIR"
-```
+Use the three exact Host-frozen DSH commands documented in
+`commands/optimize.md`: `baseline-witness.py init`, then `record`, then
+`verify`. Each must begin with the controller prompt's literal
+`KERSOR_PYTHON='<absolute path>'; export KERSOR_PYTHON;` prefix and use the
+canonical bridge/root expression and exact typed command/path arguments. Each
+call is exact-once and is followed by an exclusive Host receipt plus matching
+durable event; never abbreviate these commands to a direct Python invocation.
 
 `test-method.md` owns the exact correctness and benchmark commands. The
 initializer atomically writes both commands and `Baseline Status: present`,
@@ -296,14 +385,20 @@ node "$kersor_root/scripts/prepare-dsh-workflow.mjs" \
   --report "$RUN_DIR/dsh-compatibility.json"
 ```
 
+The adapter machine-restricts every Workflow child to the inherited
+`glob`/`grep`/`read` tools. `structured_output` remains child-scoped and
+available when a schema is declared. A child must return exact candidate source
+inline; inability to write, edit, run shell commands, compile, or benchmark is
+the intended advisory-only contract, not a reason to weaken the filter.
+
 After compatibility passes, seal the host-owned candidate boundary exactly
 once, before the Workflow call:
 
-```bash
-"${KERSOR_PYTHON:-python3}" "$kersor_root/scripts/candidate-ownership.py" seal \
-  --session "$SESSION_DIR" \
-  --run-dir "$RUN_DIR"
-```
+Use the exact Host-frozen DSH seal command documented in
+`commands/optimize.md`. It must begin with the literal frozen Python prefix,
+resolve the checkout through the canonical bridge, and pass the exact absolute
+Session and run paths. The call is exact-once; never abbreviate it to a direct
+Python invocation or create the seal yourself.
 
 Then run the cooperative budget safe point and commit the durable dispatch
 start marker before entering the blocking Workflow call:
@@ -321,24 +416,26 @@ transition the Session to `stalled` and do not call Workflow.
 
 Call `kersor_workflow` exactly once with only
 `{"exp_dir":"<exact absolute RUN_DIR>"}`. The Host reads and validates the
-generated envelope, invokes the native DSH Workflow with its exact owned fields,
-and atomically commits raw `output.json`. Never call raw `workflow`, extract or
-retype the script, compare envelope hashes in the model, or write a rendered
-preview yourself. The first parent action after that blocking call returns,
-including an error, must verify the same boundary:
+generated envelope and invokes the native DSH Workflow with its exact owned
+fields. Before any raw result is returned or `output.json` is published, the
+Host revalidates the baseline/dispatch/seal chain, current Session state,
+protected files, worktree, and dispatch bytes, then exclusively writes
+`candidate-ownership.json`. Only an exact `verdict=pass` permits the Host to
+atomically commit `output.json` and return success. Never call raw `workflow`,
+extract or retype the script, compare envelope hashes in the model, write a
+rendered preview, or invoke `candidate-ownership.py verify` manually.
 
-```bash
-"${KERSOR_PYTHON:-python3}" "$kersor_root/scripts/candidate-ownership.py" verify \
-  --session "$SESSION_DIR" \
-  --run-dir "$RUN_DIR"
-```
-
-On an ownership failure, reject all child output and measurements, transition
-the Session to canonical `stalled`, and stop. Restoring an oracle afterward is
+On ownership failure the Host discards the native raw result, publishes no
+`output.json`, records the Experiment's stalled checkpoint, and returns a tool
+error. Do not collect stray files, attempt re-verification, or invoke the
+authored candidate reviewer after that error. Restoring an oracle afterward is
 recovery, not a passing result.
-When the returned `output.json` declares
-`arch_stage=awaiting_host_verification`, run the current optimize protocol's
-deterministic authored-candidate reviewer before result analysis:
+For every selected authored Proposal, require returned `output.json` to declare
+the canonical pair `arch_stage=awaiting_host_verification` and
+`selected_candidate_id`. The bounded compatibility pair
+`evaluation_status=pending_host_verification` and `candidate_identity` is also
+accepted for an already-sealed older Proposal. Then run the current optimize
+protocol's deterministic authored-candidate reviewer before result analysis:
 
 ```bash
 KERSOR_PYTHON="${KERSOR_PYTHON:-python3}" \
@@ -350,6 +447,8 @@ KERSOR_PYTHON="${KERSOR_PYTHON:-python3}" \
 It owns Session-local materialization and the immutable witness commands. Do
 not copy the returned candidate into the canonical task, edit an oracle, use a
 Workflow estimate as a measurement, or replace its Host-owned analysis.
+Require `host-verification.json` with `verdict=pass`; a missing stage/id or a
+failed review is canonical `stalled`, not permission to skip this gate.
 Never pass `scriptPath`, invoke a nested `workflow()` helper, or translate the
 Proposal ad hoc. If compatibility preparation or the Workflow call fails, do
 not rewrite the author-owned script, retry dispatch, or optimize directly as
