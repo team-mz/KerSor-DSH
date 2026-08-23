@@ -970,14 +970,91 @@ class InstallTests(unittest.TestCase):
             config_path.write_text(json.dumps(original), encoding="utf-8")
 
         local_config = workspace / "runtime-claude.json"
-        local_config.write_text(json.dumps(original), encoding="utf-8")
-        with self.assertRaisesRegex(RuntimeError, "trusted KerSor"):
-            BRIDGE.validate_claude_runtime_config(
+        local_config.write_bytes(config_path.read_bytes())
+        local_path, local_hash = BRIDGE.validate_claude_runtime_config(
+            self.kersor,
+            contract,
+            {"runtime_config": str(local_config)},
+            needs_write=False,
+        )
+        self.assertEqual(local_path, local_config.resolve())
+        self.assertEqual(local_hash, observed_hash)
+
+    def test_generic_dsh_config_accepts_only_a_byte_identical_workspace_copy(
+        self,
+    ) -> None:
+        self.prepare_generic_evolve_checkout()
+        workspace = self.root / "dsh-config-workspace"
+        workspace.mkdir()
+        contract = workspace / "mission.json"
+        contract.write_text("{}\n", encoding="utf-8")
+        trusted = self.kersor / "config" / "runtime-dsh-autonomous.json"
+        local_config = workspace / "runtime-config.json"
+        local_config.write_bytes(trusted.read_bytes())
+
+        observed_path, observed_hash = BRIDGE.validate_dsh_runtime_config(
+            self.kersor,
+            contract,
+            {"runtime_config": local_config.name},
+        )
+
+        self.assertEqual(observed_path, local_config.resolve())
+        self.assertEqual(
+            observed_hash,
+            hashlib.sha256(trusted.read_bytes()).hexdigest(),
+        )
+        local_value = json.loads(local_config.read_text(encoding="utf-8"))
+        local_value["budget"]["total_tokens"] += 1
+        local_config.write_text(json.dumps(local_value), encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "byte-identical"):
+            BRIDGE.validate_dsh_runtime_config(
                 self.kersor,
                 contract,
-                {"runtime_config": str(local_config)},
-                needs_write=False,
+                {"runtime_config": local_config.name},
             )
+
+    def test_generic_runtime_config_rejects_a_hardlink_to_the_trusted_config(
+        self,
+    ) -> None:
+        self.prepare_generic_evolve_checkout()
+        workspace = self.root / "linked-config-workspace"
+        workspace.mkdir()
+        contract = workspace / "mission.json"
+        contract.write_text("{}\n", encoding="utf-8")
+        trusted = self.kersor / "config" / "runtime-dsh-autonomous.json"
+        linked = workspace / "runtime-config.json"
+        os.link(trusted, linked)
+
+        with self.assertRaisesRegex(RuntimeError, "single-link|independent"):
+            BRIDGE.validate_dsh_runtime_config(
+                self.kersor,
+                contract,
+                {"runtime_config": linked.name},
+            )
+
+    def test_generic_runtime_config_rejects_a_workspace_symlink(self) -> None:
+        self.prepare_generic_evolve_checkout()
+        workspace = self.root / "symlink-config-workspace"
+        workspace.mkdir()
+        contract = workspace / "mission.json"
+        contract.write_text("{}\n", encoding="utf-8")
+        trusted = self.kersor / "config" / "runtime-dsh-autonomous.json"
+        independent = self.root / "independent-runtime-config.json"
+        independent.write_bytes(trusted.read_bytes())
+
+        for label, target in (("trusted", trusted), ("independent", independent)):
+            with self.subTest(label=label):
+                linked = workspace / "runtime-config.json"
+                linked.symlink_to(target)
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "cannot read runtime config"):
+                        BRIDGE.validate_dsh_runtime_config(
+                            self.kersor,
+                            contract,
+                            {"runtime_config": linked.name},
+                        )
+                finally:
+                    linked.unlink()
 
     def test_generic_evolve_requires_the_host_rpc_for_dsh_runtime(self) -> None:
         self.prepare_generic_evolve_checkout()
@@ -1121,7 +1198,7 @@ class InstallTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 2)
         self.assertIn(
-            "must use the trusted KerSor runtime-codex-autonomous-write.json",
+            "runtime config must be runtime-codex-autonomous-write.json",
             completed.stderr,
         )
         self.assertFalse(session.exists())
@@ -1169,10 +1246,15 @@ class InstallTests(unittest.TestCase):
         )
 
         self.assertEqual(completed.returncode, 2)
-        self.assertIn("must use the trusted KerSor", completed.stderr)
+        self.assertIn(
+            "runtime config must be runtime-codex-autonomous.json",
+            completed.stderr,
+        )
         self.assertFalse(session.exists())
 
-    def test_generic_evolve_rejects_workspace_local_runtime_config(self) -> None:
+    def test_generic_evolve_accepts_byte_identical_workspace_runtime_config(
+        self,
+    ) -> None:
         self.prepare_generic_evolve_checkout()
         destination, _, _ = self.run_install()
         self.prepare_installed_generic_tools(destination)
@@ -1217,8 +1299,13 @@ class InstallTests(unittest.TestCase):
             text=True,
         )
 
-        self.assertEqual(completed.returncode, 2)
-        self.assertIn("must use the trusted KerSor", completed.stderr)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        argv = (contract.with_suffix(".json.argv")).read_text(encoding="utf-8")
+        self.assertIn(hashlib.sha256(local_config.read_bytes()).hexdigest(), argv)
+        self.assertEqual(
+            json.loads(contract.read_text(encoding="utf-8"))["runtime_config"],
+            str(local_config),
+        )
 
     def test_generic_evolve_rejects_unsandboxed_read_only_host_evaluator(self) -> None:
         self.prepare_generic_evolve_checkout()

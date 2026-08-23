@@ -33,6 +33,7 @@ const MAX_RPC_CONNECTIONS = 64
 const MAX_RPC_ERROR_BYTES = 4_096
 const TERMINAL_STATUSES = new Set(['completed', 'blocked', 'waiting', 'failed'])
 const CLAIMED_SESSIONS = new WeakSet()
+const CLAIMED_TURNS = new WeakMap()
 const CHILD_POLICY = new AsyncLocalStorage()
 
 function isRecord(value) {
@@ -737,12 +738,48 @@ async function topLevelWorkspace(exec) {
   }
 }
 
-function claimSession(session) {
+function toolCallTurn(session, callId) {
+  const events = Array.isArray(session?.events) ? session.events : []
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event?.type !== 'tool/call' || event.data?.callId !== callId) continue
+    return Number.isInteger(event.data.turn) && event.data.turn > 0
+      ? event.data.turn
+      : undefined
+  }
+  return undefined
+}
+
+function executionTurn(session, exec) {
+  const directTurn = toolCallTurn(session, exec.callId)
+  if (directTurn !== undefined) return directTurn
+  if (exec.rootCallId === undefined || exec.rootCallId === exec.callId) return undefined
+  return toolCallTurn(session, exec.rootCallId)
+}
+
+function claimSession(session, exec) {
   if (!isRecord(session)) throw new Error('kersor_evolve requires a stable DSH session')
   if (CLAIMED_SESSIONS.has(session)) {
     throw new Error('kersor_evolve permits only one call per top-level DSH session; retry in a new session')
   }
+  const turn = executionTurn(session, exec)
+  if (turn === undefined) {
+    throw new Error('kersor_evolve could not bind its top-level DSH turn')
+  }
   CLAIMED_SESSIONS.add(session)
+  CLAIMED_TURNS.set(session, turn)
+}
+
+function claimedTurnGuard(exec) {
+  const session = exec.agent?.session
+  if (!isRecord(session)) return undefined
+  const claimedTurn = CLAIMED_TURNS.get(session)
+  if (claimedTurn === undefined) return undefined
+  const currentTurn = executionTurn(session, exec)
+  if (currentTurn === claimedTurn || currentTurn === undefined) {
+    return 'kersor_evolve owns the rest of this DSH turn; later tool calls are denied'
+  }
+  return undefined
 }
 
 async function missionPath(value, workspace) {
@@ -794,88 +831,100 @@ export function createTool({ctx, timeoutMs = DEFAULT_TIMEOUT_MS} = {}) {
           status: {type: 'string', enum: ['completed', 'blocked', 'waiting', 'failed']},
           revision: {oneOf: [{type: 'integer'}, {type: 'null'}]},
           run_dir: {type: 'string'},
+          error: {type: 'string'},
         },
         required: ['status'],
       },
       render: (_args, value) => [{type: 'text', text: JSON.stringify(value)}],
+      presentationMeta: (_args, value) => ({status: value.status}),
     },
     async execute(args, exec) {
       const {workspace, lexicalWorkspace, session} = await topLevelWorkspace(exec)
-      claimSession(session)
       const contract = await missionPath(args.contract, workspace)
-      const resume = args.resume === true
-      const runDir = optionalRunDir(args.run_dir, workspace, resume)
-      const runtime = await installedRuntime(workspace)
-      const selectedContract = await missionRuntime(contract)
-      if (selectedContract.runtime === 'dsh' && !ctx?.subagents) {
-        throw new Error('runtime=dsh requires the DSH subagent Host service')
-      }
-      const argv = [
-        runtime.bridge,
-        'evolve',
-        '--host-execution',
-        '--contract',
-        contract,
-        '--expected-contract-sha256',
-        selectedContract.sha256,
-      ]
-      if (typeof selectedContract.runtime === 'string') {
-        argv.push('--expected-runtime', selectedContract.runtime)
-      }
-      if (runDir !== null) argv.push('--run-dir', runDir)
-      if (resume) argv.push('--resume')
-      let rpc = null
-      let completed
+      claimSession(session, exec)
       try {
-        if (selectedContract.runtime === 'dsh') {
-          rpc = await createDshRpcHost({
-            ctx,
-            parent: exec.agent,
-            workspace,
-            lexicalWorkspace,
-            runtime,
-            signal: exec.signal,
-          })
+        const resume = args.resume === true
+        const runDir = optionalRunDir(args.run_dir, workspace, resume)
+        const runtime = await installedRuntime(workspace)
+        const selectedContract = await missionRuntime(contract)
+        if (selectedContract.runtime === 'dsh' && !ctx?.subagents) {
+          throw new Error('runtime=dsh requires the DSH subagent Host service')
         }
-        const process = runHostProcess({
-          command: runtime.python,
-          args: argv,
-          cwd: workspace,
-          environment: rpc === null ? hostEnvironment(runtime) : dshHostEnvironment(runtime, rpc),
-          signal: rpc === null ? exec.signal : rpc.signal,
-          timeoutMs,
-        })
-        if (rpc === null) {
-          completed = await process
-        } else {
-          try {
-            completed = await Promise.race([process, rpc.failure])
-          } catch (error) {
-            await Promise.allSettled([process])
-            throw error
+        const argv = [
+          runtime.bridge,
+          'evolve',
+          '--host-execution',
+          '--contract',
+          contract,
+          '--expected-contract-sha256',
+          selectedContract.sha256,
+        ]
+        if (typeof selectedContract.runtime === 'string') {
+          argv.push('--expected-runtime', selectedContract.runtime)
+        }
+        if (runDir !== null) argv.push('--run-dir', runDir)
+        if (resume) argv.push('--resume')
+        let rpc = null
+        let completed
+        try {
+          if (selectedContract.runtime === 'dsh') {
+            rpc = await createDshRpcHost({
+              ctx,
+              parent: exec.agent,
+              workspace,
+              lexicalWorkspace,
+              runtime,
+              signal: exec.signal,
+            })
           }
+          const process = runHostProcess({
+            command: runtime.python,
+            args: argv,
+            cwd: workspace,
+            environment: rpc === null ? hostEnvironment(runtime) : dshHostEnvironment(runtime, rpc),
+            signal: rpc === null ? exec.signal : rpc.signal,
+            timeoutMs,
+          })
+          if (rpc === null) {
+            completed = await process
+          } else {
+            try {
+              completed = await Promise.race([process, rpc.failure])
+            } catch (error) {
+              await Promise.allSettled([process])
+              throw error
+            }
+          }
+        } finally {
+          if (rpc !== null) await rpc.close()
         }
-      } finally {
-        if (rpc !== null) await rpc.close()
+        let terminal
+        try {
+          terminal = parseTerminalJson(completed.stdout)
+        } catch (cause) {
+          const detail = String(completed.stderr || completed.stdout || `exit ${completed.code}`).trim().slice(-4_096)
+          throw new Error(
+            `KerSor Host bridge failed with exit ${completed.code}: ${cause.message}; ${detail}`,
+            {cause},
+          )
+        }
+        const expectedExit = terminal.status === 'completed' ? 0 : 2
+        if (completed.code !== expectedExit) {
+          throw new Error(
+            `KerSor Host bridge returned ${terminal.status} with exit ${completed.code}; expected ${expectedExit}`,
+          )
+        }
+        exec.concludeTurn()
+        return terminal
+      } catch (error) {
+        if (exec.signal.aborted) throw error
+        exec.concludeTurn()
+        return {
+          status: 'failed',
+          revision: null,
+          error: String(error?.message ?? error).trim().slice(-4_096),
+        }
       }
-      let terminal
-      try {
-        terminal = parseTerminalJson(completed.stdout)
-      } catch (cause) {
-        const detail = String(completed.stderr || completed.stdout || `exit ${completed.code}`).trim().slice(-4_096)
-        throw new Error(
-          `KerSor Host bridge failed with exit ${completed.code}: ${cause.message}; ${detail}`,
-          {cause},
-        )
-      }
-      const expectedExit = terminal.status === 'completed' ? 0 : 2
-      if (completed.code !== expectedExit) {
-        throw new Error(
-          `KerSor Host bridge returned ${terminal.status} with exit ${completed.code}; expected ${expectedExit}`,
-        )
-      }
-      exec.concludeTurn()
-      return terminal
     },
     presentCall: () => ({card: 'generic', title: 'Run KerSor Mission', kind: 'execute'}),
     presentResult(_args, result) {
@@ -886,6 +935,7 @@ export function createTool({ctx, timeoutMs = DEFAULT_TIMEOUT_MS} = {}) {
 }
 
 export function apply(ctx) {
+  ctx.tools.guard(claimedTurnGuard)
   ctx.on('agent/created', ({agent}) => {
     const policy = CHILD_POLICY.getStore()
     if (policy === undefined) return

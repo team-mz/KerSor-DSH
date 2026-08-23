@@ -140,8 +140,14 @@ capabilities to exactly `Read,Glob,Grep` and transaction-backed writes to exactl
 `Read,Glob,Grep,Edit,Write`, requires its per-activation OS filesystem sandbox,
 and fails preflight if that boundary is unavailable. Declare every intended
 transaction artifact and
-keep unrelated files and tests immutable. Do not use a workspace-local runtime
-config; the bridge accepts only the matching trusted KerSor config.
+keep unrelated files and tests immutable. Do not author an arbitrary
+workspace-local runtime config. A generic-v1 materializer may copy the matching
+trusted KerSor config into the workspace; the bridge accepts that copy only
+when it is a regular single-link file with an independent inode and its bytes
+exactly match the runtime-specific trusted config, then binds the expected
+SHA-256 again at launch. A completed DSH turn is not Mission success: only a
+Host-owned `kersor_evolve` status of `completed` plus the matching Core result
+may be reported as successful.
 
 The first DSH-native Mission slice accepts only `runtime=dsh` agent capabilities
 with `side_effect=none|read`, no transaction artifacts, and no Host evaluator or

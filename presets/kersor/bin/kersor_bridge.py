@@ -40,6 +40,7 @@ DSH_RPC_NONCE_ENV = "KERSOR_DSH_RPC_NONCE"
 DSH_RPC_MAX_FRAME_BYTES = 16 * 1024 * 1024
 DSH_PROVIDER = "deepseek-official"
 DSH_MODEL = "deepseek-v4-flash"
+MAX_RUNTIME_CONFIG_BYTES = 1 * 1024 * 1024
 MAX_MODEL_ID_LENGTH = 128
 MINIMUM_PYTHON = (3, 10)
 TERMINAL_PHASES = frozenset({"complete", "stalled", "cancelled", "single_run"})
@@ -429,6 +430,15 @@ def contract_path(contract: Path, value: object, field: str) -> Path:
     return (candidate if candidate.is_absolute() else contract.parent / candidate).resolve()
 
 
+def contract_lexical_path(contract: Path, value: object, field: str) -> Path:
+    """Normalize a contract path without resolving its final filesystem object."""
+    if not isinstance(value, str) or not value:
+        raise RuntimeError(f"generic evolve contract {field} must be a non-empty string")
+    candidate = Path(value).expanduser()
+    selected = candidate if candidate.is_absolute() else contract.parent / candidate
+    return Path(os.path.abspath(selected))
+
+
 def require_descendant(path: Path, parent: Path, label: str) -> None:
     """Reject a path that is not owned by the current DSH workspace."""
     try:
@@ -642,6 +652,109 @@ def validate_finite_runtime_budget(config: dict[str, Any]) -> None:
         )
 
 
+def trusted_runtime_config_bytes(
+    config_path: Path,
+    expected_config: Path,
+) -> bytes:
+    """Accept the trusted config itself or one byte-identical materialized copy."""
+    descriptors: list[int] = []
+
+    def open_regular_single_link(
+        path: Path,
+        label: str,
+    ) -> tuple[int, os.stat_result]:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as error:
+            raise RuntimeError(f"cannot read {label} {path}: {error}") from error
+        descriptors.append(descriptor)
+        metadata = os.fstat(descriptor)
+        if not stat_module.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise RuntimeError(f"{label} must be a regular single-link file: {path}")
+        if metadata.st_size > MAX_RUNTIME_CONFIG_BYTES:
+            raise RuntimeError(f"{label} exceeds the runtime config size limit: {path}")
+        return descriptor, metadata
+
+    def read_snapshot(
+        descriptor: int,
+        before: os.stat_result,
+        path: Path,
+        label: str,
+    ) -> bytes:
+        chunks: list[bytes] = []
+        retained = 0
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(65_536, MAX_RUNTIME_CONFIG_BYTES + 1 - retained),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            retained += len(chunk)
+            if retained > MAX_RUNTIME_CONFIG_BYTES:
+                raise RuntimeError(f"{label} exceeds the runtime config size limit: {path}")
+        after = os.fstat(descriptor)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(before, field) != getattr(after, field)
+            for field in stable_fields
+        ):
+            raise RuntimeError(f"{label} changed while it was being read: {path}")
+        return b"".join(chunks)
+
+    try:
+        expected_descriptor, expected_metadata = open_regular_single_link(
+            expected_config,
+            "trusted runtime config",
+        )
+        config_descriptor, config_metadata = open_regular_single_link(
+            config_path,
+            "runtime config",
+        )
+        if config_path != expected_config and (
+            config_metadata.st_dev,
+            config_metadata.st_ino,
+        ) == (
+            expected_metadata.st_dev,
+            expected_metadata.st_ino,
+        ):
+            raise RuntimeError(
+                "materialized runtime config must be independent from the trusted runtime config"
+            )
+        expected_bytes = read_snapshot(
+            expected_descriptor,
+            expected_metadata,
+            expected_config,
+            "trusted runtime config",
+        )
+        config_bytes = read_snapshot(
+            config_descriptor,
+            config_metadata,
+            config_path,
+            "runtime config",
+        )
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+    if config_bytes != expected_bytes:
+        raise RuntimeError(
+            f"runtime config must be {expected_config.name} or a byte-identical "
+            "materialized copy"
+        )
+    return config_bytes
+
+
 def validate_codex_runtime_config(
     root: Path,
     contract: Path,
@@ -665,17 +778,9 @@ def validate_codex_runtime_config(
     config_path = (
         default_config
         if configured is None
-        else contract_path(contract, configured, "runtime_config")
+        else contract_lexical_path(contract, configured, "runtime_config")
     )
-    if config_path != expected_config:
-        label = "workspace-write" if needs_write else "read-only"
-        raise RuntimeError(
-            f"a {label} Mission must use the trusted KerSor {expected_config.name}"
-        )
-    try:
-        config_bytes = config_path.read_bytes()
-    except OSError as error:
-        raise RuntimeError(f"cannot read runtime config {config_path}: {error}") from error
+    config_bytes = trusted_runtime_config_bytes(config_path, expected_config)
     config = required_json_object_bytes(config_bytes, config_path, "runtime config")
     validate_finite_runtime_budget(config)
     broker = config.get("broker")
@@ -700,7 +805,7 @@ def validate_codex_runtime_config(
         "sandbox_probe_command"
     ) is not None:
         raise RuntimeError("generic evolve runtime config cannot replace sandbox preflight")
-    return config_path, hashlib.sha256(config_bytes).hexdigest()
+    return config_path.resolve(), hashlib.sha256(config_bytes).hexdigest()
 
 
 def validate_claude_runtime_config(
@@ -718,18 +823,9 @@ def validate_claude_runtime_config(
     config_path = (
         expected_config
         if configured is None
-        else contract_path(contract, configured, "runtime_config")
+        else contract_lexical_path(contract, configured, "runtime_config")
     )
-    if config_path != expected_config:
-        label = "mutating" if needs_write else "read-only"
-        raise RuntimeError(
-            f"a {label} Claude contract must use the trusted KerSor "
-            f"{expected_config.name}"
-        )
-    try:
-        config_bytes = config_path.read_bytes()
-    except OSError as error:
-        raise RuntimeError(f"cannot read runtime config {config_path}: {error}") from error
+    config_bytes = trusted_runtime_config_bytes(config_path, expected_config)
     config = required_json_object_bytes(config_bytes, config_path, "runtime config")
     validate_finite_runtime_budget(config)
     broker = config.get("broker")
@@ -761,7 +857,7 @@ def validate_claude_runtime_config(
         )
     if broker.get("extra_args", []) != []:
         raise RuntimeError("generic Claude evolve cannot add Claude CLI arguments")
-    return config_path, hashlib.sha256(config_bytes).hexdigest()
+    return config_path.resolve(), hashlib.sha256(config_bytes).hexdigest()
 
 
 def validate_dsh_runtime_config(
@@ -775,17 +871,9 @@ def validate_dsh_runtime_config(
     config_path = (
         expected_config
         if configured is None
-        else contract_path(contract, configured, "runtime_config")
+        else contract_lexical_path(contract, configured, "runtime_config")
     )
-    if config_path != expected_config:
-        raise RuntimeError(
-            "a DSH-native Mission must use the trusted KerSor "
-            "runtime-dsh-autonomous.json"
-        )
-    try:
-        config_bytes = config_path.read_bytes()
-    except OSError as error:
-        raise RuntimeError(f"cannot read runtime config {config_path}: {error}") from error
+    config_bytes = trusted_runtime_config_bytes(config_path, expected_config)
     config = required_json_object_bytes(config_bytes, config_path, "runtime config")
     validate_finite_runtime_budget(config)
     broker = config.get("broker")
@@ -806,7 +894,7 @@ def validate_dsh_runtime_config(
             raise RuntimeError(
                 f"generic DSH evolve requires broker.{field}={expected_value!r}"
             )
-    return config_path, hashlib.sha256(config_bytes).hexdigest()
+    return config_path.resolve(), hashlib.sha256(config_bytes).hexdigest()
 
 
 def validate_core_mission(

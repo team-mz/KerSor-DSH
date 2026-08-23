@@ -72,22 +72,41 @@ if (request.abort_after_ms !== undefined) {
 }
 let concludeCount = 0
 const exec = {
-  agent: {session: {header: {cwd: request.cwd, origin: request.origin ?? 'user'}}},
+  callId: 'call-test-evolve',
+  agent: {session: {
+    header: {cwd: request.cwd, origin: request.origin ?? 'user'},
+    events: [{type: 'tool/call', data: {turn: 1, step: 1, callId: 'call-test-evolve', name: 'kersor_evolve'}}],
+  }},
   signal: controller.signal,
   concludeTurn() { concludeCount += 1 },
 }
 let payload
 try {
   const value = await tool.execute(request.args, exec)
+  const meta = tool.output.presentationMeta?.(request.args, value)
+  const presentation = tool.presentResult?.(request.args, {isError: false, content: [], meta})
   if (request.second_call === true) {
     try {
       await tool.execute(request.args, exec)
       payload = {ok: false, conclude_count: concludeCount, error: 'second call unexpectedly succeeded'}
     } catch (error) {
-      payload = {ok: true, conclude_count: concludeCount, value, second_error: String(error?.message ?? error)}
+      payload = {
+        ok: true,
+        conclude_count: concludeCount,
+        value,
+        presentation_meta: meta,
+        presentation,
+        second_error: String(error?.message ?? error),
+      }
     }
   } else {
-    payload = {ok: true, conclude_count: concludeCount, value}
+    payload = {
+      ok: true,
+      conclude_count: concludeCount,
+      value,
+      presentation_meta: meta,
+      presentation,
+    }
   }
 } catch (error) {
   if (request.second_call === true) {
@@ -125,6 +144,7 @@ const telemetry = {
   guards: {},
   dispose_count: 0,
 }
+const topLevelGuards = []
 let registeredTool
 const child = {
   id: 'dsh-child-route-probe',
@@ -155,12 +175,19 @@ const child = {
 }
 const callingAgent = {
   id: 'dsh-parent-route-probe',
-  session: {header: {cwd: request.cwd, origin: 'user'}},
+  session: {
+    header: {cwd: request.cwd, origin: 'user'},
+    events: [{type: 'tool/call', data: {turn: 1, step: 1, callId: 'call-dsh-evolve', name: 'kersor_evolve'}}],
+  },
 }
 const ctx = {
   tools: {
     register(tool) {
       registeredTool = tool
+      return () => undefined
+    },
+    guard(value) {
+      topLevelGuards.push(value)
       return () => undefined
     },
   },
@@ -236,6 +263,7 @@ if (request.abort_after_ms !== undefined) {
   setTimeout(() => controller.abort(new Error('test DSH cancellation')), request.abort_after_ms).unref()
 }
 const exec = {
+  callId: 'call-dsh-evolve',
   agent: callingAgent,
   signal: controller.signal,
   concludeTurn() { telemetry.conclude_count = (telemetry.conclude_count ?? 0) + 1 },
@@ -243,6 +271,40 @@ const exec = {
 let payload
 try {
   const value = await registeredTool.execute(request.args, exec)
+  if (request.guard_probe === true) {
+    callingAgent.session.events.push({
+      type: 'tool/call',
+      data: {turn: 1, step: 1, callId: 'call-same-turn-bash', name: 'bash'},
+    })
+    telemetry.same_turn_denials = topLevelGuards
+      .map(guard => guard({name: 'bash', callId: 'call-same-turn-bash', agent: callingAgent}))
+      .filter(value => value !== undefined)
+    callingAgent.session.events.push({
+      type: 'tool/call',
+      data: {turn: 1, step: 1, callId: 'call-same-turn-code', name: 'run_code'},
+    })
+    telemetry.same_turn_nested_denials = topLevelGuards
+      .map(guard => guard({
+        name: 'read',
+        callId: 'call-same-turn-code:code:1',
+        rootCallId: 'call-same-turn-code',
+        agent: callingAgent,
+      }))
+      .filter(value => value !== undefined)
+    callingAgent.session.events.push({type: 'turn/end', data: {turn: 1}})
+    callingAgent.session.events.push({
+      type: 'tool/call',
+      data: {turn: 2, step: 1, callId: 'call-next-turn-code', name: 'run_code'},
+    })
+    telemetry.next_turn_denials = topLevelGuards
+      .map(guard => guard({
+        name: 'read',
+        callId: 'call-next-turn-code:code:1',
+        rootCallId: 'call-next-turn-code',
+        agent: callingAgent,
+      }))
+      .filter(value => value !== undefined)
+  }
   payload = {ok: true, value, telemetry}
 } catch (error) {
   payload = {ok: false, error: String(error?.message ?? error), telemetry}
@@ -476,6 +538,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         *,
         abort_after_ms: int | None = None,
         child_mode: str | None = None,
+        guard_probe: bool = False,
     ) -> dict[str, object]:
         request: dict[str, object] = {
             "module": str(self.module),
@@ -489,6 +552,8 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             request["abort_after_ms"] = abort_after_ms
         if child_mode is not None:
             request["child_mode"] = child_mode
+        if guard_probe:
+            request["guard_probe"] = True
         completed = subprocess.run(
             [NODE, "--input-type=module", "-e", DSH_NODE_DRIVER],
             input=json.dumps(request),
@@ -503,11 +568,16 @@ class KerSorEvolvePluginTests(unittest.TestCase):
     def test_public_tool_routes_read_only_dsh_mission_to_pinned_spawn_child(self) -> None:
         self.prepare_dsh_native_core()
         session = self.workspace / ".kersor-autonomous" / "route-probe"
+        local_runtime_config = self.workspace / "runtime-config.json"
+        local_runtime_config.write_bytes(
+            (self.core / "config" / "runtime-dsh-autonomous.json").read_bytes()
+        )
         contract = self.write_contract(
             contract_version="kersor-mission-v1",
             workspace=str(self.workspace),
             session=str(session),
             runtime="dsh",
+            runtime_config=local_runtime_config.name,
             mission={
                 "mission_id": "route-probe",
                 "goal": "inspect safely",
@@ -522,7 +592,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             }],
         )
 
-        result = self.invoke_dsh_native(contract)
+        result = self.invoke_dsh_native(contract, guard_probe=True)
 
         self.assertTrue(result["ok"], result.get("error"))
         telemetry = result["telemetry"]
@@ -537,6 +607,11 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self.assertEqual(start["tool_filter"], {"allow": ["read", "glob", "grep"]})
         self.assertEqual(telemetry["dispose_count"], 1)
         self.assertEqual(telemetry["conclude_count"], 1)
+        self.assertEqual(len(telemetry["same_turn_denials"]), 1)
+        self.assertIn("owns the rest", telemetry["same_turn_denials"][0])
+        self.assertEqual(len(telemetry["same_turn_nested_denials"]), 1)
+        self.assertIn("owns the rest", telemetry["same_turn_nested_denials"][0])
+        self.assertEqual(telemetry["next_turn_denials"], [])
         for allowed in ("read", "glob", "grep", "structured_output"):
             self.assertIsNone(telemetry["guards"][allowed])
         for forbidden in ("edit", "write", "bash", "subagent", "workflow", "kersor_evolve"):
@@ -617,8 +692,13 @@ class KerSorEvolvePluginTests(unittest.TestCase):
 
         result = self.invoke_dsh_native(contract)
 
-        self.assertFalse(result["ok"])
-        self.assertIn("read-only Mission capabilities only", result["error"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn(
+            "read-only Mission capabilities only",
+            result["value"]["error"],
+        )
+        self.assertEqual(result["telemetry"]["conclude_count"], 1)
         self.assertEqual(result["telemetry"]["starts"], [])
 
     def test_core_disconnect_aborts_and_disposes_only_that_dsh_child(self) -> None:
@@ -707,8 +787,13 @@ class KerSorEvolvePluginTests(unittest.TestCase):
 
         result = self.invoke_dsh_native(contract)
 
-        self.assertFalse(result["ok"])
-        self.assertIn("rejects Host evaluator and command", result["error"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn(
+            "rejects Host evaluator and command",
+            result["value"]["error"],
+        )
+        self.assertEqual(result["telemetry"]["conclude_count"], 1)
         self.assertEqual(result["telemetry"]["starts"], [])
         self.assertNotIn("outside-secret-must-not-leak", json.dumps(result))
 
@@ -763,9 +848,13 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             f"{self.workspace}\n", encoding="utf-8"
         )
         result, _ = self.invoke({"contract": str(contract)})
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["conclude_count"], 0)
-        self.assertIn("checkout cannot be owned by the DSH workspace", result["error"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["conclude_count"], 1)
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn(
+            "checkout cannot be owned by the DSH workspace",
+            result["value"]["error"],
+        )
 
     def test_blocked_terminal_is_returned_and_concludes(self) -> None:
         contract = self.write_contract(status="blocked", exit=2)
@@ -787,8 +876,14 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             {"contract": str(contract)}, second_call=True
         )
         self.assertTrue(result["ok"])
-        self.assertEqual(result["conclude_count"], 0)
-        self.assertIn("completed|blocked|waiting|failed", result["first_error"])
+        self.assertEqual(result["conclude_count"], 1)
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("completed|blocked|waiting|failed", result["value"]["error"])
+        self.assertEqual(result["presentation_meta"], {"status": "failed"})
+        self.assertEqual(
+            result["presentation"]["title"],
+            "KerSor Mission · failed",
+        )
         self.assertIn("only one call per top-level DSH session", result["second_error"])
 
     def test_terminal_status_and_exit_code_mapping_is_closed(self) -> None:
@@ -800,12 +895,19 @@ class KerSorEvolvePluginTests(unittest.TestCase):
                 self.assertEqual(result["conclude_count"], 1)
         unknown = self.write_contract(status="cancelled", exit=2)
         result, _ = self.invoke({"contract": str(unknown)})
-        self.assertFalse(result["ok"])
-        self.assertIn("completed|blocked|waiting|failed", result["error"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["conclude_count"], 1)
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn(
+            "completed|blocked|waiting|failed",
+            result["value"]["error"],
+        )
         mismatch = self.write_contract(status="waiting", exit=0)
         result, _ = self.invoke({"contract": str(mismatch)})
-        self.assertFalse(result["ok"])
-        self.assertIn("expected 2", result["error"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["conclude_count"], 1)
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("expected 2", result["value"]["error"])
 
     def test_cancel_terminates_the_foreground_process_group(self) -> None:
         contract = self.write_contract(mode="sleep")
@@ -846,9 +948,10 @@ class KerSorEvolvePluginTests(unittest.TestCase):
     def test_rejects_multiple_json_terminals(self) -> None:
         contract = self.write_contract(mode="multiple")
         result, _ = self.invoke({"contract": str(contract)})
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["conclude_count"], 0)
-        self.assertIn("exactly one JSON terminal", result["error"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["conclude_count"], 1)
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("exactly one JSON terminal", result["value"]["error"])
 
 
 if __name__ == "__main__":
