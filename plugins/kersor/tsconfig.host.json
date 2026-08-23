@@ -39,6 +39,9 @@
       "path": "../../subprocess/subprocess"
     },
     {
+      "path": "../../shell/tool-bash"
+    },
+    {
       "path": "../../typert/protocol"
     },
     {

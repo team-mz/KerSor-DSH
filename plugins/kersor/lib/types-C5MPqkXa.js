@@ -19,6 +19,28 @@ const LAUNCH_KEYS = new Set([
 	"correctness_command",
 	"benchmark_command"
 ]);
+/**
+* Serialize a lossless JSON value with recursively sorted object keys.
+* Arrays retain their source order. Host authority hashes use these exact UTF-8
+* bytes so producers and invariant replay cannot diverge on property insertion
+* order.
+* @param value - Lossless JSON value to serialize canonically.
+* @returns Canonical JSON text with recursively sorted object keys.
+*/
+function canonicalKersorJson(value) {
+	if (value === null) return "null";
+	if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) throw new TypeError("KerSor canonical JSON requires finite numbers");
+		return JSON.stringify(value);
+	}
+	if (Array.isArray(value)) return `[${value.map(canonicalKersorJson).join(",")}]`;
+	if (typeof value !== "object") throw new TypeError("KerSor canonical JSON requires a lossless JSON value");
+	const prototype = Object.getPrototypeOf(value);
+	if (prototype !== null && prototype !== Object.prototype) throw new TypeError("KerSor canonical JSON requires plain JSON objects");
+	const record = value;
+	return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalKersorJson(record[key])}`).join(",")}}`;
+}
 function launchRecord(value, label) {
 	if (value === null || typeof value !== "object" || Array.isArray(value)) throw new TypeError(`${label} must be a plain JSON object`);
 	const prototype = Object.getPrototypeOf(value);
@@ -36,6 +58,7 @@ function launchText(record, key, label) {
 }
 function launchCommand(record, key, label) {
 	const value = launchText(record, key, label);
+	if (value !== value.trim()) throw new TypeError(`${label}.${key} must already be trimmed`);
 	if (/[\r\n\u2028\u2029]/u.test(value)) throw new TypeError(`${label}.${key} must be a single-line string`);
 	return value;
 }
@@ -62,9 +85,41 @@ function launchInteger(record, key, minimum, label) {
 */
 function parseKersorLaunchContract(value, label = "KerSor launch contract") {
 	const record = launchRecord(value, label);
+	const backend = launchEnum(record, "backend", [
+		"cuda",
+		"rocm",
+		"triton",
+		"python",
+		"metal",
+		"metax",
+		"ascend",
+		"sycl"
+	], label);
+	const language = launchEnum(record, "language", [
+		"cuda",
+		"rocm",
+		"triton",
+		"python_reference",
+		"metal",
+		"metax",
+		"ascendc",
+		"sycl",
+		"cutlass"
+	], label);
+	if (backend !== {
+		cuda: "cuda",
+		rocm: "rocm",
+		triton: "triton",
+		python_reference: "python",
+		metal: "metal",
+		metax: "metax",
+		ascendc: "ascend",
+		sycl: "sycl",
+		cutlass: "cuda"
+	}[language]) throw new TypeError(`${label}.backend ${JSON.stringify(backend)} is incompatible with language ${JSON.stringify(language)}`);
 	return {
-		backend: launchText(record, "backend", label),
-		language: launchText(record, "language", label),
+		backend,
+		language,
 		integration_pattern: launchText(record, "integration_pattern", label),
 		target_speedup: launchPositiveNumber(record, "target_speedup", label),
 		max_workflows: launchInteger(record, "max_workflows", 1, label),
@@ -87,4 +142,4 @@ function parseKersorLaunchContract(value, label = "KerSor launch contract") {
 	};
 }
 //#endregion
-export { parseKersorLaunchContract as t };
+export { parseKersorLaunchContract as n, canonicalKersorJson as t };

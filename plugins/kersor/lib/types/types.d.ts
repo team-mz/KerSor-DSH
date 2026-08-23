@@ -13,8 +13,8 @@ export type KersorRunId = Branded<'KersorRunId'>;
 export type KersorExperimentId = Branded<'KersorExperimentId'>;
 /** Immutable typed launch inputs for one KerSor experiment. */
 export interface KersorLaunchContract {
-    readonly backend: string;
-    readonly language: string;
+    readonly backend: 'cuda' | 'rocm' | 'triton' | 'python' | 'metal' | 'metax' | 'ascend' | 'sycl';
+    readonly language: 'cuda' | 'rocm' | 'triton' | 'python_reference' | 'metal' | 'metax' | 'ascendc' | 'sycl' | 'cutlass';
     readonly integration_pattern: string;
     readonly target_speedup: number;
     readonly max_workflows: number;
@@ -27,6 +27,15 @@ export interface KersorLaunchContract {
     readonly correctness_command: string;
     readonly benchmark_command: string;
 }
+/**
+ * Serialize a lossless JSON value with recursively sorted object keys.
+ * Arrays retain their source order. Host authority hashes use these exact UTF-8
+ * bytes so producers and invariant replay cannot diverge on property insertion
+ * order.
+ * @param value - Lossless JSON value to serialize canonically.
+ * @returns Canonical JSON text with recursively sorted object keys.
+ */
+export declare function canonicalKersorJson(value: unknown): string;
 /**
  * Validate and copy one launch contract into canonical field order.
  * @param value - candidate plain JSON value.
@@ -48,10 +57,36 @@ export interface KersorExperimentStartEventData {
     readonly origin: 'created' | 'attached';
     readonly objective: string;
     readonly freshSession: boolean;
-    /** Optional immutable typed launch authority; absent on legacy bindings. */
-    readonly launch?: KersorLaunchContract;
+    /** Immutable typed launch authority for every created or attached binding. */
+    readonly launch: KersorLaunchContract;
+    /** Durable parent Session containing the created origin for an attached binding. */
+    readonly originSessionId?: SessionId;
+    /** Crash-recoverable source authority reserved before an attached child exists. */
+    readonly authorityIntent?: KersorSessionAuthorityIntent;
     readonly turn: number;
     readonly step: number;
+}
+/** Durable parent-side reservation used to complete an attached authority transfer. */
+export interface KersorSessionAuthorityIntent {
+    readonly attach_call_id: string;
+    readonly workspace: string;
+    readonly session_dir: string;
+    readonly source_parent_session_id: SessionId;
+    readonly source_controller_session_id: SessionId;
+    readonly pre_transfer_event_watermark: number;
+    readonly pre_transfer_event_sha256: string;
+    readonly source_setup_receipt: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly source_state: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly source_workflow_catalog: {
+        readonly path: string;
+        readonly sha256: string;
+    };
 }
 /** Replayable latest-value checkpoint for one conversation-owned experiment. */
 export interface KersorExperimentCheckpointEventData {
@@ -69,6 +104,294 @@ export interface KersorExperimentCheckpointEventData {
     readonly targetSpeedup?: number;
     readonly nextAction?: string;
     readonly steps: readonly KersorExperimentStep[];
+}
+/** Host-sealed receipt for one fresh KerSor Session setup boundary. */
+export interface KersorSessionInitializedEventData {
+    readonly schema_version: 1;
+    readonly contract: 'dsh_session_initialization_v1';
+    readonly authority: 'dsh_host';
+    readonly experiment_id: KersorExperimentId;
+    readonly workspace: string;
+    readonly session_dir: string;
+    readonly controller_session_id: SessionId;
+    readonly setup_call_id: string;
+    readonly setup_command: string;
+    readonly kersor_python: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly launch: KersorLaunchContract;
+    readonly session_config: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly state: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly workflow_catalog: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly adapter: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly kernel: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+}
+/** Host-sealed transfer that permanently retires a created source controller. */
+export interface KersorSessionAuthorityTransferredEventData {
+    readonly schema_version: 1;
+    readonly contract: 'dsh_session_authority_transfer_v1';
+    readonly authority: 'dsh_host';
+    readonly experiment_id: KersorExperimentId;
+    readonly workspace: string;
+    readonly session_dir: string;
+    readonly source_parent_session_id: SessionId;
+    readonly source_controller_session_id: SessionId;
+    readonly target_parent_session_id: SessionId;
+    readonly target_controller_session_id: SessionId;
+    readonly attach_call_id: string;
+    readonly launch: KersorLaunchContract;
+    readonly pre_transfer_event_watermark: number;
+    readonly pre_transfer_event_sha256: string;
+    readonly source_setup_receipt: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly source_state: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly source_workflow_catalog: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+}
+/** Host-sealed import of an existing Session's setup authority into one attached controller. */
+export interface KersorSessionAuthorityImportedEventData {
+    readonly schema_version: 1;
+    readonly contract: 'dsh_session_authority_import_v1';
+    readonly authority: 'dsh_host';
+    readonly experiment_id: KersorExperimentId;
+    readonly workspace: string;
+    readonly session_dir: string;
+    readonly controller_session_id: SessionId;
+    readonly attached_parent_session_id: SessionId;
+    readonly attach_call_id: string;
+    readonly launch: KersorLaunchContract;
+    readonly source_parent_session_id: SessionId;
+    readonly source_controller_session_id: SessionId;
+    readonly source_event_watermark: number;
+    readonly source_event_sha256: string;
+    readonly source_setup_receipt: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly source_transfer_receipt: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly source_state: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly source_workflow_catalog: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+}
+/** Host seal of the exact three files returned by one foreground Workflow author. */
+export interface KersorAuthorHandoffSealedEventData {
+    readonly schema_version: 1;
+    readonly contract: 'dsh_author_handoff_seal_v1';
+    readonly authority: 'dsh_host';
+    readonly session_dir: string;
+    readonly controller_session_id: string;
+    readonly seal_call_id: string;
+    readonly seal_command: string;
+    readonly staging_dir: string;
+    readonly handoff: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly files: Readonly<Record<'workflow.js' | 'metadata.json' | 'rationale.md', {
+        readonly path: string;
+        readonly sha256: string;
+    }>>;
+}
+/** Durable pre-execution consumption of the sole canonical authored Proposal save. */
+export interface KersorAuthorSaveAttemptedEventData {
+    readonly schema_version: 1;
+    readonly contract: 'dsh_author_save_attempt_v1';
+    readonly authority: 'dsh_host';
+    readonly session_dir: string;
+    readonly controller_session_id: string;
+    readonly save_call_id: string;
+    readonly save_command: string;
+    readonly seal_call_id: string;
+    readonly staging_dir: string;
+    readonly handoff: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly files: Readonly<Record<'workflow.js' | 'metadata.json' | 'rationale.md', {
+        readonly path: string;
+        readonly sha256: string;
+    }>>;
+}
+/** One Host-minted binding from a foreground dispatch synthesizer to its exact bytes. */
+export interface KersorDispatchArgsProducedEventData {
+    readonly schema_version: 1;
+    readonly contract: 'dsh_dispatch_args_producer_v1';
+    readonly authority: 'dsh_host';
+    readonly session_dir: string;
+    readonly run_dir: string;
+    readonly round: number;
+    readonly workflow_name: string;
+    readonly controller_session_id: string;
+    readonly producer_session_id: string;
+    readonly producer_call_id: string;
+    readonly dispatch_args: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly dispatch_args_provenance: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+}
+/** Host-minted second custody link for the deterministic runtime-control pass. */
+export interface KersorDispatchArgsTransformedEventData {
+    readonly schema_version: 1;
+    readonly contract: 'dsh_dispatch_args_transformation_v1';
+    readonly authority: 'dsh_host';
+    readonly transformer: 'inject-runtime-controls';
+    readonly session_dir: string;
+    readonly run_dir: string;
+    readonly round: number;
+    readonly workflow_name: string;
+    readonly controller_session_id: string;
+    readonly transformation_call_id: string;
+    readonly producer_receipt: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly input: {
+        readonly dispatch_args: {
+            readonly path: string;
+            readonly sha256: string;
+        };
+        readonly dispatch_args_provenance: {
+            readonly path: string;
+            readonly sha256: string;
+        };
+    };
+    readonly output: {
+        readonly dispatch_args: {
+            readonly path: string;
+            readonly sha256: string;
+        };
+        readonly dispatch_args_provenance: {
+            readonly path: string;
+            readonly sha256: string;
+        };
+    };
+    readonly changed: boolean;
+    readonly authorized_fields: {
+        readonly dispatch_args: readonly string[];
+        readonly dispatch_args_provenance: readonly string[];
+    };
+}
+/** Host authority for one exact canonical candidate-ownership seal call and file. */
+export interface KersorCandidateOwnershipSealedEventData {
+    readonly schema_version: 1;
+    readonly contract: 'dsh_candidate_ownership_seal_v1';
+    readonly authority: 'dsh_host';
+    readonly session_dir: string;
+    readonly run_dir: string;
+    readonly round: number;
+    readonly controller_session_id: string;
+    readonly seal_call_id: string;
+    readonly seal: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly state: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+}
+/** One bounded execution summary independently validated and sealed by the Host. */
+export interface KersorBaselineExecutionEventData {
+    readonly kind: 'correctness' | 'benchmark';
+    readonly command: string;
+    readonly exit_code: number;
+    readonly timed_out: boolean;
+    readonly stdout_sha256: string;
+    readonly stderr_sha256: string;
+}
+interface KersorBaselineAuthorityEventData {
+    readonly schema_version: 1;
+    readonly authority: 'dsh_host';
+    readonly launch: KersorLaunchContract;
+    readonly workspace: string;
+    readonly session_dir: string;
+    readonly controller_session_id: string;
+    readonly call_id: string;
+    readonly session_config: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly task_dir: string;
+    readonly kernel: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly test_method: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly commands: {
+        readonly correctness: string;
+        readonly benchmark: string;
+    };
+}
+/** Host authority for the exact typed-launch baseline initializer call. */
+export interface KersorBaselineInitializedEventData extends KersorBaselineAuthorityEventData {
+    readonly contract: 'dsh_baseline_initialized_v1';
+}
+/** Host authority for the exact baseline recorder call and its execution witness. */
+export interface KersorBaselineRecordedEventData extends KersorBaselineAuthorityEventData {
+    readonly contract: 'dsh_baseline_recorded_v1';
+    readonly initialization_receipt: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly witness: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly executions: readonly KersorBaselineExecutionEventData[];
+}
+/** Host authority for the exact final baseline verifier call and current bytes. */
+export interface KersorBaselineVerifiedEventData extends KersorBaselineAuthorityEventData {
+    readonly contract: 'dsh_baseline_verified_v1';
+    readonly recording_receipt: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly witness: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+    readonly executions: readonly KersorBaselineExecutionEventData[];
+    readonly protected_files: Readonly<Record<string, string>>;
+    readonly worktree: Readonly<Record<string, unknown>>;
+    readonly verdict: 'pass';
 }
 /** Browser-safe description of one configured Mission. */
 export interface KersorTaskRef {
@@ -113,6 +436,29 @@ declare module '@deepseek-ai/dsh-session/types' {
          * @param data - latest controller-owned checkpoint for the experiment.
          */
         'kersor/experiment-checkpoint': KersorExperimentCheckpointEventData;
+        /** Durable Host authority for one freshly initialized KerSor Session. */
+        'kersor/session-initialized': KersorSessionInitializedEventData;
+        /** Durable Host retirement of a created controller before attached import. */
+        'kersor/session-authority-transferred': KersorSessionAuthorityTransferredEventData;
+        /** Durable Host authority imported into one attached controller. */
+        'kersor/session-authority-imported': KersorSessionAuthorityImportedEventData;
+        /** Host seal of one foreground Workflow author's exact returned files. */
+        'kersor/author-handoff-sealed': KersorAuthorHandoffSealedEventData;
+        /** Durable consumption of the sole canonical authored Proposal save attempt. */
+        'kersor/author-save-attempted': KersorAuthorSaveAttemptedEventData;
+        /** Durable Host authority for one exact foreground dispatch producer. */
+        'kersor/dispatch-args-produced': KersorDispatchArgsProducedEventData;
+        /** Durable Host authority for one deterministic post-producer transform. */
+        'kersor/dispatch-args-transformed': KersorDispatchArgsTransformedEventData;
+        /** Durable Host authority for one canonical candidate-ownership seal. */
+        'kersor/candidate-ownership-sealed': KersorCandidateOwnershipSealedEventData;
+        /** Durable Host authority for one exact typed-launch baseline initializer. */
+        'kersor/baseline-initialized': KersorBaselineInitializedEventData;
+        /** Durable Host authority for one exact baseline execution recorder. */
+        'kersor/baseline-recorded': KersorBaselineRecordedEventData;
+        /** Durable Host authority for one exact baseline verification boundary. */
+        'kersor/baseline-verified': KersorBaselineVerifiedEventData;
     }
 }
+export {};
 //# sourceMappingURL=types.d.ts.map

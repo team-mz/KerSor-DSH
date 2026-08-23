@@ -18,6 +18,12 @@ KerSor 文件继续作为优化状态、证据、artifact 与 resume 决策的�
 
 该解释器契约同时也是执行门，而不只是 prompt 指导。每次 Bash 调用前，控制器都会沿调用 Session 的 live `parentSession` 链检查 ancestry；controller 及其每层 descendant 的 KerSor bridge／helper／setup 命令都必须以精确的规范 `KERSOR_PYTHON='<frozen-path>'; export KERSOR_PYTHON;` 前缀开头。整条 ancestry 内都会拒绝 Python 发现与替换。无关 task Bash、KerSor agents／docs 的读取与列举、非 Bash 工具，以及不属于 Experiment ancestry 的 agent 均不受影响。
 
+规范 setup 边界同时拥有其 Bash 沙箱处置。携带精确 Host 生成命令，且 workdir 缺省、为字面量 `.` 或与规范 controller workspace 字符串完全相同的前台调用，仍是唯一耐久 setup 身份；其他拼写会被拒绝，避免 symlink/`..` 别名跨越鉴权边界。该 registry execution 通过鉴权后，模型写入的任何 `sandbox_permissions` 与 `justification` 都会在 Bash 校验升权或请求审批前被抑制。因此 setup 始终在 Session 常驻 workspace policy 下运行；模型写入的升权既不能通过非法配对阻断首次执行，也不能扩大其权限。授权以 registry 创建的 execution object 为键，并在最终 `tools/result` 再次清理，不能跨越失败、call-id 复用、dispose 或 reload。
+
+Gate B 向 direct controller 提供与事件绑定的 transform 命令，而不要求它重建脚本语法。唯一的前台 dispatch producer 写入两份语义文件后，Host 会先创建一条 `KERSOR_DISPATCH_TRANSFORM_COMMAND_V1` 模型上下文，再发布 receipt、追加并 flush `kersor/dispatch-args-produced`；只有这次持久化成功后才会返回该上下文。无法创建上下文时既不发布 receipt，也不发布事件。该上下文把事件中的精确 `run_dir` 与 producer call 身份绑定到一条完整 Bash 命令，并要求逐字执行，禁止增加 flag、变量、重定向、前缀或后缀，也禁止检查、探测或重试。pre-execution 鉴权仍要求完整命令与恰好一条持久 producer event 逐字相同；不匹配的调用不会到达 Bash executor，而存在唯一 pending transform 时，诊断会指出绑定事件与必需命令。
+
+Workflow authoring 在 Host handoff seal 前把 staging 独占交给前台 author。Direct controller 在 seal 前不能读取、搜索、列举或修改 staging，author child 则保留 seal 前文件写入与 syntax self-check。文件工具门禁会递归检查嵌套路径字段，以及 Glob/Grep 的 root 和 filter；Bash 门禁会在 dispatch 前解析模型提供的 workdir、shell cwd 变更、静态变量与 wrapper、glob target、保留原始段的 symlink/`..` 遍历、symlink alias 和常规文件身份。Host 只根据完整的 Host-minted Bash envelope 识别 seal 与 Proposal-save，因此 basename 拆分、alias、`source`、替代解释器、变量或额外字段都无法取得门禁身份。Host 把三份 direct staging file 和 `author-handoff.json` 哈希绑定进 `kersor/author-handoff-sealed`，随后永久拒绝所有 Experiment actor 通过直接路径或 alias 访问 staging。第一次精确的规范 Proposal-save 调用会在 Bash 执行前追加并 flush `kersor/author-save-attempted`；无论脚本成功还是失败都会消费该调用，后续调用在 dispatch 前被拒绝，sealed bytes 也不会重新开放以供修复。
+
 成功的 `workflow` 结果只有一个 Host-owned 文件系统边界。每个 Experiment descendant 都必须传入绝对 `args.exp_dir`，且该路径不能经过 symlink，必须精确解析到 `<workspace>/.kersor/<session>/run-N`。结果到达模型前，Host 会校验规范 `{runId, agentsStarted, result}`，要求 raw `result` 是不超过 4 MiB 的 JSON object，写完完整临时文件后再通过原子、独占 hard link 发布为 `output.json`。路径非法、symlink escape、非对象或超限结果，以及已存在的 output 都会 block Workflow 结果；绝不覆盖任何文件。工具渲染结果可以截断，但该文件来自未截断的规范值。
 
 一旦 `run-N/output.json` 存在，Experiment descendant 可以读取，但不能通过 `write`、`edit`、明显的 Bash 重定向／`tee`／`cp`／`mv`／`rm` 或 Python open/write 路径修改它。只有成功 Workflow 结果由 Host commit。失败 Workflow 不创建文件，因此 controller 可在文件缺失时使用 `write` 一次来创建 failure stub；首次创建后，同一不可变规则生效。
@@ -66,11 +72,11 @@ Mission 必须是 JSON `kersor-mission-v1` 文档。其 `workspace`、`session` 
 
 #### 模型看到什么
 
-父模型只看到 start、attach、resume 三个小型工具 schema。每个成功结果都会声明后续工作归 controller 所有，要求父级结束当前 Turn、不得轮询、委派或检查工作区，并携带实际强制停止的 runtime conclusion marker。Start schema 通过逐字段 enum、数字、命令与权威性描述公开可选 typed launch contract。控制器 child 收到冻结目标、当前工作区、解析后的 Host Python 路径、显式 `runtime=dsh`、提供时的规范 launch JSON 及逐字段指令，以及 Host-owned Workflow output contract。它被要求在成功后读取 raw `output.json`，不得从受限结果文本重建；只有 Workflow error 且文件缺失时才能创建 stub。Child 还会收到加载已安装 KerSor skill 及通过 `kersor_status` 报告阶段变化的要求；它不会收到父对话历史。Session persistence 会为后续每次 resume 保留解释器、launch 与 custody 指令。
+父模型只看到 start、attach、resume 三个小型工具 schema。每个成功结果都会声明后续工作归 controller 所有，要求父级结束当前 Turn、不得轮询、委派或检查工作区，并携带实际强制停止的 runtime conclusion marker。Start schema 通过逐字段 enum、数字、命令与权威性描述公开可选 typed launch contract。控制器 child 收到冻结目标、当前工作区、解析后的 Host Python 路径、显式 `runtime=dsh`、提供时的规范 launch JSON 及逐字段指令，以及 Host-owned Workflow output contract。Dispatch producer 成功后，它还会以有序 user context 收到与事件绑定的精确 Gate B transform 命令，无需推导 run path 或命令语法。它被要求在 Workflow 成功后读取 raw `output.json`，不得从受限结果文本重建；只有 Workflow error 且文件缺失时才能创建 stub。Child 还会收到加载已安装 KerSor skill 及通过 `kersor_status` 报告阶段变化的要求；它不会收到父对话历史。Session persistence 会为后续每次 resume 保留解释器、launch 与 custody 指令。
 
 #### Token 影响
 
-父对话只承担工具调用与 checkpoint card 的 token。控制器和每个 Workflow 成员使用独立子历史，因此其 token 不会累积进父对话。
+父对话只承担工具调用与 checkpoint card 的 token。控制器和每个 Workflow 成员使用独立子历史，因此其 token 不会累积进父对话。每个成功的 dispatch producer 都会向 controller 的下一次模型请求与持久历史加入一条有界的规范命令 user context。
 
 #### KV Cache 影响
 
