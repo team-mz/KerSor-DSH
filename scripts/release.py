@@ -1210,6 +1210,30 @@ def tarball_json_file(path: Path, member_name: str) -> dict[str, object]:
     return value
 
 
+def _publish_manifest(source: dict[str, object]) -> dict[str, object]:
+    """Create the deterministic install contract used for detached tarballs."""
+    manifest = json.loads(json.dumps(source, ensure_ascii=False))
+    manifest.pop("devDependencies", None)
+
+    def reject_workspace_protocol(value: object, field: str) -> None:
+        if isinstance(value, str):
+            if value.startswith("workspace:"):
+                raise ReleaseError(
+                    f"publish package manifest retains workspace protocol at {field}"
+                )
+            return
+        if isinstance(value, list):
+            for index, item in enumerate(value):
+                reject_workspace_protocol(item, f"{field}[{index}]")
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                reject_workspace_protocol(item, f"{field}.{key}")
+
+    reject_workspace_protocol(manifest, "package.json")
+    return manifest
+
+
 def _verify_package_tarball_traceability(
     *,
     package_name: str,
@@ -1253,8 +1277,8 @@ def _verify_package_tarball_traceability(
                     f"{package_name} source package.json is invalid: {error}"
                 ) from error
             # pnpm rewrites JSON whitespace during pack. The member remains
-            # traceable when its parsed value equals the distribution-owned file.
-            member_matches = packaged_manifest == source_manifest \
+            # traceable when it equals the deterministic publish projection.
+            member_matches = packaged_manifest == _publish_manifest(source_manifest) \
                 and member.get("mode") == stat.S_IMODE(metadata.st_mode)
         else:
             member_matches = member.get("sha256") == entry.get("sha256") \
@@ -1458,6 +1482,14 @@ def prepare_release(
             manifest = _read_json(build / "package.json", f"{name} package manifest")
             if manifest.get("name") != name or not isinstance(manifest.get("version"), str):
                 raise ReleaseError(f"package identity differs at {source}")
+            (build / "package.json").write_text(
+                json.dumps(
+                    _publish_manifest(manifest),
+                    ensure_ascii=False,
+                    indent=2,
+                ) + "\n",
+                encoding="utf-8",
+            )
             output = package_output / _package_filename(name)
             _pack_package(build, output, pnpm, environment)
             package_tree = tarball_receipt(output)

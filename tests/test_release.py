@@ -812,6 +812,79 @@ class ReleaseWorkflowTests(unittest.TestCase):
             tarball = self.release_root / package["tarball"]
             self.assertEqual(file_sha256(tarball), tarball_hashes[package["name"]])
 
+    def test_prepare_removes_only_development_workspace_dependencies(self) -> None:
+        package_path = self.personal / "plugins" / "kersor" / "package.json"
+        source_manifest = json.loads(package_path.read_text(encoding="utf-8"))
+        source_manifest["description"] = "publish manifest fixture"
+        source_manifest["devDependencies"] = {
+            "@deepseek-ai/cordis": "workspace:^",
+        }
+        write(package_path, json.dumps(source_manifest, indent=2) + "\n")
+        mirror_path = self.personal / "plugins" / "dsh-mirror.json"
+        mirror = json.loads(mirror_path.read_text(encoding="utf-8"))
+        entry = next(
+            item
+            for item in mirror["files"]
+            if item["path"] == "plugins/kersor/package.json"
+        )
+        entry["sha256"] = file_sha256(package_path)
+        write(mirror_path, json.dumps(mirror, indent=2) + "\n")
+        self.personal_commit = commit_all(
+            self.personal,
+            "add development workspace dependency",
+        )
+
+        lock = self.prepare()
+
+        package = next(
+            item
+            for item in lock["packages"]
+            if item["name"] == "@deepseek-ai/dsh-kersor"
+        )
+        packaged_manifest = release.tarball_json_file(
+            self.release_root / package["tarball"],
+            "package/package.json",
+        )
+        expected_manifest = dict(source_manifest)
+        del expected_manifest["devDependencies"]
+        self.assertEqual(packaged_manifest, expected_manifest)
+        self.assertNotIn("workspace:", json.dumps(packaged_manifest, sort_keys=True))
+        self.assertEqual(
+            json.loads(
+                (self.release_root / "personal" / "plugins" / "kersor" / "package.json")
+                .read_text(encoding="utf-8")
+            ),
+            source_manifest,
+        )
+
+    def test_prepare_rejects_runtime_workspace_protocols(self) -> None:
+        package_path = self.personal / "plugins" / "kersor" / "package.json"
+        source_manifest = json.loads(package_path.read_text(encoding="utf-8"))
+        source_manifest["peerDependencies"] = {
+            "@deepseek-ai/cordis": "workspace:^",
+        }
+        write(package_path, json.dumps(source_manifest, indent=2) + "\n")
+        mirror_path = self.personal / "plugins" / "dsh-mirror.json"
+        mirror = json.loads(mirror_path.read_text(encoding="utf-8"))
+        entry = next(
+            item
+            for item in mirror["files"]
+            if item["path"] == "plugins/kersor/package.json"
+        )
+        entry["sha256"] = file_sha256(package_path)
+        write(mirror_path, json.dumps(mirror, indent=2) + "\n")
+        self.personal_commit = commit_all(
+            self.personal,
+            "add runtime workspace dependency",
+        )
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            "retains workspace protocol",
+        ):
+            self.prepare()
+        self.assertFalse(self.release_root.exists())
+
     def test_prepare_accepts_internal_authority_links_but_drops_them(self) -> None:
         write(
             self.authority / ".agents" / "skills" / "fixture" / "SKILL.md",
