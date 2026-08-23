@@ -14,6 +14,7 @@ import hashlib
 import io
 import json
 import os
+import platform
 import re
 import shutil
 import stat
@@ -28,7 +29,32 @@ from typing import Iterable, Iterator
 ROOT = Path(__file__).resolve().parents[1]
 FULL_COMMIT = re.compile(r"[0-9a-f]{40}")
 RELEASE_SCHEMA_VERSION = 1
+MIRROR_SCHEMA_VERSION = 2
 MIRROR_PATH = Path("plugins/dsh-mirror.json")
+BUILD_RECEIPT_PATH = "release/kersor-distribution-build-receipt.json"
+BUILD_RECEIPT_TYPE = "kersor-distribution-build"
+BUILD_RECIPE_ID = "dsh-kersor-distribution-build-v1"
+MIRROR_PACKAGES = ("kersor", "kersor-viewer", "ui-kersor-viewer")
+AUTHORITY_INSTALL_RECIPE = [
+    "pnpm",
+    "install",
+    "--frozen-lockfile",
+    "--ignore-scripts",
+    "--filter",
+    "@deepseek-ai/dsh-root",
+    "--filter",
+    "@deepseek-ai/dsh-kersor...",
+    "--filter",
+    "@deepseek-ai/dsh-kersor-viewer...",
+    "--filter",
+    "@deepseek-ai/dsh-client-ui-kersor-viewer...",
+    "--filter",
+    "@deepseek-ai/dsh-typert-generator...",
+]
+AUTHORITY_BUILD_RECIPE = [
+    "node",
+    "scripts/release/build-kersor-distribution.mjs",
+]
 PACKAGE_PATHS = {
     "@deepseek-ai/dsh-kersor": Path("plugins/kersor"),
     "@deepseek-ai/dsh-kersor-viewer": Path("plugins/kersor-viewer"),
@@ -301,7 +327,8 @@ def require_reconciled_mirror(snapshot: Path, authority_commit: str) -> dict[str
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ReleaseError(f"cannot read mirror manifest: {error}") from error
-    if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != \
+            MIRROR_SCHEMA_VERSION:
         raise ReleaseError("mirror manifest schema is invalid")
     authority = manifest.get("authority")
     if not isinstance(authority, dict):
@@ -315,7 +342,286 @@ def require_reconciled_mirror(snapshot: Path, authority_commit: str) -> dict[str
     return manifest
 
 
-def _tool_identity(path: Path, version_arguments: list[str]) -> dict[str, object]:
+def _derived_source_path(path: Path) -> Path | None:
+    """Map one personal lib path to its only allowed authority output path."""
+    parts = path.parts
+    if len(parts) < 4 or parts[0] != "plugins" \
+            or parts[1] not in MIRROR_PACKAGES or parts[2] != "lib":
+        return None
+    return Path("packages", "extensions", *parts[1:])
+
+
+def _mirror_package_files(snapshot: Path) -> dict[str, Path]:
+    """Return the complete regular-file inventory of the three mirror packages."""
+    result: dict[str, Path] = {}
+    for package in MIRROR_PACKAGES:
+        root = snapshot / "plugins" / package
+        if root.is_symlink() or not root.is_dir():
+            raise ReleaseError(f"mirror package root is unavailable: {root}")
+        for path in _walk_without_links(root):
+            metadata = path.lstat()
+            relative = path.relative_to(snapshot).as_posix()
+            if stat.S_ISDIR(metadata.st_mode):
+                continue
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise ReleaseError(f"mirror package tree contains a link or special file: {relative}")
+            result[relative] = path
+    return result
+
+
+def _require_complete_mirror_inventory(
+    snapshot: Path,
+    entries: object,
+) -> dict[str, Path]:
+    """Require the manifest and physical package trees to be an exact bijection."""
+    if not isinstance(entries, list) or not entries:
+        raise ReleaseError("mirror manifest does not cover the complete package tree")
+    listed: list[str] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            raise ReleaseError(f"mirror files[{index}].path is invalid")
+        relative = _safe_relative(entry["path"], f"mirror files[{index}].path")
+        parts = relative.parts
+        if len(parts) < 3 or parts[0] != "plugins" \
+                or parts[1] not in MIRROR_PACKAGES:
+            raise ReleaseError(f"mirror files[{index}].path is outside package trees")
+        listed.append(entry["path"])
+    if listed != sorted(listed) or len(listed) != len(set(listed)):
+        raise ReleaseError("mirror file inventory must be sorted and unique")
+    actual = _mirror_package_files(snapshot)
+    if set(listed) != set(actual):
+        missing = sorted(set(actual) - set(listed))
+        extra = sorted(set(listed) - set(actual))
+        details = [*(f"unlisted {path}" for path in missing), *(
+            f"missing {path}" for path in extra
+        )]
+        raise ReleaseError(
+            "mirror manifest does not cover the complete package tree: "
+            + ", ".join(details)
+        )
+    return actual
+
+
+def _authority_build_receipt(
+    manifest: dict[str, object],
+    authority_repository: Path,
+    authority_commit: str,
+    authority_snapshot: Path,
+) -> tuple[
+    dict[str, object],
+    dict[str, object],
+    dict[str, dict[str, object]],
+]:
+    """Load and validate the build receipt committed by the DSH authority."""
+    binding = manifest.get("build_receipt")
+    if not isinstance(binding, dict):
+        raise ReleaseError("mirror build receipt binding is invalid")
+    if binding.get("path") != BUILD_RECEIPT_PATH:
+        raise ReleaseError("mirror build receipt path is invalid")
+    expected_blob_hash = binding.get("sha256")
+    if not isinstance(expected_blob_hash, str) or re.fullmatch(
+        r"[0-9a-f]{64}", expected_blob_hash
+    ) is None:
+        raise ReleaseError("mirror build receipt hash is invalid")
+    if binding.get("recipe_id") != BUILD_RECIPE_ID:
+        raise ReleaseError("mirror build receipt recipe is invalid")
+
+    receipt_bytes = _git_bytes(
+        authority_repository,
+        "show",
+        f"{authority_commit}:{BUILD_RECEIPT_PATH}",
+    )
+    if sha256_bytes(receipt_bytes) != expected_blob_hash:
+        raise ReleaseError("authority build receipt differs from the mirror binding")
+    try:
+        receipt = json.loads(receipt_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ReleaseError(f"authority build receipt is invalid JSON: {error}") from error
+    if not isinstance(receipt, dict) or receipt.get("schema_version") != 1 \
+            or receipt.get("receipt_type") != BUILD_RECEIPT_TYPE:
+        raise ReleaseError("authority build receipt schema is invalid")
+    recipe = receipt.get("recipe")
+    if not isinstance(recipe, dict) or set(recipe) != {
+        "id",
+        "node",
+        "pnpm",
+        "install",
+        "command",
+    } or recipe.get("id") != BUILD_RECIPE_ID:
+        raise ReleaseError("authority build receipt recipe is invalid")
+    if recipe.get("install") != AUTHORITY_INSTALL_RECIPE \
+            or recipe.get("command") != AUTHORITY_BUILD_RECIPE:
+        raise ReleaseError("authority build receipt commands are not canonical")
+    tools = receipt.get("tools")
+    if not isinstance(tools, dict) or set(tools) != {"node", "pnpm"}:
+        raise ReleaseError("authority build receipt tools are invalid")
+    expected_node_tool = {"version": recipe.get("node")}
+    pnpm_tool = tools.get("pnpm")
+    if tools.get("node") != expected_node_tool \
+            or not isinstance(pnpm_tool, dict) \
+            or set(pnpm_tool) != {"version", "tree"} \
+            or pnpm_tool.get("version") != recipe.get("pnpm"):
+        raise ReleaseError("authority build receipt tools are not canonical")
+    validate_portable_tree_receipt(
+        pnpm_tool.get("tree"),
+        "authority pnpm package tree",
+    )
+    if receipt.get("tools_sha256") != sha256_bytes(canonical_json(tools)):
+        raise ReleaseError("authority build receipt tool digest differs")
+    toolchain = manifest.get("toolchain")
+    if not isinstance(toolchain, dict) or {
+        "node": recipe.get("node"),
+        "pnpm": recipe.get("pnpm"),
+    } != toolchain:
+        raise ReleaseError("mirror toolchain differs from the authority build receipt")
+
+    inputs = receipt.get("inputs")
+    if not isinstance(inputs, list) or not inputs:
+        raise ReleaseError("authority build receipt inputs are invalid")
+    if receipt.get("inputs_sha256") != sha256_bytes(canonical_json(inputs)):
+        raise ReleaseError("authority build receipt input digest differs")
+    input_paths: list[str] = []
+    required_inputs = {
+        "package.json",
+        "apps/cli/package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        AUTHORITY_BUILD_RECIPE[1],
+        "tsconfig.base.json",
+        "tsconfig.base.client.json",
+        "tsconfig.host.json",
+        "tsdown.config.ts",
+    }
+    for package_manifest in authority_snapshot.rglob("package.json"):
+        if package_manifest.is_symlink() or not package_manifest.is_file():
+            raise ReleaseError(
+                "authority snapshot contains an invalid package.json input"
+            )
+        required_inputs.add(
+            package_manifest.relative_to(authority_snapshot).as_posix()
+        )
+    cli_root = authority_snapshot / "apps" / "cli"
+    if cli_root.is_symlink() or not cli_root.is_dir():
+        raise ReleaseError("authority snapshot omits the canonical apps/cli closure")
+    for cli_input in _walk_without_links(cli_root):
+        metadata = cli_input.lstat()
+        if stat.S_ISDIR(metadata.st_mode):
+            continue
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise ReleaseError("authority apps/cli closure contains a link")
+        required_inputs.add(cli_input.relative_to(authority_snapshot).as_posix())
+    for index, input_file in enumerate(inputs):
+        if not isinstance(input_file, dict):
+            raise ReleaseError(f"authority build receipt inputs[{index}] is invalid")
+        raw_path = input_file.get("path")
+        digest = input_file.get("git_blob_sha256")
+        size = input_file.get("size")
+        mode = input_file.get("mode")
+        if not isinstance(raw_path, str):
+            raise ReleaseError(f"authority build receipt inputs[{index}].path is invalid")
+        relative = _safe_relative(
+            raw_path,
+            f"authority build receipt inputs[{index}].path",
+        )
+        if relative.as_posix() == BUILD_RECEIPT_PATH:
+            raise ReleaseError("authority build receipt cannot list itself as an input")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ReleaseError(f"authority build input hash is invalid: {raw_path}")
+        if type(size) is not int or size < 0:
+            raise ReleaseError(f"authority build input size is invalid: {raw_path}")
+        if type(mode) is not int or mode not in {0o644, 0o755}:
+            raise ReleaseError(f"authority build input mode is invalid: {raw_path}")
+        path = authority_snapshot / relative
+        if path.is_symlink() or not path.is_file():
+            raise ReleaseError(f"authority build input is absent: {raw_path}")
+        metadata = path.stat()
+        if sha256_file(path) != digest or metadata.st_size != size:
+            raise ReleaseError(f"authority build input differs from commit: {raw_path}")
+        if mode != stat.S_IMODE(metadata.st_mode):
+            raise ReleaseError(f"authority build input mode differs: {raw_path}")
+        input_paths.append(raw_path)
+    if input_paths != sorted(input_paths) or len(input_paths) != len(set(input_paths)):
+        raise ReleaseError("authority build receipt inputs are not sorted and unique")
+    if not required_inputs.issubset(input_paths):
+        raise ReleaseError("authority build receipt omits canonical build inputs")
+
+    outputs = receipt.get("outputs")
+    if not isinstance(outputs, list) or not outputs:
+        raise ReleaseError("authority build receipt outputs are invalid")
+    if receipt.get("outputs_sha256") != sha256_bytes(canonical_json(outputs)):
+        raise ReleaseError("authority build receipt output digest differs")
+    by_path: dict[str, dict[str, object]] = {}
+    listed_paths: list[str] = []
+    for index, output in enumerate(outputs):
+        if not isinstance(output, dict):
+            raise ReleaseError(f"authority build receipt outputs[{index}] is invalid")
+        raw_path = output.get("path")
+        digest = output.get("sha256")
+        size = output.get("size")
+        mode = output.get("mode")
+        if not isinstance(raw_path, str):
+            raise ReleaseError(
+                f"authority build receipt outputs[{index}].path is invalid"
+            )
+        relative = _safe_relative(
+            raw_path,
+            f"authority build receipt outputs[{index}].path",
+        )
+        parts = relative.parts
+        if len(parts) < 5 or parts[:2] != ("packages", "extensions") \
+                or parts[2] not in MIRROR_PACKAGES or parts[3] != "lib":
+            raise ReleaseError(f"authority build output is outside KerSor lib: {raw_path}")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ReleaseError(f"authority build output hash is invalid: {raw_path}")
+        if type(size) is not int or size < 0:
+            raise ReleaseError(f"authority build output size is invalid: {raw_path}")
+        if type(mode) is not int or mode not in {0o644, 0o755}:
+            raise ReleaseError(f"authority build output mode is invalid: {raw_path}")
+        listed_paths.append(raw_path)
+        if raw_path in by_path:
+            raise ReleaseError(f"authority build output is duplicated: {raw_path}")
+        by_path[raw_path] = output
+    if listed_paths != sorted(listed_paths):
+        raise ReleaseError("authority build receipt outputs are not sorted")
+    return binding, receipt, by_path
+
+
+def _authority_tracked_mirror_files(
+    authority_snapshot: Path,
+) -> dict[str, str]:
+    """Map the complete tracked authority package surface into personal paths."""
+    result: dict[str, str] = {}
+    for package in MIRROR_PACKAGES:
+        package_root = authority_snapshot / "packages" / "extensions" / package
+        if package_root.is_symlink() or not package_root.is_dir():
+            raise ReleaseError(f"authority package root is unavailable: {package}")
+        for path in _walk_without_links(package_root):
+            metadata = path.lstat()
+            source = path.relative_to(authority_snapshot)
+            if stat.S_ISDIR(metadata.st_mode):
+                continue
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise ReleaseError(
+                    f"authority package tree contains a link or special file: {source}"
+                )
+            package_relative = path.relative_to(package_root)
+            if package_relative == Path("package.json"):
+                continue
+            if package_relative.parts[0] == "lib":
+                raise ReleaseError(
+                    f"authority unexpectedly tracks a build output: {source}"
+                )
+            personal = Path("plugins", package, package_relative).as_posix()
+            result[personal] = source.as_posix()
+    return result
+
+
+def _tool_identity(
+    path: Path,
+    version_arguments: list[str],
+    *,
+    path_tools: Iterable[Path] = (),
+) -> dict[str, object]:
     """Freeze one executable's requested path, physical file, hash, and version."""
     requested = path.expanduser().absolute()
     try:
@@ -325,7 +631,10 @@ def _tool_identity(path: Path, version_arguments: list[str]) -> dict[str, object
         raise ReleaseError(f"release tool is unavailable: {requested}: {error}") from error
     if not stat.S_ISREG(metadata.st_mode) or not os.access(physical, os.X_OK):
         raise ReleaseError(f"release tool is not executable: {physical}")
-    path_parts = [str(physical.parent)]
+    path_parts = [
+        str(physical.parent),
+        *(str(tool.expanduser().resolve().parent) for tool in path_tools),
+    ]
     node = shutil.which("node")
     if node is not None:
         path_parts.append(str(Path(node).resolve().parent))
@@ -364,7 +673,120 @@ def file_identity(path: Path) -> dict[str, object]:
         "sha256": sha256_file(physical),
         "mode": stat.S_IMODE(metadata.st_mode),
         "size": metadata.st_size,
+        "platform": platform.system().lower(),
+        "arch": platform.machine().lower(),
     }
+
+
+def portable_tree_receipt(root: Path) -> dict[str, object]:
+    """Hash a cross-platform regular-file tree without platform mode bits."""
+    requested = root.expanduser().absolute()
+    if requested.is_symlink() or not requested.is_dir():
+        raise ReleaseError(
+            f"portable tree root must be a physical directory: {requested}"
+        )
+    root = requested.resolve(strict=True)
+    files: list[dict[str, object]] = []
+    for path in _walk_without_links(root):
+        metadata = path.lstat()
+        relative = path.relative_to(root).as_posix()
+        if stat.S_ISDIR(metadata.st_mode):
+            continue
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise ReleaseError(
+                f"portable tree contains a link or special file: {relative}"
+            )
+        files.append({
+            "path": relative,
+            "size": metadata.st_size,
+            "sha256": sha256_file(path),
+        })
+    files.sort(key=lambda item: str(item["path"]))
+    if not files:
+        raise ReleaseError(f"portable tree contains no files: {root}")
+    return {
+        "schema_version": 1,
+        "files": files,
+        "tree_sha256": sha256_bytes(canonical_json(files)),
+    }
+
+
+def validate_portable_tree_receipt(value: object, label: str) -> None:
+    """Validate the canonical cross-platform tree receipt schema."""
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "files",
+        "tree_sha256",
+    } or value.get("schema_version") != 1:
+        raise ReleaseError(f"{label} schema is invalid")
+    files = value.get("files")
+    if not isinstance(files, list) or not files:
+        raise ReleaseError(f"{label} files are invalid")
+    paths: list[str] = []
+    for index, entry in enumerate(files):
+        if not isinstance(entry, dict) or set(entry) != {"path", "size", "sha256"}:
+            raise ReleaseError(f"{label} files[{index}] is invalid")
+        raw_path = entry.get("path")
+        size = entry.get("size")
+        digest = entry.get("sha256")
+        if not isinstance(raw_path, str):
+            raise ReleaseError(f"{label} files[{index}].path is invalid")
+        _safe_relative(raw_path, f"{label} files[{index}].path")
+        if type(size) is not int or size < 0 \
+                or not isinstance(digest, str) \
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ReleaseError(f"{label} files[{index}] metadata is invalid")
+        paths.append(raw_path)
+    if paths != sorted(paths) or len(paths) != len(set(paths)):
+        raise ReleaseError(f"{label} paths are not sorted and unique")
+    if value.get("tree_sha256") != sha256_bytes(canonical_json(files)):
+        raise ReleaseError(f"{label} digest differs")
+
+
+def pnpm_package_identity(pnpm: Path, version: str) -> dict[str, object]:
+    """Identify the portable node_modules/pnpm package behind one wrapper."""
+    wrapper = pnpm.expanduser().resolve(strict=True)
+    candidates: set[Path] = set()
+    ancestors = (wrapper.parent, *tuple(wrapper.parents)[:5])
+    for ancestor in ancestors:
+        for relative in (
+            Path("node_modules/pnpm/bin/pnpm.mjs"),
+            Path("node/node_modules/pnpm/bin/pnpm.mjs"),
+            Path("lib/node_modules/pnpm/bin/pnpm.mjs"),
+        ):
+            candidate = ancestor / relative
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+            candidates.add(candidate.resolve(strict=True))
+    if len(candidates) != 1:
+        raise ReleaseError(
+            "cannot uniquely resolve pnpm's portable node_modules/pnpm/bin/pnpm.mjs "
+            f"artifact from {wrapper}"
+        )
+    package_root = candidates.pop().parents[1]
+    return {
+        "requested_wrapper": str(pnpm.expanduser().absolute()),
+        "realpath": str(package_root),
+        "version": version,
+        "platform": platform.system().lower(),
+        "arch": platform.machine().lower(),
+        "tree": portable_tree_receipt(package_root),
+    }
+
+
+def verify_pnpm_package_identity(expected: object, label: str) -> list[str]:
+    """Re-hash a recorded pnpm package tree and report any drift."""
+    if not isinstance(expected, dict) or not isinstance(expected.get("realpath"), str):
+        return [f"{label}: identity receipt is invalid"]
+    try:
+        current_tree = portable_tree_receipt(Path(expected["realpath"]))
+    except (OSError, ReleaseError) as error:
+        return [f"{label}: identity is unavailable: {error}"]
+    if current_tree != expected.get("tree") \
+            or expected.get("platform") != platform.system().lower() \
+            or expected.get("arch") != platform.machine().lower():
+        return [f"{label}: pnpm package identity differs"]
+    return []
 
 
 def verify_file_identity(expected: object, label: str) -> list[str]:
@@ -379,7 +801,15 @@ def verify_file_identity(expected: object, label: str) -> list[str]:
         return [f"{label}: identity is unavailable: {error}"]
     recorded = {
         key: expected.get(key)
-        for key in ("requested_path", "realpath", "sha256", "mode", "size")
+        for key in (
+            "requested_path",
+            "realpath",
+            "sha256",
+            "mode",
+            "size",
+            "platform",
+            "arch",
+        )
     }
     if current != recorded:
         return [f"{label}: executable identity differs"]
@@ -420,33 +850,305 @@ def _verify_mirror_against_authority(
     personal_snapshot: Path,
     authority_repository: Path,
     authority_commit: str,
-) -> dict[str, object]:
+    authority_snapshot: Path,
+) -> tuple[
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    dict[str, dict[str, object]],
+]:
     """Verify every reconciled mirror byte against the named authority commit."""
+    _require_commit(authority_repository, authority_commit)
     manifest = require_reconciled_mirror(personal_snapshot, authority_commit)
+    package_files = _require_complete_mirror_inventory(
+        personal_snapshot,
+        manifest["files"],
+    )
+    receipt_binding, receipt, receipt_outputs = _authority_build_receipt(
+        manifest,
+        authority_repository,
+        authority_commit,
+        authority_snapshot,
+    )
+    used_outputs: set[str] = set()
+    expected_tracked_files = _authority_tracked_mirror_files(
+        authority_snapshot,
+    )
+    used_tracked_files: dict[str, str] = {}
+    used_distribution_files: set[str] = set()
+    expected_distribution_files = {
+        f"plugins/{package}/package.json" for package in MIRROR_PACKAGES
+    }
+    listed_paths: list[str] = []
     for index, entry in enumerate(manifest["files"]):
         if not isinstance(entry, dict):
             raise ReleaseError(f"mirror files[{index}] must be an object")
         raw_path = entry.get("path")
         raw_source = entry.get("source")
         expected_hash = entry.get("sha256")
-        if not isinstance(raw_path, str) or not isinstance(raw_source, str) \
-                or not isinstance(expected_hash, str):
+        origin = entry.get("origin")
+        if not isinstance(raw_path, str) or not isinstance(expected_hash, str) \
+                or origin not in {"tracked", "derived-build", "distribution-owned"}:
             raise ReleaseError(f"mirror files[{index}] is incomplete")
         relative = _safe_relative(raw_path, f"mirror files[{index}].path")
-        source = _safe_relative(raw_source, f"mirror files[{index}].source")
-        personal_file = personal_snapshot / relative
-        if not personal_file.is_file() or sha256_file(personal_file) != expected_hash:
+        listed_paths.append(raw_path)
+        personal_file = package_files[raw_path]
+        if sha256_file(personal_file) != expected_hash:
             raise ReleaseError(f"personal mirror differs from its manifest: {raw_path}")
-        authority_bytes = _git_bytes(
-            authority_repository,
-            "show",
-            f"{authority_commit}:{source.as_posix()}",
+        if origin == "distribution-owned":
+            if raw_path not in expected_distribution_files \
+                    or raw_source is not None or entry.get("receipt_output") is not None:
+                raise ReleaseError(
+                    f"distribution-owned mirror entry is invalid: {raw_path}"
+                )
+            used_distribution_files.add(raw_path)
+            continue
+
+        if not isinstance(raw_source, str):
+            raise ReleaseError(f"mirror files[{index}].source is invalid")
+        source = _safe_relative(raw_source, f"mirror files[{index}].source")
+        expected_source = Path("packages", "extensions", *relative.parts[1:])
+        if source != expected_source:
+            raise ReleaseError(f"mirror source mapping is invalid: {raw_path}")
+        derived_source = _derived_source_path(relative)
+        if origin == "tracked":
+            if entry.get("receipt_output") is not None:
+                raise ReleaseError(f"tracked mirror entry references a build receipt: {raw_path}")
+            authority_file = authority_snapshot / source
+            if authority_file.is_symlink() or not authority_file.is_file() \
+                    or sha256_file(authority_file) != expected_hash \
+                    or stat.S_IMODE(authority_file.stat().st_mode) != \
+                    stat.S_IMODE(personal_file.stat().st_mode):
+                raise ReleaseError(
+                    f"personal mirror differs from authority commit: {raw_path}"
+                )
+            used_tracked_files[raw_path] = raw_source
+            continue
+
+        if derived_source is None or source != derived_source:
+            raise ReleaseError(f"derived mirror entry is outside KerSor lib: {raw_path}")
+        receipt_output = entry.get("receipt_output")
+        if receipt_output != source.as_posix():
+            raise ReleaseError(f"derived mirror entry has no matching receipt output: {raw_path}")
+        if (authority_snapshot / source).exists():
+            raise ReleaseError(f"derived mirror output is tracked by authority: {raw_source}")
+        output = receipt_outputs.get(receipt_output)
+        if output is None:
+            raise ReleaseError(f"authority build receipt omits mirror output: {raw_source}")
+        metadata = personal_file.stat()
+        if output.get("sha256") != expected_hash \
+                or output.get("size") != metadata.st_size \
+                or output.get("mode") != stat.S_IMODE(metadata.st_mode):
+            raise ReleaseError(f"personal mirror differs from authority build: {raw_path}")
+        used_outputs.add(receipt_output)
+    if listed_paths != sorted(listed_paths) or len(listed_paths) != len(set(listed_paths)):
+        raise ReleaseError("mirror file inventory must be sorted and unique")
+    if used_distribution_files != expected_distribution_files:
+        raise ReleaseError(
+            "mirror package.json files must be distribution-owned by the personal commit"
         )
-        if sha256_bytes(authority_bytes) != expected_hash:
+    if used_tracked_files != expected_tracked_files:
+        missing = sorted(set(expected_tracked_files) - set(used_tracked_files))
+        extra = sorted(set(used_tracked_files) - set(expected_tracked_files))
+        raise ReleaseError(
+            "tracked authority files absent from the mirror: "
+            + ", ".join([
+                *(f"missing {path}" for path in missing),
+                *(f"unexpected {path}" for path in extra),
+            ])
+        )
+    orphaned_outputs = sorted(set(receipt_outputs) - used_outputs)
+    if orphaned_outputs:
+        raise ReleaseError(
+            "authority build receipt has outputs absent from the mirror: "
+            + ", ".join(orphaned_outputs)
+        )
+    return manifest, receipt_binding, receipt, receipt_outputs
+
+
+def _run_authority_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    label: str,
+) -> None:
+    completed = subprocess.run(
+        command,
+        cwd=cwd,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        umask=0o022,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise ReleaseError(f"{label} failed: {detail}")
+
+
+def _rebuild_authority_outputs(
+    *,
+    authority_repository: Path,
+    authority_commit: str,
+    authority_snapshot: Path,
+    build_home: Path,
+    receipt_binding: dict[str, object],
+    receipt: dict[str, object],
+    receipt_outputs: dict[str, dict[str, object]],
+    node: Path,
+    pnpm: Path,
+) -> dict[str, object]:
+    """Rebuild ignored lib outputs from one clean, exact authority snapshot."""
+    for raw_path in receipt_outputs:
+        if (authority_snapshot / raw_path).exists():
             raise ReleaseError(
-                f"personal mirror differs from authority commit: {raw_path}"
+                f"clean authority snapshot unexpectedly contains build output: {raw_path}"
             )
-    return manifest
+
+    build_home.mkdir(parents=True, mode=0o700)
+    temporary = build_home / "tmp"
+    temporary.mkdir(mode=0o700)
+    empty_npm_config = build_home / "empty.npmrc"
+    empty_npm_config.write_text("", encoding="utf-8")
+    corepack_home = build_home / "corepack"
+    pnpm_home = build_home / "pnpm"
+    xdg_config = build_home / "xdg-config"
+    xdg_cache = build_home / "xdg-cache"
+    xdg_data = build_home / "xdg-data"
+    xdg_state = build_home / "xdg-state"
+    for directory in (
+        corepack_home,
+        pnpm_home,
+        xdg_config,
+        xdg_cache,
+        xdg_data,
+        xdg_state,
+    ):
+        directory.mkdir(mode=0o700)
+    environment = {
+        "HOME": str(build_home),
+        "USERPROFILE": str(build_home),
+        "TMPDIR": str(temporary),
+        "PATH": os.pathsep.join([
+            str(node.resolve().parent),
+            "/usr/bin",
+            "/bin",
+        ]),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "CI": "1",
+        "NODE_ENV": "production",
+        "TZ": "UTC",
+        "SOURCE_DATE_EPOCH": "0",
+        "COREPACK_HOME": str(corepack_home),
+        "PNPM_HOME": str(pnpm_home),
+        "XDG_CONFIG_HOME": str(xdg_config),
+        "XDG_CACHE_HOME": str(xdg_cache),
+        "XDG_DATA_HOME": str(xdg_data),
+        "XDG_STATE_HOME": str(xdg_state),
+        "npm_config_userconfig": str(empty_npm_config),
+        "npm_config_globalconfig": str(empty_npm_config),
+        "npm_config_ignore_scripts": "true",
+        "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
+    }
+    pnpm_store_setting = os.environ.get("PNPM_CONFIG_STORE_DIR")
+    if pnpm_store_setting:
+        pnpm_store = Path(pnpm_store_setting).expanduser().absolute()
+        if pnpm_store.is_symlink() or not pnpm_store.is_dir():
+            raise ReleaseError(
+                "PNPM_CONFIG_STORE_DIR must name a physical package store"
+            )
+        environment["PNPM_CONFIG_STORE_DIR"] = str(
+            pnpm_store.resolve(strict=True)
+        )
+    _run_authority_command(
+        [str(pnpm), *AUTHORITY_INSTALL_RECIPE[1:]],
+        cwd=authority_snapshot,
+        environment=environment,
+        label="frozen authority dependency install",
+    )
+    _run_authority_command(
+        [str(node), *AUTHORITY_BUILD_RECIPE[1:]],
+        cwd=authority_snapshot,
+        environment=environment,
+        label="clean authority build",
+    )
+
+    built: dict[str, Path] = {}
+    for package in MIRROR_PACKAGES:
+        lib = authority_snapshot / "packages" / "extensions" / package / "lib"
+        if lib.is_symlink() or not lib.is_dir():
+            raise ReleaseError(f"clean authority build omitted lib tree: {package}")
+        for path in _walk_without_links(lib):
+            metadata = path.lstat()
+            relative = path.relative_to(authority_snapshot).as_posix()
+            if stat.S_ISDIR(metadata.st_mode):
+                continue
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise ReleaseError(
+                    f"clean authority build produced a link or special file: {relative}"
+                )
+            built[relative] = path
+    if set(built) != set(receipt_outputs):
+        missing = sorted(set(receipt_outputs) - set(built))
+        extra = sorted(set(built) - set(receipt_outputs))
+        raise ReleaseError(
+            "clean authority build output inventory differs: "
+            + ", ".join([
+                *(f"missing {path}" for path in missing),
+                *(f"unexpected {path}" for path in extra),
+            ])
+        )
+    snapshot_marker = str(authority_snapshot).encode("utf-8")
+    for raw_path, expected in receipt_outputs.items():
+        path = built[raw_path]
+        content = path.read_bytes()
+        metadata = path.stat()
+        if snapshot_marker in content:
+            raise ReleaseError(
+                f"clean authority build output contains its staging path: {raw_path}"
+            )
+        if sha256_bytes(content) != expected.get("sha256") \
+                or len(content) != expected.get("size") \
+                or stat.S_IMODE(metadata.st_mode) != expected.get("mode"):
+            raise ReleaseError(
+                f"clean authority build differs from committed receipt: {raw_path}"
+            )
+    receipt_inputs = receipt.get("inputs")
+    if not isinstance(receipt_inputs, list):
+        raise ReleaseError("authority build receipt inputs are invalid")
+    for input_file in receipt_inputs:
+        if not isinstance(input_file, dict) or not isinstance(input_file.get("path"), str):
+            raise ReleaseError("authority build receipt input is invalid")
+        path = authority_snapshot / input_file["path"]
+        if path.is_symlink() or not path.is_file():
+            raise ReleaseError(
+                f"clean authority build changed an input: {input_file['path']}"
+            )
+        metadata = path.stat()
+        if sha256_file(path) != input_file.get("git_blob_sha256") \
+                or metadata.st_size != input_file.get("size") \
+                or stat.S_IMODE(metadata.st_mode) != input_file.get("mode"):
+            raise ReleaseError(
+                f"clean authority build changed an input: {input_file['path']}"
+            )
+    tree_oid = _git_bytes(
+        authority_repository,
+        "rev-parse",
+        f"{authority_commit}^{{tree}}",
+    ).decode("ascii").strip()
+    return {
+        "authority_commit": authority_commit,
+        "authority_tree_oid": tree_oid,
+        "receipt": receipt_binding,
+        "recipe_id": BUILD_RECIPE_ID,
+        "inputs_sha256": receipt["inputs_sha256"],
+        "outputs_sha256": receipt["outputs_sha256"],
+        "pnpm_lock_sha256": sha256_file(authority_snapshot / "pnpm-lock.yaml"),
+        "initial_outputs_absent": True,
+        "clean_rebuild_passed": True,
+    }
 
 
 def tarball_receipt(path: Path) -> dict[str, object]:
@@ -508,14 +1210,69 @@ def tarball_json_file(path: Path, member_name: str) -> dict[str, object]:
     return value
 
 
-def _pack_environment(home: Path, pnpm: Path) -> dict[str, str]:
+def _verify_package_tarball_traceability(
+    *,
+    package_name: str,
+    package_root: Path,
+    tarball: Path,
+    tarball_tree: dict[str, object],
+    mirror: dict[str, object],
+) -> None:
+    """Require every mirrored package tar member to come from the v2 union."""
+    entries = mirror.get("files")
+    if not isinstance(entries, list):
+        raise ReleaseError("mirror file inventory is invalid")
+    by_path = {
+        entry.get("path"): entry
+        for entry in entries
+        if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+    }
+    members = tarball_tree.get("files")
+    if not isinstance(members, list):
+        raise ReleaseError(f"{package_name} tarball receipt is invalid")
+    source_prefix = PACKAGE_PATHS[package_name]
+    for member in members:
+        if not isinstance(member, dict) or not isinstance(member.get("path"), str):
+            raise ReleaseError(f"{package_name} tarball member is invalid")
+        relative = _safe_relative(member["path"], f"{package_name} tarball member")
+        manifest_path = (source_prefix / relative).as_posix()
+        entry = by_path.get(manifest_path)
+        physical = package_root / relative
+        if entry is None or not physical.is_file():
+            raise ReleaseError(
+                f"{package_name} tarball member is absent from the mirror union: "
+                f"{member['path']}"
+            )
+        metadata = physical.stat()
+        if relative == Path("package.json"):
+            packaged_manifest = tarball_json_file(tarball, "package/package.json")
+            try:
+                source_manifest = json.loads(physical.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise ReleaseError(
+                    f"{package_name} source package.json is invalid: {error}"
+                ) from error
+            # pnpm rewrites JSON whitespace during pack. The member remains
+            # traceable when its parsed value equals the distribution-owned file.
+            member_matches = packaged_manifest == source_manifest \
+                and member.get("mode") == stat.S_IMODE(metadata.st_mode)
+        else:
+            member_matches = member.get("sha256") == entry.get("sha256") \
+                and member.get("sha256") == sha256_file(physical) \
+                and member.get("size") == metadata.st_size \
+                and member.get("mode") == stat.S_IMODE(metadata.st_mode)
+        if not member_matches:
+            raise ReleaseError(
+                f"{package_name} tarball member differs from the mirror union: "
+                f"{member['path']}"
+            )
+
+
+def _pack_environment(home: Path, node: Path, pnpm: Path) -> dict[str, str]:
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = home / "tmp"
     temporary.mkdir(mode=0o700)
-    node = shutil.which("node")
-    path_parts = [str(pnpm.resolve().parent)]
-    if node is not None:
-        path_parts.append(str(Path(node).resolve().parent))
+    path_parts = [str(pnpm.resolve().parent), str(node.resolve().parent)]
     path_parts.extend(["/usr/bin", "/bin"])
     return {
         "HOME": str(home),
@@ -604,6 +1361,7 @@ def prepare_release(
     authority_repository: Path,
     authority_commit: str,
     destination: Path,
+    node: Path,
     pnpm: Path,
 ) -> dict[str, object]:
     """Atomically create one read-only release from explicit Git commits."""
@@ -611,31 +1369,72 @@ def prepare_release(
     if destination.exists() or destination.is_symlink():
         raise ReleaseError(f"release destination already exists: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    pnpm_identity = _tool_identity(pnpm, ["--version"])
+    node_identity = _tool_identity(node, ["--version"])
+    pnpm_identity = _tool_identity(pnpm, ["--version"], path_tools=[node])
+    pnpm_package = pnpm_package_identity(pnpm, str(pnpm_identity["version"]))
     stage = Path(tempfile.mkdtemp(prefix=".kersor-release-", dir=destination.parent))
     try:
         personal = stage / "personal"
         core = stage / "core"
+        authority_snapshot = stage / ".authority-source"
         materialize_git_snapshot(personal_repository, personal_commit, personal)
         materialize_git_snapshot(core_repository, core_commit, core)
-        mirror = _verify_mirror_against_authority(
-            personal,
+        materialize_git_snapshot(
             authority_repository,
             authority_commit,
+            authority_snapshot,
+        )
+        mirror, receipt_binding, receipt, receipt_outputs = (
+            _verify_mirror_against_authority(
+                personal,
+                authority_repository,
+                authority_commit,
+                authority_snapshot,
+            )
         )
         toolchain = mirror.get("toolchain")
+        expected_node = toolchain.get("node") if isinstance(toolchain, dict) else None
         expected_pnpm = toolchain.get("pnpm") if isinstance(toolchain, dict) else None
+        receipt_tools = receipt.get("tools")
+        receipt_pnpm = receipt_tools.get("pnpm") \
+            if isinstance(receipt_tools, dict) else None
+        if not isinstance(receipt_pnpm, dict) \
+                or pnpm_package["version"] != receipt_pnpm.get("version") \
+                or pnpm_package["tree"] != receipt_pnpm.get("tree"):
+            raise ReleaseError(
+                "selected pnpm package differs from the authority build receipt"
+            )
+        actual_node = str(node_identity["version"]).removeprefix("v")
+        if expected_node != actual_node:
+            raise ReleaseError(
+                "Node version differs from the reconciled mirror toolchain: "
+                f"expected {expected_node!r}, got {actual_node!r}"
+            )
         if expected_pnpm != pnpm_identity["version"]:
             raise ReleaseError(
                 "pnpm version differs from the reconciled mirror toolchain: "
                 f"expected {expected_pnpm!r}, got {pnpm_identity['version']!r}"
             )
+        authority_home = stage / ".authority-home"
+        authority_build = _rebuild_authority_outputs(
+            authority_repository=authority_repository,
+            authority_commit=authority_commit,
+            authority_snapshot=authority_snapshot,
+            build_home=authority_home,
+            receipt_binding=receipt_binding,
+            receipt=receipt,
+            receipt_outputs=receipt_outputs,
+            node=node,
+            pnpm=pnpm,
+        )
+        shutil.rmtree(authority_snapshot)
+        shutil.rmtree(authority_home)
 
         package_output = stage / "packages"
         package_output.mkdir()
         build_root = stage / ".package-build"
         pack_home = stage / ".pack-home"
-        environment = _pack_environment(pack_home, pnpm)
+        environment = _pack_environment(pack_home, node, pnpm)
         package_entries: list[dict[str, object]] = []
         tarballs: dict[str, Path] = {}
         for name in (
@@ -651,13 +1450,21 @@ def prepare_release(
                 raise ReleaseError(f"package identity differs at {source}")
             output = package_output / _package_filename(name)
             _pack_package(build, output, pnpm, environment)
+            package_tree = tarball_receipt(output)
+            _verify_package_tarball_traceability(
+                package_name=name,
+                package_root=source,
+                tarball=output,
+                tarball_tree=package_tree,
+                mirror=mirror,
+            )
             tarballs[name] = output
             package_entries.append({
                 "name": name,
                 "version": manifest["version"],
                 "tarball": output.relative_to(stage).as_posix(),
                 "sha256": sha256_file(output),
-                "tree": tarball_receipt(output),
+                "tree": package_tree,
                 "source_path": PACKAGE_PATHS[name].as_posix(),
             })
 
@@ -696,6 +1503,13 @@ def prepare_release(
         shutil.rmtree(build_root)
         shutil.rmtree(pack_home)
 
+        if _tool_identity(node, ["--version"]) != node_identity \
+                or _tool_identity(pnpm, ["--version"], path_tools=[node]) != \
+                pnpm_identity \
+                or pnpm_package_identity(pnpm, str(pnpm_identity["version"])) != \
+                pnpm_package:
+            raise ReleaseError("release tool identity changed during preparation")
+
         _seal_read_only(personal)
         _seal_read_only(core)
         _seal_read_only(package_output)
@@ -707,6 +1521,7 @@ def prepare_release(
                 "core_commit": core_commit,
                 "authority_commit": authority_commit,
                 "source_from_git_objects": True,
+                "authority_build": authority_build,
             },
             "personal": {
                 "root": "personal",
@@ -716,7 +1531,11 @@ def prepare_release(
             },
             "core": {"root": "core", "tree": tree_receipt(core)},
             "packages": sorted(package_entries, key=lambda item: str(item["name"])),
-            "tools": {"pnpm": pnpm_identity},
+            "tools": {
+                "node": node_identity,
+                "pnpm": pnpm_identity,
+                "pnpm_package": pnpm_package,
+            },
         }
         payload["release_id"] = sha256_bytes(canonical_json(payload))
         lock_path = stage / "release-lock.json"
@@ -783,6 +1602,41 @@ def load_release(release_root: Path) -> dict[str, object]:
             raise ReleaseError(f"release package contents differ: {name}")
     if names != set(PACKAGE_PATHS):
         raise ReleaseError("release package inventory is incomplete")
+    tools = lock.get("tools")
+    if not isinstance(tools, dict) or set(tools) != {
+        "node",
+        "pnpm",
+        "pnpm_package",
+    }:
+        raise ReleaseError("release tool identity evidence is incomplete")
+    file_identity_fields = {
+        "requested_path",
+        "realpath",
+        "sha256",
+        "mode",
+        "size",
+        "platform",
+        "arch",
+        "version",
+    }
+    for name in ("node", "pnpm"):
+        identity = tools.get(name)
+        if not isinstance(identity, dict) or set(identity) != file_identity_fields:
+            raise ReleaseError(f"release {name} identity evidence is invalid")
+    package_identity = tools.get("pnpm_package")
+    if not isinstance(package_identity, dict) or set(package_identity) != {
+        "requested_wrapper",
+        "realpath",
+        "version",
+        "platform",
+        "arch",
+        "tree",
+    }:
+        raise ReleaseError("release pnpm package identity evidence is invalid")
+    validate_portable_tree_receipt(
+        package_identity.get("tree"),
+        "release pnpm package tree",
+    )
     return lock
 
 
@@ -936,13 +1790,23 @@ def verify_web_install(
     except (OSError, ReleaseError) as error:
         return [str(error)]
     tools = receipt.get("tools")
-    if not isinstance(tools, dict) or set(tools) != {"node", "pnpm", "dsh_bin"}:
+    if not isinstance(tools, dict) or set(tools) != {
+        "node",
+        "pnpm",
+        "pnpm_package",
+        "dsh_bin",
+    }:
         violations.append("Web release receipt has incomplete tool identity evidence")
         return violations
     for name, identity in sorted(tools.items()):
-        violations.extend(
-            verify_file_identity(identity, f"Web release tool {name}")
-        )
+        if name == "pnpm_package":
+            violations.extend(
+                verify_pnpm_package_identity(identity, "Web release pnpm package")
+            )
+        else:
+            violations.extend(
+                verify_file_identity(identity, f"Web release tool {name}")
+            )
     stable_receipt = dict(receipt)
     stable_receipt.pop("tools", None)
     if stable_receipt != current:
@@ -963,13 +1827,15 @@ def install_web_release(
     """Install the release bundle through DSH into one temporary or real profile."""
     lock = load_release(release_root)
     node_identity = _tool_identity(node, ["--version"])
-    pnpm_identity = _tool_identity(pnpm, ["--version"])
-    recorded_pnpm = lock.get("tools")
-    recorded_pnpm = recorded_pnpm.get("pnpm") if isinstance(recorded_pnpm, dict) else None
-    if not isinstance(recorded_pnpm, dict) \
-            or pnpm_identity["version"] != recorded_pnpm.get("version") \
-            or pnpm_identity["sha256"] != recorded_pnpm.get("sha256"):
-        raise ReleaseError("install pnpm identity differs from the release packer")
+    pnpm_identity = _tool_identity(pnpm, ["--version"], path_tools=[node])
+    pnpm_package = pnpm_package_identity(pnpm, str(pnpm_identity["version"]))
+    recorded_tools = lock.get("tools")
+    recorded_package = recorded_tools.get("pnpm_package") \
+        if isinstance(recorded_tools, dict) else None
+    if not isinstance(recorded_package, dict) \
+            or pnpm_package["version"] != recorded_package.get("version") \
+            or pnpm_package["tree"] != recorded_package.get("tree"):
+        raise ReleaseError("install pnpm package differs from the release packer")
     dsh_bin_identity = _dsh_bin_identity(node, dsh_bin)
     dsh_home = dsh_home.expanduser().absolute()
     dsh_home.mkdir(parents=True, exist_ok=True)
@@ -1009,6 +1875,7 @@ def install_web_release(
     receipt["tools"] = {
         "node": node_identity,
         "pnpm": pnpm_identity,
+        "pnpm_package": pnpm_package,
         "dsh_bin": dsh_bin_identity,
     }
     receipt_path = profile / ".kersor-release-receipt.json"
@@ -1049,7 +1916,7 @@ def _extract_git_archive(archive: bytes, destination: Path) -> None:
             target = destination / relative
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
-                target.chmod(member.mode & 0o777)
+                target.chmod(0o755)
                 continue
             if not member.isfile():
                 raise ReleaseError(
@@ -1061,7 +1928,7 @@ def _extract_git_archive(archive: bytes, destination: Path) -> None:
                 raise ReleaseError(f"cannot extract Git archive entry: {member.name}")
             with target.open("xb") as output:
                 shutil.copyfileobj(extracted, output)
-            target.chmod(member.mode & 0o777)
+            target.chmod(0o755 if member.mode & 0o111 else 0o644)
 
 
 def _gitlinks(repository: Path, commit: str) -> list[tuple[Path, str]]:
@@ -1241,6 +2108,7 @@ def parser() -> argparse.ArgumentParser:
     prepare.add_argument("--authority-root", required=True, type=Path)
     prepare.add_argument("--authority-commit", required=True)
     prepare.add_argument("--output", required=True, type=Path)
+    prepare.add_argument("--node", required=True, type=Path)
     prepare.add_argument("--pnpm", required=True, type=Path)
 
     install_web = subcommands.add_parser(
@@ -1280,6 +2148,7 @@ def main(argv: list[str] | None = None) -> int:
                 authority_repository=options.authority_root,
                 authority_commit=options.authority_commit,
                 destination=options.output,
+                node=options.node,
                 pnpm=options.pnpm,
             )
             print(

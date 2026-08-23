@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from scripts import release
+from scripts import release, sync_plugins
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -98,6 +98,29 @@ class ReleaseParityTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_authority_receipt_canonical_json_golden_vector(self) -> None:
+        entries = [
+            {
+                "size": 1,
+                "path": "z/é.ts",
+                "mode": 0o644,
+                "git_blob_sha256": "0" * 64,
+            },
+            {
+                "path": "😀/a.ts",
+                "mode": 0o755,
+                "size": 2,
+                "git_blob_sha256": "f" * 64,
+            },
+        ]
+
+        digest = hashlib.sha256(release.canonical_json(entries)).hexdigest()
+
+        self.assertEqual(
+            digest,
+            "adc371a32a54d4eb668655602bb35db968bf019364d9ee696695e92d649e5e18",
+        )
+
     def test_rejects_directory_file_dependencies(self) -> None:
         profile = self.root / "profile"
         profile.mkdir()
@@ -144,7 +167,7 @@ class ReleaseParityTests(unittest.TestCase):
         write(
             manifest,
             json.dumps({
-                "schema_version": 1,
+                "schema_version": 2,
                 "authority": {
                     "revision": "a" * 40,
                     "reconciled": False,
@@ -345,9 +368,71 @@ class ReleaseWorkflowTests(unittest.TestCase):
         if self.node is None or self.pnpm is None:
             self.skipTest("Node.js and pnpm are required for release packing")
         self.pnpm_version = run([self.pnpm, "--version"], self.root)
+        self.node_version = run([self.node, "--version"], self.root).removeprefix("v")
 
         self.authority = self.root / "authority"
         init_repository(self.authority)
+        write(self.authority / ".gitignore", "lib/\nnode_modules/\n")
+        write(
+            self.authority / "package.json",
+            json.dumps({
+                "name": "@deepseek-ai/dsh-root",
+                "private": True,
+                "packageManager": f"pnpm@{self.pnpm_version}",
+            })
+            + "\n",
+        )
+        write(
+            self.authority / "pnpm-workspace.yaml",
+            "packages:\n  - packages/extensions/*\n",
+        )
+        write(
+            self.authority / "pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n\n"
+            "settings:\n"
+            "  autoInstallPeers: true\n"
+            "  excludeLinksFromLockfile: false\n\n"
+            "importers:\n\n"
+            "  .: {}\n\n"
+            "  packages/extensions/kersor: {}\n\n"
+            "  packages/extensions/kersor-viewer: {}\n\n"
+            "  packages/extensions/ui-kersor-viewer: {}\n",
+        )
+        write(
+            self.authority / "apps" / "cli" / "package.json",
+            json.dumps({
+                "name": "@deepseek-ai/dsh-cli",
+                "private": True,
+                "type": "module",
+            })
+            + "\n",
+        )
+        write(
+            self.authority / "apps" / "cli" / "src" / "index.ts",
+            "export const cli = true\n",
+        )
+        for root_config in (
+            "tsconfig.base.json",
+            "tsconfig.base.client.json",
+            "tsconfig.host.json",
+        ):
+            write(self.authority / root_config, "{}\n")
+        write(self.authority / "tsdown.config.ts", "export default {}\n")
+        write(
+            self.authority / "scripts" / "release" / "build-kersor-distribution.mjs",
+            "import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'\n"
+            "for (const name of ['kersor', 'kersor-viewer', 'ui-kersor-viewer']) {\n"
+            "  const root = `packages/extensions/${name}`\n"
+            "  const source = readFileSync(`${root}/src/index.ts`, 'utf8')\n"
+            "  const value = /fixture = (true|false)/.exec(source)?.[1]\n"
+            "  if (!value) throw new Error(`invalid fixture source: ${name}`)\n"
+            "  rmSync(`${root}/lib`, { recursive: true, force: true })\n"
+            "  mkdirSync(`${root}/lib/types`, { recursive: true })\n"
+            "  writeFileSync(`${root}/lib/index.js`, `export const fixture = ${value}\\n`)\n"
+            "  writeFileSync(`${root}/lib/types/index.d.ts`, 'export declare const fixture: boolean\\n')\n"
+            "}\n",
+        )
+        authority_outputs = []
         for directory, package_name in self.PACKAGE_FIXTURES.items():
             package = self.authority / "packages" / "extensions" / directory
             write(
@@ -357,11 +442,102 @@ class ReleaseWorkflowTests(unittest.TestCase):
                     "version": "1.0.0",
                     "type": "module",
                     "main": "lib/index.js",
-                    "files": ["lib/index.js"],
+                    "files": ["lib"],
                 })
                 + "\n",
             )
-            write(package / "lib" / "index.js", "export const fixture = true\n")
+            write(package / "src" / "index.ts", "export const fixture = true\n")
+            write(package / "tests" / "index.spec.ts", "export {}\n")
+            output = package / "lib" / "index.js"
+            write(output, "export const fixture = true\n")
+            authority_outputs.append({
+                "path": output.relative_to(self.authority).as_posix(),
+                "sha256": file_sha256(output),
+                "size": output.stat().st_size,
+                "mode": stat.S_IMODE(output.stat().st_mode),
+            })
+            declaration = package / "lib" / "types" / "index.d.ts"
+            write(declaration, "export declare const fixture: boolean\n")
+            authority_outputs.append({
+                "path": declaration.relative_to(self.authority).as_posix(),
+                "sha256": file_sha256(declaration),
+                "size": declaration.stat().st_size,
+                "mode": stat.S_IMODE(declaration.stat().st_mode),
+            })
+        authority_outputs.sort(key=lambda item: item["path"])
+        authority_inputs = []
+        for path in sorted(self.authority.rglob("*")):
+            relative = path.relative_to(self.authority)
+            if not path.is_file() or ".git" in relative.parts or "lib" in relative.parts:
+                continue
+            authority_inputs.append({
+                "path": relative.as_posix(),
+                "git_blob_sha256": file_sha256(path),
+                "size": path.stat().st_size,
+                "mode": stat.S_IMODE(path.stat().st_mode),
+            })
+        authority_inputs.sort(key=lambda item: item["path"])
+        pnpm_package = release.pnpm_package_identity(
+            Path(self.pnpm),
+            self.pnpm_version,
+        )
+        authority_tools = {
+            "node": {"version": self.node_version},
+            "pnpm": {
+                "version": self.pnpm_version,
+                "tree": pnpm_package["tree"],
+            },
+        }
+        build_receipt = {
+            "schema_version": 1,
+            "receipt_type": "kersor-distribution-build",
+            "recipe": {
+                "id": "dsh-kersor-distribution-build-v1",
+                "node": self.node_version,
+                "pnpm": self.pnpm_version,
+                "install": [
+                    "pnpm",
+                    "install",
+                    "--frozen-lockfile",
+                    "--ignore-scripts",
+                    "--filter",
+                    "@deepseek-ai/dsh-root",
+                    "--filter",
+                    "@deepseek-ai/dsh-kersor...",
+                    "--filter",
+                    "@deepseek-ai/dsh-kersor-viewer...",
+                    "--filter",
+                    "@deepseek-ai/dsh-client-ui-kersor-viewer...",
+                    "--filter",
+                    "@deepseek-ai/dsh-typert-generator...",
+                ],
+                "command": [
+                    "node",
+                    "scripts/release/build-kersor-distribution.mjs",
+                ],
+            },
+            "tools": authority_tools,
+            "tools_sha256": hashlib.sha256(
+                release.canonical_json(authority_tools)
+            ).hexdigest(),
+            "inputs": authority_inputs,
+            "inputs_sha256": hashlib.sha256(
+                release.canonical_json(authority_inputs)
+            ).hexdigest(),
+            "outputs": authority_outputs,
+            "outputs_sha256": hashlib.sha256(
+                release.canonical_json(authority_outputs)
+            ).hexdigest(),
+        }
+        authority_receipt = (
+            self.authority
+            / "release"
+            / "kersor-distribution-build-receipt.json"
+        )
+        write(
+            authority_receipt,
+            json.dumps(build_receipt, indent=2) + "\n",
+        )
         self.authority_commit = commit_all(self.authority)
 
         self.personal = self.root / "personal"
@@ -377,27 +553,46 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 if not path.is_file():
                     continue
                 relative = path.relative_to(self.personal).as_posix()
-                source = (
-                    Path("packages/extensions")
-                    / directory
-                    / path.relative_to(personal_package)
-                ).as_posix()
-                mirror_entries.append({
+                package_relative = path.relative_to(personal_package)
+                source = (Path("packages/extensions") / directory / package_relative)
+                entry = {
                     "path": relative,
-                    "source": source,
                     "sha256": file_sha256(path),
-                })
+                    "origin": (
+                        "distribution-owned"
+                        if package_relative == Path("package.json")
+                        else (
+                            "derived-build"
+                            if package_relative.parts[0] == "lib"
+                            else "tracked"
+                        )
+                    ),
+                }
+                if entry["origin"] != "distribution-owned":
+                    entry["source"] = source.as_posix()
+                if entry["origin"] == "derived-build":
+                    entry["receipt_output"] = source.as_posix()
+                mirror_entries.append(entry)
+        receipt_bytes = authority_receipt.read_bytes()
         write(
             self.personal / "plugins" / "dsh-mirror.json",
             json.dumps({
-                "schema_version": 1,
+                "schema_version": 2,
                 "authority": {
                     "repository": "fixture",
                     "revision": self.authority_commit,
                     "source_root": "packages/extensions",
                     "reconciled": True,
                 },
-                "toolchain": {"node": "fixture", "pnpm": self.pnpm_version},
+                "toolchain": {
+                    "node": self.node_version,
+                    "pnpm": self.pnpm_version,
+                },
+                "build_receipt": {
+                    "path": "release/kersor-distribution-build-receipt.json",
+                    "sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+                    "recipe_id": "dsh-kersor-distribution-build-v1",
+                },
                 "files": sorted(mirror_entries, key=lambda item: item["path"]),
             }, indent=2)
             + "\n",
@@ -440,6 +635,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.core_commit = commit_all(self.core)
         self.release_root = self.root / "release"
 
+        for output in authority_outputs:
+            write(
+                self.authority / output["path"],
+                "export const fixture = 'ignored authority worktree drift'\n",
+            )
+
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
@@ -453,6 +654,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             authority_repository=self.authority,
             authority_commit=self.authority_commit,
             destination=self.release_root,
+            node=Path(self.node),
             pnpm=Path(self.pnpm),
         )
 
@@ -492,6 +694,392 @@ class ReleaseWorkflowTests(unittest.TestCase):
         for package in packages:
             tarball = self.release_root / package["tarball"]
             self.assertEqual(file_sha256(tarball), tarball_hashes[package["name"]])
+
+    def test_sync_accepts_only_receipted_ignored_build_outputs(self) -> None:
+        with mock.patch.multiple(
+            sync_plugins,
+            TOOLCHAIN_NODE=self.node_version,
+            TOOLCHAIN_PNPM=self.pnpm_version,
+        ):
+            with self.assertRaisesRegex(
+                sync_plugins.MirrorError,
+                "ignored build output differs from authority receipt",
+            ):
+                sync_plugins.source_snapshot(self.authority)
+
+            run(
+                [
+                    self.node,
+                    "scripts/release/build-kersor-distribution.mjs",
+                ],
+                self.authority,
+            )
+            ignored_modules = (
+                self.authority
+                / "packages"
+                / "extensions"
+                / "kersor"
+                / "node_modules"
+            )
+            ignored_modules.mkdir()
+            (ignored_modules / "fixture-dependency").symlink_to(
+                self.authority / "package.json"
+            )
+            revision, snapshot, binding = sync_plugins.source_snapshot(self.authority)
+
+        self.assertEqual(revision, self.authority_commit)
+        self.assertEqual(binding["recipe_id"], "dsh-kersor-distribution-build-v1")
+        self.assertNotIn(
+            Path("plugins/kersor/package.json"),
+            {Path(str(path)) for path in snapshot},
+        )
+
+    def test_prepare_rejects_self_asserted_generated_bytes(self) -> None:
+        generated = self.personal / "plugins" / "kersor" / "lib" / "index.js"
+        write(generated, "export const fixture = 'stale generated output'\n")
+        manifest_path = self.personal / "plugins" / "dsh-mirror.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        entry = next(item for item in manifest["files"] if item["path"] == (
+            "plugins/kersor/lib/index.js"
+        ))
+        entry["sha256"] = file_sha256(generated)
+        write(manifest_path, json.dumps(manifest, indent=2) + "\n")
+        self.personal_commit = commit_all(self.personal, "self asserted output")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            "differs from authority build",
+        ):
+            self.prepare()
+
+    def test_prepare_rebuilds_authority_instead_of_trusting_matching_receipts(self) -> None:
+        generated = self.personal / "plugins" / "kersor" / "lib" / "index.js"
+        write(generated, "export const fixture = false\n")
+        generated_hash = file_sha256(generated)
+
+        receipt_path = (
+            self.authority
+            / "release"
+            / "kersor-distribution-build-receipt.json"
+        )
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        output = next(
+            item
+            for item in receipt["outputs"]
+            if item["path"] == "packages/extensions/kersor/lib/index.js"
+        )
+        output.update({
+            "sha256": generated_hash,
+            "size": generated.stat().st_size,
+            "mode": stat.S_IMODE(generated.stat().st_mode),
+        })
+        receipt["outputs_sha256"] = hashlib.sha256(
+            release.canonical_json(receipt["outputs"])
+        ).hexdigest()
+        write(receipt_path, json.dumps(receipt, indent=2) + "\n")
+        self.authority_commit = commit_all(self.authority, "tampered build receipt")
+
+        manifest_path = self.personal / "plugins" / "dsh-mirror.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["authority"]["revision"] = self.authority_commit
+        manifest["build_receipt"]["sha256"] = file_sha256(receipt_path)
+        entry = next(
+            item
+            for item in manifest["files"]
+            if item["path"] == "plugins/kersor/lib/index.js"
+        )
+        entry["sha256"] = generated_hash
+        write(manifest_path, json.dumps(manifest, indent=2) + "\n")
+        self.personal_commit = commit_all(self.personal, "matching self assertion")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            "clean authority build",
+        ):
+            self.prepare()
+
+    def test_prepare_rejects_receipt_outputs_missing_from_personal_mirror(self) -> None:
+        (
+            self.personal / "plugins" / "kersor" / "lib" / "index.js"
+        ).unlink()
+        manifest_path = self.personal / "plugins" / "dsh-mirror.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["files"] = [
+            item
+            for item in manifest["files"]
+            if item["path"] != "plugins/kersor/lib/index.js"
+        ]
+        write(manifest_path, json.dumps(manifest, indent=2) + "\n")
+        self.personal_commit = commit_all(self.personal, "omit generated output")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            "outputs absent from the mirror",
+        ):
+            self.prepare()
+
+    def test_prepare_rejects_tracked_authority_files_missing_from_the_union(self) -> None:
+        (
+            self.personal / "plugins" / "kersor" / "src" / "index.ts"
+        ).unlink()
+        manifest_path = self.personal / "plugins" / "dsh-mirror.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["files"] = [
+            item
+            for item in manifest["files"]
+            if item["path"] != "plugins/kersor/src/index.ts"
+        ]
+        write(manifest_path, json.dumps(manifest, indent=2) + "\n")
+        self.personal_commit = commit_all(self.personal, "omit tracked authority file")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            "tracked authority files absent from the mirror",
+        ):
+            self.prepare()
+
+    def test_prepare_rejects_tracked_authority_mode_drift(self) -> None:
+        tracked = self.personal / "plugins" / "kersor" / "src" / "index.ts"
+        tracked.chmod(0o755)
+        self.personal_commit = commit_all(self.personal, "change tracked source mode")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            "personal mirror differs from authority commit",
+        ):
+            self.prepare()
+
+    def test_prepare_rejects_unlisted_packable_files(self) -> None:
+        extra = self.personal / "plugins" / "kersor" / "lib" / "injected.js"
+        write(extra, "export const injected = true\n")
+        package_path = self.personal / "plugins" / "kersor" / "package.json"
+        package = json.loads(package_path.read_text(encoding="utf-8"))
+        package["files"] = ["lib/*.js"]
+        write(package_path, json.dumps(package, indent=2) + "\n")
+        manifest_path = self.personal / "plugins" / "dsh-mirror.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        package_entry = next(
+            item
+            for item in manifest["files"]
+            if item["path"] == "plugins/kersor/package.json"
+        )
+        package_entry["sha256"] = file_sha256(package_path)
+        write(manifest_path, json.dumps(manifest, indent=2) + "\n")
+        self.personal_commit = commit_all(self.personal, "unlisted packable file")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            "complete package tree",
+        ):
+            self.prepare()
+
+    def test_prepare_requires_distribution_owned_package_manifests(self) -> None:
+        manifest_path = self.personal / "plugins" / "dsh-mirror.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        entry = next(
+            item
+            for item in manifest["files"]
+            if item["path"] == "plugins/kersor/package.json"
+        )
+        entry["origin"] = "tracked"
+        entry["source"] = "packages/extensions/kersor/package.json"
+        write(manifest_path, json.dumps(manifest, indent=2) + "\n")
+        self.personal_commit = commit_all(self.personal, "misclassified package manifest")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            "package.json files must be distribution-owned",
+        ):
+            self.prepare()
+
+    def test_prepare_rejects_authority_lock_drift(self) -> None:
+        lock_path = self.authority / "pnpm-lock.yaml"
+        write(
+            lock_path,
+            lock_path.read_text(encoding="utf-8") + "# committed drift\n",
+        )
+        self.authority_commit = commit_all(self.authority, "lock drift")
+        manifest_path = self.personal / "plugins" / "dsh-mirror.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["authority"]["revision"] = self.authority_commit
+        write(manifest_path, json.dumps(manifest, indent=2) + "\n")
+        self.personal_commit = commit_all(self.personal, "bind drifted authority")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            "build input differs from commit: pnpm-lock.yaml",
+        ):
+            self.prepare()
+
+    def test_prepare_rejects_incomplete_workspace_input_closure(self) -> None:
+        receipt_path = (
+            self.authority
+            / "release"
+            / "kersor-distribution-build-receipt.json"
+        )
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["inputs"] = [
+            entry
+            for entry in receipt["inputs"]
+            if entry["path"] != "apps/cli/src/index.ts"
+        ]
+        receipt["inputs_sha256"] = hashlib.sha256(
+            release.canonical_json(receipt["inputs"])
+        ).hexdigest()
+        write(receipt_path, json.dumps(receipt, indent=2) + "\n")
+        self.authority_commit = commit_all(
+            self.authority,
+            "omit workspace input closure",
+        )
+
+        manifest_path = self.personal / "plugins" / "dsh-mirror.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["authority"]["revision"] = self.authority_commit
+        manifest["build_receipt"]["sha256"] = file_sha256(receipt_path)
+        write(manifest_path, json.dumps(manifest, indent=2) + "\n")
+        self.personal_commit = commit_all(
+            self.personal,
+            "bind incomplete workspace closure",
+        )
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            "omits canonical build inputs",
+        ):
+            self.prepare()
+
+    def test_prepare_rejects_toolchain_drift(self) -> None:
+        manifest_path = self.personal / "plugins" / "dsh-mirror.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["toolchain"]["node"] = "24.19.1"
+        write(manifest_path, json.dumps(manifest, indent=2) + "\n")
+        self.personal_commit = commit_all(self.personal, "toolchain drift")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            "toolchain differs from the authority build receipt",
+        ):
+            self.prepare()
+
+    def test_prepare_rejects_self_asserted_pnpm_package_identity(self) -> None:
+        receipt_path = (
+            self.authority
+            / "release"
+            / "kersor-distribution-build-receipt.json"
+        )
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        pnpm_tree = receipt["tools"]["pnpm"]["tree"]
+        pnpm_tree["files"][0]["sha256"] = "0" * 64
+        pnpm_tree["tree_sha256"] = hashlib.sha256(
+            release.canonical_json(pnpm_tree["files"])
+        ).hexdigest()
+        receipt["tools_sha256"] = hashlib.sha256(
+            release.canonical_json(receipt["tools"])
+        ).hexdigest()
+        write(receipt_path, json.dumps(receipt, indent=2) + "\n")
+        self.authority_commit = commit_all(
+            self.authority,
+            "self-assert pnpm package identity",
+        )
+
+        manifest_path = self.personal / "plugins" / "dsh-mirror.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["authority"]["revision"] = self.authority_commit
+        manifest["build_receipt"]["sha256"] = file_sha256(receipt_path)
+        write(manifest_path, json.dumps(manifest, indent=2) + "\n")
+        self.personal_commit = commit_all(
+            self.personal,
+            "bind self-asserted pnpm identity",
+        )
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            "selected pnpm package differs from the authority build receipt",
+        ):
+            self.prepare()
+
+    def test_prepare_rejects_path_dependent_authority_builds(self) -> None:
+        build_script = (
+            self.authority
+            / "scripts"
+            / "release"
+            / "build-kersor-distribution.mjs"
+        )
+        write(
+            build_script,
+            "import { mkdirSync, rmSync, writeFileSync } from 'node:fs'\n"
+            "for (const name of ['kersor', 'kersor-viewer', 'ui-kersor-viewer']) {\n"
+            "  const root = `packages/extensions/${name}`\n"
+            "  rmSync(`${root}/lib`, { recursive: true, force: true })\n"
+            "  mkdirSync(`${root}/lib`, { recursive: true })\n"
+            "  mkdirSync(`${root}/lib/types`, { recursive: true })\n"
+            "  writeFileSync(`${root}/lib/index.js`, `export const cwd = ${JSON.stringify(process.cwd())}\\n`)\n"
+            "  writeFileSync(`${root}/lib/types/index.d.ts`, `export const cwd = ${JSON.stringify(process.cwd())}\\n`)\n"
+            "}\n",
+        )
+        expected = f"export const cwd = {json.dumps(str(self.authority.resolve()))}\n"
+        receipt_path = (
+            self.authority
+            / "release"
+            / "kersor-distribution-build-receipt.json"
+        )
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        script_input = next(
+            item
+            for item in receipt["inputs"]
+            if item["path"] == "scripts/release/build-kersor-distribution.mjs"
+        )
+        script_input.update({
+            "git_blob_sha256": file_sha256(build_script),
+            "size": build_script.stat().st_size,
+            "mode": stat.S_IMODE(build_script.stat().st_mode),
+        })
+        receipt["inputs_sha256"] = hashlib.sha256(
+            release.canonical_json(receipt["inputs"])
+        ).hexdigest()
+        for output in receipt["outputs"]:
+            output.update({
+                "sha256": hashlib.sha256(expected.encode("utf-8")).hexdigest(),
+                "size": len(expected.encode("utf-8")),
+                "mode": 0o644,
+            })
+        receipt["outputs_sha256"] = hashlib.sha256(
+            release.canonical_json(receipt["outputs"])
+        ).hexdigest()
+        write(receipt_path, json.dumps(receipt, indent=2) + "\n")
+        self.authority_commit = commit_all(self.authority, "path dependent build")
+
+        manifest_path = self.personal / "plugins" / "dsh-mirror.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["authority"]["revision"] = self.authority_commit
+        manifest["build_receipt"]["sha256"] = file_sha256(receipt_path)
+        for entry in manifest["files"]:
+            if entry["origin"] != "derived-build":
+                continue
+            personal_output = self.personal / entry["path"]
+            write(personal_output, expected)
+            entry["sha256"] = file_sha256(personal_output)
+        write(manifest_path, json.dumps(manifest, indent=2) + "\n")
+        self.personal_commit = commit_all(self.personal, "path dependent outputs")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            "contains its staging path",
+        ):
+            self.prepare()
+
+    def test_prepare_rejects_empty_mirror_inventory(self) -> None:
+        manifest_path = self.personal / "plugins" / "dsh-mirror.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["files"] = []
+        write(manifest_path, json.dumps(manifest, indent=2) + "\n")
+        self.personal_commit = commit_all(self.personal, "empty mirror inventory")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError,
+            "complete package tree",
+        ):
+            self.prepare()
 
     def test_release_mode_installs_preset_with_frozen_core_receipt(self) -> None:
         self.prepare()
@@ -555,7 +1143,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(
             set(persisted_receipt["tools"]),
-            {"node", "pnpm", "dsh_bin"},
+            {"node", "pnpm", "pnpm_package", "dsh_bin"},
         )
         self.assertEqual(
             release.verify_web_install(
@@ -578,6 +1166,27 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
         self.assertTrue(
             any("tool" in item and "identity" in item for item in violations),
+            violations,
+        )
+        (profile / ".kersor-release-receipt.json").write_text(
+            json.dumps(persisted_receipt),
+            encoding="utf-8",
+        )
+        tampered_receipt = json.loads(json.dumps(persisted_receipt))
+        tampered_receipt["tools"]["pnpm_package"]["tree"][
+            "tree_sha256"
+        ] = "0" * 64
+        (profile / ".kersor-release-receipt.json").write_text(
+            json.dumps(tampered_receipt),
+            encoding="utf-8",
+        )
+        violations = release.verify_web_install(
+            self.release_root,
+            profile,
+            source_roots=[self.personal],
+        )
+        self.assertTrue(
+            any("pnpm package identity" in item for item in violations),
             violations,
         )
         (profile / ".kersor-release-receipt.json").write_text(

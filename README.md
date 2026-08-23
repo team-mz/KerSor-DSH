@@ -60,7 +60,7 @@ python3 scripts/install.py --kersor-root /absolute/path/to/KerSor --force
 
 覆盖前，安装器会把旧目录移动到同级时间戳备份。KerSor 的机器路径只写入已安装 preset 的 `.local/kersor-root`，不会进入 Git。
 
-上面的 `--kersor-root` 和直接安装 `file:<checkout>` 适合本地开发，但不构成冻结发布证据：pnpm 的目录依赖可以让 checkout 与 profile 中的文件共享 inode，修改源码会同时改变正在使用的 Web package。正式测试或发布必须先从三个明确的 Git commit 构建只读 release；构建只读取 commit objects，展开 Core 记录的每个 submodule commit，要求 `dsh-mirror.json` 已与同一 DeepSeek Harness commit reconciled，并把四个 package 制作为本地 tarball：
+上面的 `--kersor-root` 和直接安装 `file:<checkout>` 适合本地开发，但不构成冻结发布证据：pnpm 的目录依赖可以让 checkout 与 profile 中的文件共享 inode，修改源码会同时改变正在使用的 Web package。正式测试或发布必须先从三个明确的 Git commit 构建只读 release；构建只读取 commit objects，展开 Core 记录的每个 submodule commit，要求 schema v2 `dsh-mirror.json` 的 136 项与三个 package 物理树完全一致，并把每项声明为 authority tracked、authority derived-build 或 personal distribution-owned。对于 Git 忽略的 74 个 `lib/**`，prepare 会从 exact DeepSeek Harness commit 读取中央 build receipt，核对输入闭包和固定 Node／pnpm／命令，再在独立 clean snapshot 中执行 frozen filtered install 与 canonical build；重建产物必须同时匹配 authority receipt 和 personal commit，之后才会制作四个本地 tarball：
 
 ```bash
 python3 scripts/release.py prepare \
@@ -70,6 +70,7 @@ python3 scripts/release.py prepare \
   --core-commit <40-hex-core-commit> \
   --authority-root /path/to/deepseek-harness \
   --authority-commit <40-hex-harness-commit> \
+  --node /absolute/path/to/node-24.19.0 \
   --pnpm /absolute/path/to/pnpm \
   --output /path/to/immutable-kersor-release
 ```
@@ -103,7 +104,7 @@ python3 scripts/release.py verify-installed \
   --profile web
 ```
 
-Release lock 内的 bundle 依赖绑定其 tarball 绝对路径，因此 release 目录不得移动、覆盖或删除。验证器提供的是 commit 来源与本机漂移检测；它不能防止拥有同一账户写权限的人同时伪造文件和 receipt。
+Release lock 内的 bundle 依赖绑定其 tarball 绝对路径，因此 release 目录不得移动、覆盖或删除。验证器记录 exact authority tree、build receipt、输入／输出摘要、实际 Node binary 的 SHA／platform／arch、pnpm wrapper，以及 resolved `node_modules/pnpm` 的完整跨平台文件树；prepare 前后会复核这些本机工具身份，authority receipt 则绑定 pnpm package tree 与版本。单独篡改 ignored build、personal mirror、receipt 或 pnpm 执行包都不能通过 clean rebuild。Node binary 的本机 SHA 是 release lock 明示的外部信任根，不冒充跨平台 authority 证明；该门禁也不能防御已控制同一账户及全部这些输入的攻击者。
 
 为 Web profile 安装 run viewer 与 KerSor conversation view（建议先安装上面的 preset，让两者共享同一份 checkout 指针）：
 
