@@ -1712,6 +1712,184 @@ def _append_copy_import_setting(workspace: Path) -> None:
         )
 
 
+def _profile_pnpm_store_identity(profile: Path) -> dict[str, object] | None:
+    """Read one existing profile's physical pnpm store from install metadata."""
+    modules = profile / "node_modules"
+    try:
+        modules_metadata = modules.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ReleaseError(f"profile node_modules is unavailable: {error}") from error
+    if stat.S_ISLNK(modules_metadata.st_mode) \
+            or not stat.S_ISDIR(modules_metadata.st_mode):
+        raise ReleaseError("profile node_modules must be a physical directory")
+
+    metadata_path = modules / ".modules.yaml"
+    try:
+        metadata = metadata_path.lstat()
+    except OSError as error:
+        raise ReleaseError(f"profile pnpm install metadata is unavailable: {error}") from error
+    current_uid = os.getuid() if hasattr(os, "getuid") else metadata.st_uid
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) \
+            or metadata.st_nlink != 1 or metadata.st_uid != current_uid \
+            or stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise ReleaseError("profile pnpm install metadata is not an owned regular file")
+    if metadata.st_size > 1024 * 1024:
+        raise ReleaseError("profile pnpm install metadata is unreasonably large")
+    try:
+        content = metadata_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise ReleaseError(f"cannot read profile pnpm install metadata: {error}") from error
+    duplicate_keys: list[str] = []
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                duplicate_keys.append(key)
+            result[key] = value
+        return result
+
+    try:
+        parsed_metadata = json.loads(content, object_pairs_hook=unique_object)
+    except json.JSONDecodeError:
+        matches = re.findall(r"(?m)^storeDir:[ \t]+([^\r\n]+?)[ \t]*$", content)
+        if len(matches) != 1:
+            raise ReleaseError("profile pnpm install metadata has no unique storeDir")
+        raw_store = matches[0]
+    else:
+        if duplicate_keys or not isinstance(parsed_metadata, dict) \
+                or not isinstance(parsed_metadata.get("storeDir"), str):
+            raise ReleaseError("profile pnpm install metadata has no unique storeDir")
+        raw_store = parsed_metadata["storeDir"]
+    if raw_store != raw_store.strip() or raw_store[:1] in {"'", '"'} \
+            or "#" in raw_store \
+            or any(ord(character) < 32 or ord(character) == 127 for character in raw_store):
+        raise ReleaseError("profile pnpm storeDir is malformed")
+    try:
+        requested = Path(raw_store)
+    except (OSError, ValueError) as error:
+        raise ReleaseError(f"profile pnpm storeDir is malformed: {error}") from error
+    if not requested.is_absolute() or ".." in requested.parts:
+        raise ReleaseError("profile pnpm storeDir must be an absolute physical path")
+    try:
+        physical = requested.resolve(strict=True)
+        store_metadata = requested.lstat()
+    except (OSError, ValueError) as error:
+        raise ReleaseError(f"profile pnpm storeDir is unavailable: {error}") from error
+    if physical != requested or stat.S_ISLNK(store_metadata.st_mode) \
+            or not stat.S_ISDIR(store_metadata.st_mode):
+        raise ReleaseError("profile pnpm storeDir must not contain symbolic links")
+    if store_metadata.st_uid != current_uid:
+        raise ReleaseError("profile pnpm storeDir is owned by a different user")
+    if stat.S_IMODE(store_metadata.st_mode) & 0o022:
+        raise ReleaseError("profile pnpm storeDir must not be group/world writable")
+    runtime_home = profile.parent.parent / ".release-runtime-home"
+    try:
+        isolated = physical.is_relative_to(runtime_home.resolve(strict=True))
+    except OSError:
+        isolated = False
+    return {
+        "source": "isolated-default" if isolated else "existing-profile",
+        "metadata_path": str(metadata_path.resolve(strict=True)),
+        "path": raw_store,
+        "realpath": str(physical),
+        "uid": store_metadata.st_uid,
+        "device": store_metadata.st_dev,
+        "inode": store_metadata.st_ino,
+        "mode": stat.S_IMODE(store_metadata.st_mode),
+    }
+
+
+def _prepare_runtime_npm_config(runtime_home: Path) -> Path:
+    """Create one owned empty npmrc without following a pre-existing link."""
+    try:
+        home_metadata = runtime_home.lstat()
+    except OSError as error:
+        raise ReleaseError(f"release runtime HOME is unavailable: {error}") from error
+    current_uid = os.getuid() if hasattr(os, "getuid") else home_metadata.st_uid
+    if stat.S_ISLNK(home_metadata.st_mode) \
+            or not stat.S_ISDIR(home_metadata.st_mode) \
+            or home_metadata.st_uid != current_uid:
+        raise ReleaseError("release runtime HOME must be an owned physical directory")
+    runtime_home.chmod(0o700)
+
+    config = runtime_home / "empty.npmrc"
+    try:
+        existing = config.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise ReleaseError(f"release runtime npm config is unavailable: {error}") from error
+    else:
+        if stat.S_ISLNK(existing.st_mode) \
+                or not stat.S_ISREG(existing.st_mode) \
+                or existing.st_nlink != 1 \
+                or existing.st_uid != current_uid:
+            raise ReleaseError(
+                "release runtime npm config must be an owned unlinked regular file"
+            )
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".empty.npmrc.",
+        dir=runtime_home,
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, config)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+    metadata = config.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 \
+            or metadata.st_uid != current_uid \
+            or stat.S_IMODE(metadata.st_mode) != 0o600 \
+            or metadata.st_size != 0:
+        raise ReleaseError("release runtime npm config did not materialize safely")
+    return config
+
+
+def _prepare_runtime_temporary_directory(runtime_home: Path) -> Path:
+    """Materialize the private TMPDIR without following an existing link."""
+    temporary = runtime_home / "tmp"
+    try:
+        temporary.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise ReleaseError(
+            f"release runtime temporary directory is unavailable: {error}"
+        ) from error
+    try:
+        metadata = temporary.lstat()
+    except OSError as error:
+        raise ReleaseError(
+            f"release runtime temporary directory is unavailable: {error}"
+        ) from error
+    current_uid = os.getuid() if hasattr(os, "getuid") else metadata.st_uid
+    if stat.S_ISLNK(metadata.st_mode) \
+            or not stat.S_ISDIR(metadata.st_mode) \
+            or metadata.st_uid != current_uid \
+            or stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise ReleaseError(
+            "release runtime temporary directory must be owned, private, and physical"
+        )
+    temporary.chmod(0o700)
+    final_metadata = temporary.lstat()
+    if not stat.S_ISDIR(final_metadata.st_mode) \
+            or stat.S_IMODE(final_metadata.st_mode) != 0o700 \
+            or final_metadata.st_uid != current_uid:
+        raise ReleaseError(
+            "release runtime temporary directory did not materialize safely"
+        )
+    return temporary
+
+
 def _run_dsh_plugin(
     *,
     node: Path,
@@ -1721,13 +1899,15 @@ def _run_dsh_plugin(
     runtime_home: Path,
     profile_name: str,
     arguments: list[str],
+    store: dict[str, object] | None = None,
 ) -> None:
     runtime_home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = runtime_home / "tmp"
-    temporary.mkdir(exist_ok=True, mode=0o700)
+    empty_npm_config = _prepare_runtime_npm_config(runtime_home)
+    temporary = _prepare_runtime_temporary_directory(runtime_home)
     environment = {
         "DSH_HOME": str(dsh_home),
         "HOME": str(runtime_home),
+        "USERPROFILE": str(runtime_home),
         "TMPDIR": str(temporary),
         "PATH": os.pathsep.join(dict.fromkeys([
             str(pnpm.resolve().parent),
@@ -1736,9 +1916,20 @@ def _run_dsh_plugin(
             "/bin",
         ])),
         "LANG": "C",
+        "LC_ALL": "C",
+        "npm_config_userconfig": str(empty_npm_config),
+        "npm_config_globalconfig": str(empty_npm_config),
         "npm_config_ignore_scripts": "true",
         "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
     }
+    if store is not None:
+        raw_store = store.get("path")
+        if not isinstance(raw_store, str) or not Path(raw_store).is_absolute():
+            raise ReleaseError("validated profile pnpm store path is invalid")
+        # pnpm compares store paths lexically. Preserve the exact spelling from
+        # .modules.yaml while its separately recorded realpath/dev/inode prove
+        # that the path names the validated physical store.
+        environment["PNPM_CONFIG_STORE_DIR"] = raw_store
     completed = subprocess.run(
         [
             str(node),
@@ -1755,7 +1946,16 @@ def _run_dsh_plugin(
         cwd=dsh_home,
     )
     if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout).strip()
+        output = completed.stdout.strip()
+        errors = completed.stderr.strip()
+        detail = "\n".join(
+            part
+            for part in (
+                f"stdout:\n{output}" if output else "",
+                f"stderr:\n{errors}" if errors else "",
+            )
+            if part
+        ) or f"exit code {completed.returncode} with no output"
         raise ReleaseError(f"DSH plugin manager failed: {detail}")
 
 
@@ -1778,12 +1978,13 @@ def _current_profile_receipt(
         "release_id": lock["release_id"],
         "release_root": str(release_root.resolve()),
         "release_lock_sha256": sha256_file(release_root / "release-lock.json"),
-        "profile": str(profile.absolute()),
+        "profile": str(profile.resolve()),
         "profile_files": profile_files,
         "installed_package_tree_sha256": installed,
         "source_inode_overlap": 0,
         "no_symlinks": True,
         "all_regular_nlink_one": True,
+        "pnpm_store": _profile_pnpm_store_identity(profile),
     }
 
 
@@ -1879,10 +2080,11 @@ def install_web_release(
             or pnpm_package["tree"] != recorded_package.get("tree"):
         raise ReleaseError("install pnpm package differs from the release packer")
     dsh_bin_identity = _dsh_bin_identity(node, dsh_bin)
-    dsh_home = dsh_home.expanduser().absolute()
+    dsh_home = dsh_home.expanduser().resolve()
     dsh_home.mkdir(parents=True, exist_ok=True)
     runtime_home = dsh_home / ".release-runtime-home"
     profile = dsh_home / "profiles" / profile_name
+    store = _profile_pnpm_store_identity(profile)
     if not (profile / "package.json").is_file():
         _run_dsh_plugin(
             node=node,
@@ -1892,6 +2094,7 @@ def install_web_release(
             runtime_home=runtime_home,
             profile_name=profile_name,
             arguments=["root"],
+            store=store,
         )
     _append_copy_import_setting(profile / "pnpm-workspace.yaml")
     bundle = _package_entries(lock)[WEB_BUNDLE_NAME]
@@ -1904,7 +2107,15 @@ def install_web_release(
         runtime_home=runtime_home,
         profile_name=profile_name,
         arguments=["add", "--save-exact", "--ignore-scripts", str(tarball)],
+        store=store,
     )
+    installed_store = _profile_pnpm_store_identity(profile)
+    if installed_store is None:
+        raise ReleaseError("installed profile has no pnpm store identity")
+    if store is not None and installed_store != store:
+        raise ReleaseError("profile pnpm store identity changed during installation")
+    if store is None and installed_store.get("source") != "isolated-default":
+        raise ReleaseError("new profile did not use its isolated pnpm store")
     violations = verify_web_install(
         release_root,
         profile,

@@ -83,7 +83,7 @@ python3 scripts/install.py \
   --force
 ```
 
-Web package 继续通过 DSH 自己的 plugin manager 安装，但输入改为 release 内的 bundle tarball；安装器把 profile 的 pnpm import method 固定为 `copy`，并实测每个安装文件均非 symlink、`nlink=1`、不与源码共享 inode：
+Web package 继续通过 DSH 自己的 plugin manager 安装，但输入改为 release 内的 bundle tarball；安装器把 profile 的 pnpm import method 固定为 `copy`，并实测每个安装文件均非 symlink、`nlink=1`、不与源码共享 inode。已有 `node_modules` 的 profile 会从其 `.modules.yaml` 读取既有 pnpm store，只接受同一用户拥有、无任何 symlink 路径段且不可被 group／world 写入的绝对物理目录；经验证后，安装器仍通过隔离环境把 `.modules.yaml` 中的原始路径拼写传给 pnpm，并在安装后复核原始路径和 device／inode 均未变化。新 profile 只能在最小化的 release runtime HOME 下创建隔离 store；该 HOME 同时以空的 0600 npm 配置隔离调用者的 user／global npm 配置。最终 receipt 绑定 store 原始路径、真实路径、owner、device／inode 和 mode：
 
 ```bash
 python3 scripts/release.py install-web \

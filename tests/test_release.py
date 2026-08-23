@@ -311,6 +311,199 @@ class ReleaseParityTests(unittest.TestCase):
 
         self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o400)
 
+    def test_profile_store_rejects_untrusted_install_metadata(self) -> None:
+        duplicate_store = self.root.resolve()
+        cases = {
+            "relative": json.dumps({"storeDir": "relative/store"}),
+            "missing": json.dumps({"layoutVersion": 5}),
+            "duplicate-json": (
+                '{"storeDir": ' + json.dumps(str(duplicate_store))
+                + ', "storeDir": ' + json.dumps(str(duplicate_store)) + '}'
+            ),
+            "duplicate-yaml": "storeDir: /first\nstoreDir: /second\n",
+            "quoted-yaml": "storeDir: '/quoted'\n",
+            "traversal": json.dumps({
+                "storeDir": str(self.root.resolve() / "first" / ".." / "second"),
+            }),
+            "control-character": json.dumps({"storeDir": "/store/\u0000escape"}),
+        }
+        for name, content in cases.items():
+            with self.subTest(name=name):
+                profile = self.root / f"metadata-{name}"
+                modules = profile / "node_modules"
+                modules.mkdir(parents=True)
+                write(modules / ".modules.yaml", content)
+                with self.assertRaises(release.ReleaseError):
+                    release._profile_pnpm_store_identity(profile)
+
+        profile = self.root / "metadata-link"
+        modules = profile / "node_modules"
+        modules.mkdir(parents=True)
+        backing = self.root / "metadata-backing.json"
+        write(backing, json.dumps({"storeDir": str(self.root.resolve())}))
+        (modules / ".modules.yaml").symlink_to(backing)
+        with self.assertRaisesRegex(release.ReleaseError, "owned regular file"):
+            release._profile_pnpm_store_identity(profile)
+
+        insecure_metadata_profile = self.root / "insecure-metadata-mode"
+        insecure_metadata_modules = insecure_metadata_profile / "node_modules"
+        insecure_metadata_modules.mkdir(parents=True)
+        insecure_metadata_store = self.root / "secure-store"
+        insecure_metadata_store.mkdir()
+        insecure_metadata_path = insecure_metadata_modules / ".modules.yaml"
+        write(
+            insecure_metadata_path,
+            json.dumps({"storeDir": str(insecure_metadata_store.resolve())}),
+        )
+        insecure_metadata_path.chmod(0o666)
+        with self.assertRaisesRegex(release.ReleaseError, "owned regular file"):
+            release._profile_pnpm_store_identity(insecure_metadata_profile)
+
+        insecure_store_profile = self.root / "insecure-store-mode"
+        insecure_store_modules = insecure_store_profile / "node_modules"
+        insecure_store_modules.mkdir(parents=True)
+        insecure_store = self.root / "insecure-store"
+        insecure_store.mkdir(mode=0o777)
+        insecure_store.chmod(0o777)
+        write(
+            insecure_store_modules / ".modules.yaml",
+            json.dumps({"storeDir": str(insecure_store.resolve())}),
+        )
+        with self.assertRaisesRegex(release.ReleaseError, "writable"):
+            release._profile_pnpm_store_identity(insecure_store_profile)
+
+    def test_profile_store_rejects_linked_or_nonphysical_directories(self) -> None:
+        physical_parent = self.root.resolve() / "physical-store-parent"
+        physical_store = physical_parent / "store"
+        physical_store.mkdir(parents=True)
+        linked_parent = self.root.resolve() / "linked-store-parent"
+        linked_parent.symlink_to(physical_parent, target_is_directory=True)
+        linked_store = self.root.resolve() / "linked-store"
+        linked_store.symlink_to(physical_store, target_is_directory=True)
+        for name, store in (
+            ("parent-link", linked_parent / "store"),
+            ("leaf-link", linked_store),
+        ):
+            with self.subTest(name=name):
+                profile = self.root / f"store-{name}"
+                modules = profile / "node_modules"
+                modules.mkdir(parents=True)
+                write(
+                    modules / ".modules.yaml",
+                    json.dumps({"storeDir": str(store)}),
+                )
+                with self.assertRaisesRegex(release.ReleaseError, "symbolic links"):
+                    release._profile_pnpm_store_identity(profile)
+
+        profile = self.root / "linked-node-modules"
+        profile.mkdir()
+        (profile / "node_modules").symlink_to(
+            physical_parent,
+            target_is_directory=True,
+        )
+        with self.assertRaisesRegex(release.ReleaseError, "physical directory"):
+            release._profile_pnpm_store_identity(profile)
+
+    def test_dsh_plugin_failure_preserves_stdout_and_stderr(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="pnpm first cause\n",
+            stderr="dsh wrapper context\n",
+        )
+        runtime_home = self.root / "runtime-home"
+        raw_store = "/private/lexical/pnpm/store/v11"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PNPM_CONFIG_STORE_DIR": "/poisoned/caller/store",
+                "npm_config_userconfig": "/poisoned/caller/user.npmrc",
+                "npm_config_globalconfig": "/poisoned/caller/global.npmrc",
+            },
+        ):
+            with mock.patch.object(
+                release.subprocess,
+                "run",
+                return_value=completed,
+            ) as run_call:
+                with self.assertRaises(release.ReleaseError) as caught:
+                    release._run_dsh_plugin(
+                        node=Path(sys.executable),
+                        pnpm=Path(sys.executable),
+                        dsh_bin=self.root / "dsh-bin.js",
+                        dsh_home=self.root,
+                        runtime_home=runtime_home,
+                        profile_name="web",
+                        arguments=["add", "fixture.tgz"],
+                        store={
+                            "path": raw_store,
+                            "realpath": str(self.root.resolve()),
+                        },
+                    )
+        message = str(caught.exception)
+        self.assertIn("stdout:\npnpm first cause", message)
+        self.assertIn("stderr:\ndsh wrapper context", message)
+        invoked = run_call.call_args.args[0]
+        self.assertNotIn("--store-dir", invoked)
+        environment = run_call.call_args.kwargs["env"]
+        self.assertEqual(environment["PNPM_CONFIG_STORE_DIR"], raw_store)
+        npm_config = runtime_home / "empty.npmrc"
+        self.assertEqual(environment["npm_config_userconfig"], str(npm_config))
+        self.assertEqual(environment["npm_config_globalconfig"], str(npm_config))
+        self.assertEqual(npm_config.read_bytes(), b"")
+        self.assertEqual(stat.S_IMODE(npm_config.stat().st_mode), 0o600)
+
+    def test_dsh_plugin_rejects_linked_runtime_npm_config(self) -> None:
+        runtime_home = self.root / "runtime-home-link"
+        runtime_home.mkdir()
+        outside = self.root / "outside.npmrc"
+        write(outside, "store-dir=/poisoned\n")
+        (runtime_home / "empty.npmrc").symlink_to(outside)
+
+        with self.assertRaisesRegex(release.ReleaseError, "unlinked regular file"):
+            release._run_dsh_plugin(
+                node=Path(sys.executable),
+                pnpm=Path(sys.executable),
+                dsh_bin=self.root / "dsh-bin.js",
+                dsh_home=self.root,
+                runtime_home=runtime_home,
+                profile_name="web",
+                arguments=["root"],
+            )
+        self.assertEqual(outside.read_text(encoding="utf-8"), "store-dir=/poisoned\n")
+
+    def test_dsh_plugin_rejects_linked_runtime_temp_directory(self) -> None:
+        runtime_home = self.root / "runtime-home-tmp-link"
+        runtime_home.mkdir()
+        outside = self.root / "outside-tmp"
+        outside.mkdir(mode=0o755)
+        outside_mode = stat.S_IMODE(outside.stat().st_mode)
+        (runtime_home / "tmp").symlink_to(outside, target_is_directory=True)
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+        with mock.patch.object(
+            release.subprocess,
+            "run",
+            return_value=completed,
+        ) as run_call:
+            with self.assertRaisesRegex(release.ReleaseError, "temporary directory"):
+                release._run_dsh_plugin(
+                    node=Path(sys.executable),
+                    pnpm=Path(sys.executable),
+                    dsh_bin=self.root / "dsh-bin.js",
+                    dsh_home=self.root,
+                    runtime_home=runtime_home,
+                    profile_name="web",
+                    arguments=["root"],
+                )
+        run_call.assert_not_called()
+        self.assertEqual(stat.S_IMODE(outside.stat().st_mode), outside_mode)
+
     def test_expands_every_pinned_submodule_from_git_objects(self) -> None:
         child = self.root / "child"
         init_repository(child)
@@ -1356,6 +1549,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
         profile = dsh_home / "profiles" / "web"
         self.assertEqual(receipt["mode"], "release")
+        self.assertEqual(receipt["pnpm_store"]["source"], "isolated-default")
+        self.assertTrue(
+            Path(receipt["pnpm_store"]["realpath"]).is_relative_to(
+                (dsh_home.resolve() / ".release-runtime-home")
+            )
+        )
         persisted_receipt = json.loads(
             (profile / ".kersor-release-receipt.json").read_text(encoding="utf-8")
         )
@@ -1411,6 +1610,25 @@ class ReleaseWorkflowTests(unittest.TestCase):
             json.dumps(persisted_receipt),
             encoding="utf-8",
         )
+        tampered_receipt = json.loads(json.dumps(persisted_receipt))
+        tampered_receipt["pnpm_store"]["inode"] = 0
+        (profile / ".kersor-release-receipt.json").write_text(
+            json.dumps(tampered_receipt),
+            encoding="utf-8",
+        )
+        violations = release.verify_web_install(
+            self.release_root,
+            profile,
+            source_roots=[self.personal],
+        )
+        self.assertTrue(
+            any("receipt differs" in item for item in violations),
+            violations,
+        )
+        (profile / ".kersor-release-receipt.json").write_text(
+            json.dumps(persisted_receipt),
+            encoding="utf-8",
+        )
         self.assertIn(
             "packageImportMethod: copy",
             (profile / "pnpm-workspace.yaml").read_text(encoding="utf-8"),
@@ -1442,6 +1660,70 @@ class ReleaseWorkflowTests(unittest.TestCase):
             source_roots=[self.personal],
         )
         self.assertTrue(any("content" in item for item in violations), violations)
+
+    def test_existing_profile_reuses_its_validated_pnpm_store(self) -> None:
+        dsh_bin = ROOT.parent / "deepseek-harness" / "apps" / "cli" / "lib" / "bin.js"
+        if not dsh_bin.is_file():
+            self.skipTest("built sibling DSH CLI is required for the local integration gate")
+        self.prepare()
+        dsh_home = self.root / "existing-dsh-home"
+        dsh_home.mkdir()
+        legacy_runtime_home = self.root.resolve() / "legacy-runtime-home"
+        profile = dsh_home / "profiles" / "web"
+        release._run_dsh_plugin(
+            node=Path(self.node),
+            pnpm=Path(self.pnpm),
+            dsh_bin=dsh_bin,
+            dsh_home=dsh_home,
+            runtime_home=legacy_runtime_home,
+            profile_name="web",
+            arguments=["root"],
+        )
+        release._append_copy_import_setting(profile / "pnpm-workspace.yaml")
+        bundle = release._package_entries(
+            release.load_release(self.release_root)
+        )[release.WEB_BUNDLE_NAME]
+        release._run_dsh_plugin(
+            node=Path(self.node),
+            pnpm=Path(self.pnpm),
+            dsh_bin=dsh_bin,
+            dsh_home=dsh_home,
+            runtime_home=legacy_runtime_home,
+            profile_name="web",
+            arguments=[
+                "add",
+                "--save-exact",
+                "--ignore-scripts",
+                str(self.release_root / bundle["tarball"]),
+            ],
+        )
+        original_store = release._profile_pnpm_store_identity(profile)
+        self.assertIsNotNone(original_store)
+
+        receipt = release.install_web_release(
+            release_root=self.release_root,
+            dsh_home=dsh_home,
+            profile_name="web",
+            node=Path(self.node),
+            pnpm=Path(self.pnpm),
+            dsh_bin=dsh_bin,
+            source_roots=[self.personal],
+        )
+
+        store = receipt["pnpm_store"]
+        self.assertEqual(store, original_store)
+        self.assertEqual(store["source"], "existing-profile")
+        self.assertTrue(
+            Path(store["realpath"]).is_relative_to(legacy_runtime_home.resolve())
+        )
+        self.assertEqual(
+            release.verify_web_install(
+                self.release_root,
+                profile,
+                source_roots=[self.personal],
+            ),
+            [],
+        )
 
 
 if __name__ == "__main__":
