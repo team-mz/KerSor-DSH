@@ -359,6 +359,32 @@ function providerFailureFrom(reason) {
   return {message, code, ...(status === undefined ? {} : {status})}
 }
 
+function finalCanonicalAssistantOutput(events, beforeSeq) {
+  let output = null
+  for (const event of events) {
+    if (event?.seq >= beforeSeq) break
+    if (event?.type !== 'assistant/message') continue
+    const message = event.data?.message
+    const source = message?.source
+    if (
+      !isRecord(message)
+      || typeof message.id !== 'string'
+      || message.id.length === 0
+      || message.role !== 'assistant'
+      || !isRecord(source)
+      || source.kind !== 'model'
+      || source.provider !== DSH_PROVIDER
+      || source.model !== DSH_MODEL
+      || !Array.isArray(message.content)
+      || message.content.some(block => !isRecord(block) || typeof block.type !== 'string')
+    ) {
+      return null
+    }
+    if (message.content.length > 0) output = message.content
+  }
+  return output
+}
+
 function childLifecycle(events) {
   const turnStarts = []
   const stepStarts = []
@@ -581,17 +607,73 @@ function childEvidence(agent, result) {
       && stepEnd.seq < turnEnd.seq
   }
 
+  let knownTerminalStepQuota = false
+  if (
+    lifecycle.valid
+    && terminalMatches
+    && result.stopReason === 'error'
+    && providerFailure?.code === 'QUOTA'
+    && providerFailure.status === 429
+    && Array.isArray(result.output)
+    && result.structured === undefined
+    && usage.total_tokens > 0
+    && lifecycle.turnStarts[0].data?.trigger?.kind !== 'retry'
+    && lifecycle.retryEvents.length === 0
+    && lifecycle.stepStarts.length > 1
+    && lifecycle.stepStarts.length === lifecycle.stepEnds.length
+    && lifecycle.turnEnds.length === 1
+  ) {
+    const stepStart = lifecycle.stepStarts.at(-1)
+    const stepEnd = lifecycle.stepEnds.at(-1)
+    const turnEnd = lifecycle.turnEnds[0]
+    const startStep = childStep(stepStart.data, 'terminal quota step/start')
+    const endStep = childStep(stepEnd.data, 'terminal quota step/end')
+    const priorAssistantOutput = finalCanonicalAssistantOutput(events, stepStart.seq)
+    const priorSteps = lifecycle.startedSteps.slice(0, -1)
+    const terminalStepEvents = events.slice(stepStart.seq, stepEnd.seq + 1)
+      .filter(event => DSH_STEP_SCOPED_EVENT_TYPES.has(event?.type))
+    const finish = terminalStepEvents[0]
+    knownTerminalStepQuota = priorSteps.length > 0
+      && priorSteps.every(key => usageByStep.has(key))
+      && !usageByStep.has(startStep.key)
+      && priorAssistantOutput !== null
+      && sameJson(result.output, priorAssistantOutput)
+      && terminalStepEvents.length === 1
+      && events.slice(stepStart.seq, turnEnd.seq + 1)
+        .every(event => DSH_PRE_USAGE_QUOTA_EVENT_TYPES.has(event?.type))
+      && startStep.turn === endStep.turn
+      && startStep.step === endStep.step
+      && turnEnd.data.turn === startStep.turn
+      && lifecycle.terminal === turnEnd
+      && turnEnd.seq === events.length - 1
+      && finish.type === 'assistant/chunk'
+      && finish.data?.turn === startStep.turn
+      && finish.data?.step === startStep.step
+      && finish.data.chunk?.type === 'finish'
+      && finish.data.chunk.reason?.kind === 'error'
+      && sameJson(finish.data.chunk.reason.failure, terminalReason.error)
+      && stepStart.seq < finish.seq
+      && finish.seq < stepEnd.seq
+      && stepEnd.seq < turnEnd.seq
+  }
+
   const everyStartedStepMetered = lifecycle.startedSteps.length > 0
     && lifecycle.startedSteps.every(key => usageByStep.has(key))
+  const knownQuota = knownPreUsageQuota || knownTerminalStepQuota
+  const unprovenExactQuota = result.stopReason === 'error'
+    && providerFailure?.code === 'QUOTA'
+    && providerFailure.status === 429
+    && !knownQuota
   return {
     usage,
     usageObserved: usageByStep.size > 0,
     usageComplete: lifecycle.valid
       && terminalMatches
-      && (everyStartedStepMetered || knownPreUsageQuota),
+      && (knownQuota || (everyStartedStepMetered && !unprovenExactQuota)),
     terminalMatches,
     providerFailure,
-    knownPreUsageQuota,
+    knownQuota,
+    knownTerminalStepQuota,
   }
 }
 
@@ -968,8 +1050,11 @@ async function executeDshActivation(ctx, parent, workspace, lexicalWorkspace, mi
     if (!threadId) throw new Error('DSH spawn did not publish a child thread id')
     const evidence = childEvidence(run.localAgent, result)
     const receipt = {
-      output: jsonClone(result.output ?? [], 'DSH child output'),
-      structured: result.structured === undefined
+      output: jsonClone(
+        evidence.knownTerminalStepQuota ? [] : (result.output ?? []),
+        'DSH child output',
+      ),
+      structured: evidence.knownTerminalStepQuota || result.structured === undefined
         ? null
         : jsonClone(result.structured, 'DSH child structured output'),
       stop_reason: result.stopReason,
@@ -993,7 +1078,7 @@ async function executeDshActivation(ctx, parent, workspace, lexicalWorkspace, mi
     if (result.stopReason !== 'completed') {
       const providerFailure = evidence.providerFailure
       throw dshActivationError(
-        evidence.knownPreUsageQuota ? 'DSH_CHILD_QUOTA' : 'DSH_CHILD_TERMINAL_ERROR',
+        evidence.knownQuota ? 'DSH_CHILD_QUOTA' : 'DSH_CHILD_TERMINAL_ERROR',
         providerFailure?.message ?? `DSH child stopped with ${result.stopReason}`,
         receipt,
         providerFailure,

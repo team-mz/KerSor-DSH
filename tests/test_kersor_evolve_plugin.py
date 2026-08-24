@@ -283,6 +283,266 @@ const multiStepFailureEvents = withSeq([
   {type: 'step/end', data: {turn: 1, step: 2}},
   {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: serverFailure}}},
 ])
+const terminalStepPriorAssistantOutput = [
+  {type: 'reasoning', text: 'Inspect the final artifact before reporting completion.'},
+  {type: 'text', text: 'I will read the final artifact once more.'},
+  {type: 'tool-call', id: 'read-2', name: 'read', arguments: '{"file_path":"dag_engine.py"}'},
+]
+const terminalStepQuotaAfterMeteredProgressEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 1,
+      chunk: {
+        type: 'usage',
+        usage: {inputTokens: 10, cacheReadTokens: 2, outputTokens: 1},
+      },
+    },
+  },
+  {
+    type: 'assistant/message',
+    data: {
+      turn: 1,
+      step: 1,
+      message: {
+        id: 'assistant-step-1',
+        role: 'assistant',
+        content: [{
+          type: 'tool-call',
+          id: 'read-1',
+          name: 'read',
+          arguments: '{"file_path":"README.md"}',
+        }],
+        source: {
+          kind: 'model',
+          provider: 'deepseek-official',
+          model: 'deepseek-v4-flash',
+        },
+      },
+    },
+  },
+  {type: 'tool/call', data: {turn: 1, step: 1, callId: 'read-1', name: 'read'}},
+  {type: 'tool/result', data: {turn: 1, step: 1, callId: 'read-1'}},
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'step/start', data: {turn: 1, step: 2}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 2,
+      chunk: {
+        type: 'usage',
+        usage: {inputTokens: 20, cacheWriteTokens: 3, outputTokens: 2},
+      },
+    },
+  },
+  {type: 'tool/call', data: {turn: 1, step: 2, callId: 'write-1', name: 'write'}},
+  {type: 'tool/result', data: {turn: 1, step: 2, callId: 'write-1'}},
+  {type: 'step/end', data: {turn: 1, step: 2}},
+  {type: 'step/start', data: {turn: 1, step: 3}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 3,
+      chunk: {
+        type: 'usage',
+        usage: {
+          inputTokens: 30,
+          cacheReadTokens: 4,
+          cacheWriteTokens: 1,
+          outputTokens: 3,
+        },
+      },
+    },
+  },
+  {
+    type: 'assistant/message',
+    data: {
+      turn: 1,
+      step: 3,
+      message: {
+        id: 'assistant-step-3',
+        role: 'assistant',
+        content: terminalStepPriorAssistantOutput,
+        source: {
+          kind: 'model',
+          provider: 'deepseek-official',
+          model: 'deepseek-v4-flash',
+        },
+      },
+    },
+  },
+  {type: 'tool/call', data: {turn: 1, step: 3, callId: 'read-2', name: 'read'}},
+  {type: 'tool/result', data: {turn: 1, step: 3, callId: 'read-2'}},
+  {type: 'step/end', data: {turn: 1, step: 3}},
+  {type: 'step/start', data: {turn: 1, step: 4}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 4,
+      chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}},
+    },
+  },
+  {type: 'step/end', data: {turn: 1, step: 4}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const terminalStepQuotaFailureVariant = failure => withSeq(
+  terminalStepQuotaAfterMeteredProgressEvents.map(event => {
+    if (event.type === 'assistant/chunk' && event.data?.chunk?.type === 'finish') {
+      return {
+        ...event,
+        data: {
+          ...event.data,
+          chunk: {
+            ...event.data.chunk,
+            reason: {kind: 'error', failure},
+          },
+        },
+      }
+    }
+    if (event.type === 'turn/end') {
+      return {...event, data: {...event.data, reason: {kind: 'error', error: failure}}}
+    }
+    return event
+  }),
+)
+const terminalStepQuotaFailureVariants = new Map([
+  [
+    'terminal-step-quota-code-lowercase',
+    terminalStepQuotaFailureVariant({...quotaFailure, code: 'quota'}),
+  ],
+  [
+    'terminal-step-quota-status-drift',
+    terminalStepQuotaFailureVariant({...quotaFailure, status: 430}),
+  ],
+])
+const terminalQuotaStepStartIndex = terminalStepQuotaAfterMeteredProgressEvents.findIndex(
+  event => event.type === 'step/start' && event.data?.step === 4,
+)
+const terminalStepQuotaLifecycleVariants = new Map([
+  [
+    'terminal-step-quota-missing-step-end',
+    withSeq(terminalStepQuotaAfterMeteredProgressEvents.filter(
+      event => !(event.type === 'step/end' && event.data?.step === 4),
+    )),
+  ],
+  [
+    'terminal-step-quota-duplicate-step-start',
+    withSeq([
+      ...terminalStepQuotaAfterMeteredProgressEvents.slice(0, terminalQuotaStepStartIndex + 1),
+      terminalStepQuotaAfterMeteredProgressEvents[terminalQuotaStepStartIndex],
+      ...terminalStepQuotaAfterMeteredProgressEvents.slice(terminalQuotaStepStartIndex + 1),
+    ]),
+  ],
+  [
+    'terminal-step-quota-drifted-step-end',
+    withSeq(terminalStepQuotaAfterMeteredProgressEvents.map(event => (
+      event.type === 'step/end' && event.data?.step === 4
+        ? {...event, data: {...event.data, step: 5}}
+        : event
+    ))),
+  ],
+])
+const terminalQuotaFinishIndex = terminalStepQuotaAfterMeteredProgressEvents.findIndex(
+  event => event.type === 'assistant/chunk'
+    && event.data?.step === 4
+    && event.data?.chunk?.type === 'finish',
+)
+const withTerminalStepEvents = additions => withSeq([
+  ...terminalStepQuotaAfterMeteredProgressEvents.slice(0, terminalQuotaFinishIndex),
+  ...additions,
+  ...terminalStepQuotaAfterMeteredProgressEvents.slice(terminalQuotaFinishIndex),
+])
+const terminalStepQuotaOutputEvents = withTerminalStepEvents([{
+  type: 'assistant/chunk',
+  data: {turn: 1, step: 4, chunk: {type: 'text-delta', text: 'partial output'}},
+}])
+const terminalStepQuotaToolEvents = withTerminalStepEvents([
+  {type: 'tool/call', data: {turn: 1, step: 4, callId: 'read-after-quota', name: 'read'}},
+  {type: 'tool/result', data: {turn: 1, step: 4, callId: 'read-after-quota'}},
+])
+const terminalStepQuotaRetryEvents = withTerminalStepEvents([{
+  type: 'llm/retry-started',
+  data: {turn: 1, step: 4, retryId: 'retry-terminal', retry: 1},
+}])
+const terminalStepQuotaTurnRetryEvents = withSeq(
+  terminalStepQuotaAfterMeteredProgressEvents.map(event => (
+    event.type === 'turn/start'
+      ? {...event, data: {...event.data, trigger: {kind: 'retry'}}}
+      : event
+  )),
+)
+const priorStepToolIndex = terminalStepQuotaAfterMeteredProgressEvents.findIndex(
+  event => event.type === 'tool/call' && event.data?.step === 2,
+)
+const terminalStepQuotaPriorRetryEvents = withSeq([
+  ...terminalStepQuotaAfterMeteredProgressEvents.slice(0, priorStepToolIndex),
+  {
+    type: 'llm/retry-started',
+    data: {turn: 1, step: 2, retryId: 'retry-prior', retry: 1},
+  },
+  ...terminalStepQuotaAfterMeteredProgressEvents.slice(priorStepToolIndex),
+])
+const terminalStepQuotaMismatchedFailureEvents = withSeq(
+  terminalStepQuotaAfterMeteredProgressEvents.map(event => (
+    event.type === 'assistant/chunk' && event.data?.chunk?.type === 'finish'
+      ? {
+          ...event,
+          data: {
+            ...event.data,
+            chunk: {
+              ...event.data.chunk,
+              reason: {
+                kind: 'error',
+                failure: {...quotaFailure, requestId: 'finish-only'},
+              },
+            },
+          },
+        }
+      : event
+  )),
+)
+const terminalStepQuotaUsageEvents = withTerminalStepEvents([{
+  type: 'assistant/chunk',
+  data: {
+    turn: 1,
+    step: 4,
+    chunk: {type: 'usage', usage: {inputTokens: 7, outputTokens: 1}},
+  },
+}])
+const terminalStepQuotaPriorUsageMissingEvents = withSeq(
+  terminalStepQuotaAfterMeteredProgressEvents.filter(event => !(
+    event.type === 'assistant/chunk'
+    && event.data?.step === 2
+    && event.data?.chunk?.type === 'usage'
+  )),
+)
+const terminalStepQuotaZeroMeteredEvents = withSeq(
+  terminalStepQuotaAfterMeteredProgressEvents.map(event => (
+    event.type === 'assistant/chunk' && event.data?.chunk?.type === 'usage'
+      ? {
+          ...event,
+          data: {
+            ...event.data,
+            chunk: {
+              ...event.data.chunk,
+              usage: {inputTokens: 0, outputTokens: 0},
+            },
+          },
+        }
+      : event
+  )),
+)
+const terminalStepQuotaWithoutPriorAssistantEvents = withSeq(
+  terminalStepQuotaAfterMeteredProgressEvents.filter(
+    event => event.type !== 'assistant/message',
+  ),
+)
 const quotaDuplicateTurnStartEvents = withSeq([
   {type: 'turn/start', data: {turn: 1}},
   {type: 'turn/start', data: {turn: 1, trigger: {kind: 'retry'}}},
@@ -536,6 +796,20 @@ const eventsByMode = new Map([
   ['usage-chunk-failure', usageChunkFailureEvents],
   ['unknown-failure', unknownFailureEvents],
   ['multi-step-failure', multiStepFailureEvents],
+  ['terminal-step-quota-after-metered-progress', terminalStepQuotaAfterMeteredProgressEvents],
+  ...terminalStepQuotaFailureVariants,
+  ...terminalStepQuotaLifecycleVariants,
+  ['terminal-step-quota-after-output', terminalStepQuotaOutputEvents],
+  ['terminal-step-quota-with-mismatched-result-output', terminalStepQuotaAfterMeteredProgressEvents],
+  ['terminal-step-quota-after-tool', terminalStepQuotaToolEvents],
+  ['terminal-step-quota-after-retry', terminalStepQuotaRetryEvents],
+  ['terminal-step-quota-retry-turn', terminalStepQuotaTurnRetryEvents],
+  ['terminal-step-quota-prior-retry', terminalStepQuotaPriorRetryEvents],
+  ['terminal-step-quota-mismatched-failure', terminalStepQuotaMismatchedFailureEvents],
+  ['terminal-step-quota-after-usage', terminalStepQuotaUsageEvents],
+  ['terminal-step-quota-prior-usage-missing', terminalStepQuotaPriorUsageMissingEvents],
+  ['terminal-step-quota-zero-metered-progress', terminalStepQuotaZeroMeteredEvents],
+  ['terminal-step-quota-without-prior-assistant', terminalStepQuotaWithoutPriorAssistantEvents],
   ['usage-missing-step-end', usageMissingStepEndEvents],
   ['duplicate-step-usage', duplicateStepUsageEvents],
   ['blocked', blockedEvents],
@@ -651,6 +925,22 @@ const ctx = {
           if (value.signal.aborted) settle()
           else value.signal.addEventListener('abort', settle, {once: true})
         })
+      } else if (request.child_mode === 'terminal-step-quota-without-prior-assistant') {
+        result = Promise.resolve({output: [], stopReason: 'error'})
+      } else if (request.child_mode === 'terminal-step-quota-with-mismatched-result-output') {
+        result = Promise.resolve({
+          output: [{type: 'text', text: 'partial output'}],
+          stopReason: 'error',
+        })
+      } else if (
+        typeof request.child_mode === 'string'
+        && request.child_mode.startsWith('terminal-step-quota-')
+        && eventsByMode.has(request.child_mode)
+      ) {
+        result = Promise.resolve({
+          output: terminalStepPriorAssistantOutput,
+          stopReason: 'error',
+        })
       } else if ([
         'quota',
         'quota-code-leading-space',
@@ -672,6 +962,21 @@ const ctx = {
         'usage-chunk-failure',
         'unknown-failure',
         'multi-step-failure',
+        'terminal-step-quota-after-metered-progress',
+        'terminal-step-quota-code-lowercase',
+        'terminal-step-quota-status-drift',
+        'terminal-step-quota-missing-step-end',
+        'terminal-step-quota-duplicate-step-start',
+        'terminal-step-quota-drifted-step-end',
+        'terminal-step-quota-after-output',
+        'terminal-step-quota-after-tool',
+        'terminal-step-quota-after-retry',
+        'terminal-step-quota-retry-turn',
+        'terminal-step-quota-prior-retry',
+        'terminal-step-quota-mismatched-failure',
+        'terminal-step-quota-after-usage',
+        'terminal-step-quota-prior-usage-missing',
+        'terminal-step-quota-zero-metered-progress',
         'usage-missing-step-end',
         'duplicate-step-usage',
         'interrupted',
@@ -1049,7 +1354,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self,
         mode: str,
         provider_code: str = "QUOTA",
-    ) -> None:
+    ) -> dict[str, object]:
         contract = self.write_dsh_failure_contract(mode)
         result = self.invoke_dsh_native(contract, child_mode=mode)
 
@@ -1066,6 +1371,32 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         })
         self.assertFalse(response["result"]["usage_observed"])
         self.assertFalse(response["result"]["usage_complete"])
+
+    def assert_terminal_step_quota_is_incomplete(
+        self,
+        mode: str,
+        *,
+        provider_code: str = "QUOTA",
+        provider_status: int = 429,
+        expected_usage: dict[str, int] | None = None,
+    ) -> None:
+        contract = self.write_dsh_failure_contract(mode)
+        result = self.invoke_dsh_native(contract, child_mode=mode)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_CHILD_TERMINAL_ERROR")
+        self.assertEqual(response["error"]["provider_code"], provider_code)
+        self.assertEqual(response["error"]["provider_status"], provider_status)
+        self.assertEqual(response["result"]["usage"], expected_usage or {
+            "input_tokens": 60,
+            "cached_input_tokens": 10,
+            "output_tokens": 6,
+            "total_tokens": 76,
+        })
+        self.assertTrue(response["result"]["usage_observed"])
+        self.assertFalse(response["result"]["usage_complete"])
+        return response
 
     def test_public_tool_routes_read_only_dsh_mission_to_pinned_spawn_child(self) -> None:
         self.prepare_dsh_native_core()
@@ -1289,6 +1620,136 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         })
         self.assertTrue(response["result"]["usage_observed"])
         self.assertTrue(response["result"]["usage_complete"])
+
+    def test_public_host_reports_strict_terminal_step_quota_after_metered_progress(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("terminal-step-quota-after-metered-progress")
+
+        result = self.invoke_dsh_native(
+            contract,
+            child_mode="terminal-step-quota-after-metered-progress",
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"], {
+            "code": "DSH_CHILD_QUOTA",
+            "message": "[Service quota exceeded.]",
+            "provider_code": "QUOTA",
+            "provider_status": 429,
+        })
+        self.assertEqual(response["result"]["usage"], {
+            "input_tokens": 60,
+            "cached_input_tokens": 10,
+            "output_tokens": 6,
+            "total_tokens": 76,
+        })
+        self.assertEqual(response["result"]["output"], [])
+        self.assertIsNone(response["result"]["structured"])
+        self.assertTrue(response["result"]["usage_observed"])
+        self.assertTrue(response["result"]["usage_complete"])
+
+    def test_public_host_requires_exact_terminal_step_quota_code_and_status(self) -> None:
+        self.prepare_dsh_native_core()
+        for mode, provider_code, provider_status in (
+            ("terminal-step-quota-code-lowercase", "quota", 429),
+            ("terminal-step-quota-status-drift", "QUOTA", 430),
+        ):
+            with self.subTest(mode=mode):
+                self.assert_terminal_step_quota_is_incomplete(
+                    mode,
+                    provider_code=provider_code,
+                    provider_status=provider_status,
+                )
+
+    def test_public_host_requires_closed_unique_terminal_step_quota_lifecycle(self) -> None:
+        self.prepare_dsh_native_core()
+        for mode in (
+            "terminal-step-quota-missing-step-end",
+            "terminal-step-quota-duplicate-step-start",
+            "terminal-step-quota-drifted-step-end",
+        ):
+            with self.subTest(mode=mode):
+                self.assert_terminal_step_quota_is_incomplete(mode)
+
+    def test_public_host_rejects_terminal_step_quota_after_output(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_terminal_step_quota_is_incomplete("terminal-step-quota-after-output")
+
+    def test_public_host_rejects_terminal_step_quota_with_mismatched_result_output(self) -> None:
+        self.prepare_dsh_native_core()
+        response = self.assert_terminal_step_quota_is_incomplete(
+            "terminal-step-quota-with-mismatched-result-output",
+        )
+        self.assertEqual(response["result"]["output"], [{
+            "type": "text",
+            "text": "partial output",
+        }])
+
+    def test_public_host_rejects_terminal_step_quota_after_tool_activity(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_terminal_step_quota_is_incomplete("terminal-step-quota-after-tool")
+
+    def test_public_host_rejects_terminal_step_quota_after_retry(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_terminal_step_quota_is_incomplete("terminal-step-quota-after-retry")
+
+    def test_public_host_rejects_terminal_step_quota_from_retry_turn(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_terminal_step_quota_is_incomplete("terminal-step-quota-retry-turn")
+
+    def test_public_host_rejects_terminal_step_quota_after_prior_step_retry(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_terminal_step_quota_is_incomplete("terminal-step-quota-prior-retry")
+
+    def test_public_host_requires_matching_terminal_step_quota_failures(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_terminal_step_quota_is_incomplete(
+            "terminal-step-quota-mismatched-failure",
+        )
+
+    def test_public_host_rejects_terminal_step_quota_after_usage(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_terminal_step_quota_is_incomplete(
+            "terminal-step-quota-after-usage",
+            expected_usage={
+                "input_tokens": 67,
+                "cached_input_tokens": 10,
+                "output_tokens": 7,
+                "total_tokens": 84,
+            },
+        )
+
+    def test_public_host_requires_every_prior_step_to_be_metered(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_terminal_step_quota_is_incomplete(
+            "terminal-step-quota-prior-usage-missing",
+            expected_usage={
+                "input_tokens": 40,
+                "cached_input_tokens": 7,
+                "output_tokens": 4,
+                "total_tokens": 51,
+            },
+        )
+
+    def test_public_host_requires_positive_prior_usage_for_terminal_step_quota(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_terminal_step_quota_is_incomplete(
+            "terminal-step-quota-zero-metered-progress",
+            expected_usage={
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+        )
+
+    def test_public_host_requires_prior_canonical_assistant_output_for_terminal_quota(self) -> None:
+        self.prepare_dsh_native_core()
+        response = self.assert_terminal_step_quota_is_incomplete(
+            "terminal-step-quota-without-prior-assistant",
+        )
+        self.assertEqual(response["result"]["output"], [])
 
     def test_public_host_does_not_claim_known_zero_quota_after_content(self) -> None:
         self.prepare_dsh_native_core()

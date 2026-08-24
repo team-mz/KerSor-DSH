@@ -168,24 +168,37 @@ and a fresh DSH `spawn` child pinned to `deepseek-official/deepseek-v4-flash`.
 The Host folds durable usage chunks and assistant messages by `(turn, step)`,
 with the later sample replacing an earlier sample for that step, and processes
 the durable terminal before requiring structured output. Completeness requires
-the full child log to have contiguous `seq` values starting at zero. Only an
-empty-output failure with exactly one fresh `turn=1, step=1`, ordered
-`turn/start -> step/start -> finish -> step/end -> turn/end` lifecycle, no
-retry, `tool/*`, or other assistant content/message/usage, and canonically identical
-`finish` plus `turn/end` failures whose raw machine code is exactly `QUOTA`
-(without whitespace trimming or case folding) and status is HTTP 429 may produce the known
-pre-usage receipt (`usage_observed=false`, `usage_complete=true`, all token
-counts zero). Inbox, user-message, title, and request-metadata events between
-those boundaries are permitted, but `turn/end` must be the final event. Any
-duplicate, gap, malformed sequence, missing/reordered boundary, post-terminal
-event, mismatched failure, or other unprovable usage record remains incomplete
-and fails closed. General usage is complete only when that fresh lifecycle is
-valid, steps start at 1 and close consecutively, and every step has an
-authoritative token-meter sample. Durable `blocked`, `aborted`, and
-`interrupted` terminals map to `refusal`, `aborted`, and `error`; route drift,
-disconnect, cancellation, and unsafe transactions also fail closed and dispose
-the child. Use an external runtime for multi-file or otherwise unsupported
-mutation contracts.
+the full child log to have contiguous `seq` values starting at zero, one fresh
+`turn=1`, consecutive closed steps starting at 1, and a final `turn/end` event.
+A typed `DSH_CHILD_QUOTA` has exactly two proof shapes. A first and only
+unmetered step may produce the known pre-usage receipt
+(`usage_observed=false`, `usage_complete=true`, all token counts zero). Or, after
+one or more completely metered prior steps with positive aggregate usage, one
+final unmetered step may preserve that cumulative usage and produce
+`usage_observed=true`, `usage_complete=true`. The known pre-usage shape requires
+empty in-process result output. The metered-progress shape instead requires that
+output to equal the canonical content of the last non-empty `assistant/message`
+before the terminal step. Neither shape permits a structured result. Only after
+that proof does the Host normalize the typed Core receipt to `output=[]` and
+`structured=null`. Both shapes also require canonically identical `finish` and
+`turn/end` failures whose raw machine code is exactly `QUOTA` (without whitespace
+trimming or case folding) and whose status is exactly HTTP 429. Neither proof shape
+admits retry activity anywhere in the lifecycle. The final quota step must close
+in `step/start -> finish -> step/end -> turn/end` order and contain no other
+assistant output/message/usage or `tool/*`. Inbox,
+user-message, title, and request-metadata events between lifecycle boundaries
+are permitted. Approximate code/status, duplicate or drifted coordinates,
+missing/reordered boundaries, post-terminal events, mismatched failures, any
+retry, final-step output/tool/usage, an absent prior canonical assistant message,
+result output that differs from its content, or any unmetered prior step remains
+a generic `DSH_CHILD_TERMINAL_ERROR` with incomplete usage and preserves the
+original result output. In particular, observing usage
+in the failing quota step does not prove a pre-generation terminal quota.
+General non-quota usage is complete only when every step has an authoritative
+token-meter sample. Durable `blocked`, `aborted`, and `interrupted` terminals
+map to `refusal`, `aborted`, and `error`; route drift, disconnect, cancellation,
+and unsafe transactions also fail closed and dispose the child. Use an external
+runtime for multi-file or otherwise unsupported mutation contracts.
 
 For `runtime=claude`, the bridge removes ambient `CLAUDE*`, `ANTHROPIC*`, and
 KerSor routing controls and publishes only the Claude-compatible executable and
