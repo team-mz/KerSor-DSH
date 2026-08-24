@@ -7,6 +7,7 @@ import css from './KersorView.module.css';
 const RUN_STATUS_KEYS = {
     running: 'run.active',
     completed: 'run.completed',
+    waiting: 'run.waiting',
     failed: 'run.failed',
     unknown: 'run.unknown',
 };
@@ -20,6 +21,7 @@ function runDotState(status) {
     switch (status) {
         case 'running': return 'ongoing';
         case 'completed': return 'done';
+        case 'waiting': return 'warning';
         case 'failed': return 'error';
         /* v8 ignore next -- KersorRunStatus is closed and every variant is handled above. */
         default: return 'warning';
@@ -616,7 +618,11 @@ export function KersorView({ t, store, currentWorkspace, refresh, loadRun, loadC
                                                             void loadRun(next);
                                                             void loadClassic(row.sessionDir);
                                                         }
-                                                    }, children: [_jsx(StateDot, { state: row.discovery === 'active' ? 'ongoing' : row.discovery === 'failed' ? 'error' : 'done' }), _jsx("span", { className: css.rowLabel, children: runDisplayLabel(row, session) }), _jsx("span", { className: css.runId, children: row.runId }), crossWorkspace ? _jsx("span", { className: css.workspaceBadge, children: t('session.otherWorkspace') }) : null] }), store.selectedRunDir === row.runDir && row.view !== undefined
+                                                    }, children: [_jsx(StateDot, { state: row.discovery === 'active'
+                                                                ? 'ongoing'
+                                                                : row.discovery === 'failed'
+                                                                    ? 'error'
+                                                                    : row.discovery === 'waiting' ? 'warning' : 'done' }), _jsx("span", { className: css.rowLabel, children: runDisplayLabel(row, session) }), _jsx("span", { className: css.runId, children: row.runId }), crossWorkspace ? _jsx("span", { className: css.workspaceBadge, children: t('session.otherWorkspace') }) : null] }), store.selectedRunDir === row.runDir && row.view !== undefined
                                                     ? (_jsx(RunDetail, { row: row, view: row.view, session: session, sessionDetail: state.classicDetails.get(row.sessionDir), crossWorkspace: crossWorkspace, state: state, loadCallDetail: loadCallDetail, t: t }))
                                                     : null] }, row.runDir));
                                     }) })] }))

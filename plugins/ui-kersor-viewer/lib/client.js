@@ -158,6 +158,7 @@ window.__ModuleLoader__.load({
 		const RUN_STATUS_KEYS = {
 			running: "run.active",
 			completed: "run.completed",
+			waiting: "run.waiting",
 			failed: "run.failed",
 			unknown: "run.unknown"
 		};
@@ -171,6 +172,7 @@ window.__ModuleLoader__.load({
 			switch (status) {
 				case "running": return "ongoing";
 				case "completed": return "done";
+				case "waiting": return "warning";
 				case "failed": return "error";
 				/* v8 ignore next -- KersorRunStatus is closed and every variant is handled above. */
 				default: return "warning";
@@ -1469,7 +1471,7 @@ window.__ModuleLoader__.load({
 												}
 											},
 											children: [
-												(0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.StateDot, { state: row.discovery === "active" ? "ongoing" : row.discovery === "failed" ? "error" : "done" }),
+												(0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.StateDot, { state: row.discovery === "active" ? "ongoing" : row.discovery === "failed" ? "error" : row.discovery === "waiting" ? "warning" : "done" }),
 												(0, react_jsx_runtime.jsx)("span", {
 													className: _dsh_css_64557083eb0f58b9_default.rowLabel,
 													children: runDisplayLabel(row, session)
@@ -2204,6 +2206,7 @@ window.__ModuleLoader__.load({
 			"launcher.error": "任务控制失败：{message}",
 			"run.active": "运行中",
 			"run.completed": "已完成",
+			"run.waiting": "等待恢复",
 			"run.failed": "已失败",
 			"run.unknown": "未知",
 			"run.currentPhase": "当前阶段：{phase}",
@@ -2402,6 +2405,7 @@ window.__ModuleLoader__.load({
 			"launcher.error": "Task control failed: {message}",
 			"run.active": "Running",
 			"run.completed": "Completed",
+			"run.waiting": "Waiting to resume",
 			"run.failed": "Failed",
 			"run.unknown": "Unknown",
 			"run.currentPhase": "Current phase: {phase}",

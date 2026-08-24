@@ -101,7 +101,7 @@ const _deepseek_ai_dsh_kersor_viewer_kersorViewer_runBacklog_result$schema = z.u
   'runId': z.string().readonly(),
   'runDir': z.string().readonly(),
   'sessionDir': z.string().readonly(),
-  'status': z.union([z.literal("running"), z.literal("failed"), z.literal("completed"), z.literal("unknown")]),
+  'status': z.union([z.literal("running"), z.literal("waiting"), z.literal("failed"), z.literal("completed"), z.literal("unknown")]),
   'workflow': z.union([z.undefined(), z.string()]).optional(),
   'scriptHash': z.union([z.undefined(), z.string()]).optional(),
   'startedTs': z.union([z.undefined(), z.string()]).optional(),
@@ -240,7 +240,7 @@ const _deepseek_ai_dsh_kersor_viewer_kersorViewer_snapshot_result$schema = z.obj
   'expectedCycles': z.number().readonly().optional(),
 })).readonly(),
 }).readonly().optional(),
-  'discovery': z.union([z.literal("failed"), z.literal("active"), z.literal("completed")]).readonly(),
+  'discovery': z.union([z.literal("waiting"), z.literal("failed"), z.literal("active"), z.literal("completed")]).readonly(),
 })).readonly(),
   'classic': z.object({
   'sessions': z.array(z.object({
@@ -374,7 +374,7 @@ export const TYPERT_REMOTE = {
         typeSymbol: '@deepseek-ai/dsh-kersor-viewer#kersorViewer/classicSessionDetail:result',
         schema: _deepseek_ai_dsh_kersor_viewer_kersorViewer_classicSessionDetail_result$schema,
       },
-      sourceLocation: {"file":"packages/extensions/kersor-viewer/src/service.ts","line":202,"column":9},
+      sourceLocation: {"file":"packages/extensions/kersor-viewer/src/service.ts","line":211,"column":9},
     },
     {
       id: '@deepseek-ai/dsh-kersor-viewer#kersorViewer/runBacklog',
@@ -399,7 +399,7 @@ export const TYPERT_REMOTE = {
         typeSymbol: '@deepseek-ai/dsh-kersor-viewer#kersorViewer/runBacklog:result',
         schema: _deepseek_ai_dsh_kersor_viewer_kersorViewer_runBacklog_result$schema,
       },
-      sourceLocation: {"file":"packages/extensions/kersor-viewer/src/service.ts","line":162,"column":9},
+      sourceLocation: {"file":"packages/extensions/kersor-viewer/src/service.ts","line":167,"column":9},
     },
     {
       id: '@deepseek-ai/dsh-kersor-viewer#kersorViewer/runCallDetail',
@@ -434,7 +434,7 @@ export const TYPERT_REMOTE = {
         typeSymbol: '@deepseek-ai/dsh-kersor-viewer#kersorViewer/runCallDetail:result',
         schema: _deepseek_ai_dsh_kersor_viewer_kersorViewer_runCallDetail_result$schema,
       },
-      sourceLocation: {"file":"packages/extensions/kersor-viewer/src/service.ts","line":188,"column":9},
+      sourceLocation: {"file":"packages/extensions/kersor-viewer/src/service.ts","line":197,"column":9},
     },
     {
       id: '@deepseek-ai/dsh-kersor-viewer#kersorViewer/runResult',
@@ -459,7 +459,7 @@ export const TYPERT_REMOTE = {
         typeSymbol: '@deepseek-ai/dsh-kersor-viewer#kersorViewer/runResult:result',
         schema: _deepseek_ai_dsh_kersor_viewer_kersorViewer_runResult_result$schema,
       },
-      sourceLocation: {"file":"packages/extensions/kersor-viewer/src/service.ts","line":176,"column":9},
+      sourceLocation: {"file":"packages/extensions/kersor-viewer/src/service.ts","line":185,"column":9},
     },
     {
       id: '@deepseek-ai/dsh-kersor-viewer#kersorViewer/snapshot',
@@ -474,7 +474,7 @@ export const TYPERT_REMOTE = {
         typeSymbol: '@deepseek-ai/dsh-kersor-viewer/types#KersorViewerSnapshot',
         schema: _deepseek_ai_dsh_kersor_viewer_kersorViewer_snapshot_result$schema,
       },
-      sourceLocation: {"file":"packages/extensions/kersor-viewer/src/service.ts","line":142,"column":3},
+      sourceLocation: {"file":"packages/extensions/kersor-viewer/src/service.ts","line":147,"column":3},
     },
   ],
 }

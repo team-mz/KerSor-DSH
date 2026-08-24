@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Verify personal sources and refresh artifacts from one DSH checkout.
+"""Verify personal sources against one reconciled DSH checkout.
 
 The source packages intentionally retain DSH's monorepo-relative TypeScript
 contracts. This command stages them under the expected ``packages/extensions``
 layout, links the selected DSH dependency graph read-only, and builds there.
-After that proof succeeds it copies the selected DSH checkout's authoritative
-``lib`` artifacts back. It never writes the DSH checkout.
+The schema-v2 mirror sync remains the only writer of authoritative ``lib``
+artifacts; this proof does not modify either checkout.
 """
 
 from __future__ import annotations
@@ -18,6 +18,11 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+
+if __package__:
+    from . import sync_plugins
+else:
+    import sync_plugins
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +42,56 @@ def require(path: Path, label: str) -> Path:
 def link(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.symlink_to(source.resolve(), target_is_directory=source.is_dir())
+
+
+def stage_client_build_sources(dsh_root: Path, staging: Path) -> None:
+    """Keep the shared client config and its runtime imports inside staging."""
+    source = require(dsh_root / "packages/client", "DSH client package group")
+    destination = staging / "packages/client"
+    destination.mkdir()
+    ignored = shutil.ignore_patterns("lib", "node_modules", "*.tsbuildinfo")
+    for entry in source.iterdir():
+        target = destination / entry.name
+        if entry.name in {"modules", "web"}:
+            shutil.copytree(entry, target, symlinks=True, ignore=ignored)
+        elif entry.is_file() and not entry.is_symlink():
+            shutil.copy2(entry, target)
+        else:
+            link(entry, target)
+    shutil.copy2(
+        require(
+            dsh_root / "scripts/client-build-environment.ts",
+            "DSH client build environment",
+        ),
+        staging / "scripts/client-build-environment.ts",
+    )
+
+
+def verify_authoritative_mirror(dsh_root: Path) -> str:
+    """Require the current mirror to match one clean receipt-bound authority."""
+    try:
+        revision, snapshot, build_receipt = sync_plugins.source_snapshot(dsh_root)
+        differences = sync_plugins.mirror_differences(snapshot)
+        manifest = sync_plugins.read_manifest()
+    except sync_plugins.MirrorError as error:
+        raise BuildError(f"invalid DSH mirror authority: {error}") from error
+    authority = manifest.get("authority")
+    provenance_matches = (
+        manifest.get("schema_version") == sync_plugins.MIRROR_SCHEMA_VERSION
+        and isinstance(authority, dict)
+        and authority.get("revision") == revision
+        and authority.get("reconciled") is True
+        and manifest.get("build_receipt") == build_receipt
+    )
+    if differences or not provenance_matches:
+        details = ", ".join(differences[:3])
+        suffix = f": {details}" if details else ""
+        raise BuildError(
+            "personal mirror is not reconciled with the selected authority; "
+            "run scripts/sync_plugins.py sync --harness <checkout> --write"
+            + suffix
+        )
+    return revision
 
 
 def stage_node_modules(dsh_root: Path, staging: Path, extensions: Path) -> str:
@@ -141,6 +196,7 @@ def run(command: list[str], cwd: Path) -> None:
 
 def build(dsh_root: Path) -> None:
     dsh_root = dsh_root.expanduser().resolve()
+    authority_revision = verify_authoritative_mirror(dsh_root)
     tsc = require(dsh_root / "node_modules/.bin/tsc", "TypeScript compiler")
     tsdown = require(dsh_root / "node_modules/.bin/tsdown", "tsdown")
     for config in ("tsconfig.base.json", "tsconfig.base.client.json"):
@@ -162,6 +218,9 @@ def build(dsh_root: Path) -> None:
         source_packages = require(dsh_root / "packages", "DSH package tree")
         for group in source_packages.iterdir():
             if group.name == "extensions":
+                continue
+            if group.name == "client":
+                stage_client_build_sources(dsh_root, staging)
                 continue
             if group.name != "typert":
                 link(group, packages / group.name)
@@ -228,19 +287,8 @@ def build(dsh_root: Path) -> None:
         )
 
         normalize_generated_bundles(viewer, ui, zod_version)
-
-        for name in ("kersor-viewer", "ui-kersor-viewer"):
-            built = require(
-                extensions / name / "lib",
-                f"verified staged {name} artifacts",
-            )
-            destination = ROOT / "plugins" / name / "lib"
-            shutil.copytree(
-                built,
-                destination,
-                dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns("*.map", "*.tsbuildinfo"),
-            )
+        if verify_authoritative_mirror(dsh_root) != authority_revision:
+            raise BuildError("DSH authority changed during the isolated build")
 
 
 def main() -> int:
@@ -257,7 +305,7 @@ def main() -> int:
     except (BuildError, OSError) as exc:
         print(f"BUILD FAILED: {exc}")
         return 1
-    print("Verified KerSor sources and refreshed DSH-owned artifacts")
+    print("Verified KerSor sources and receipt-owned artifacts")
     return 0
 
 

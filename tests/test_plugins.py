@@ -255,7 +255,7 @@ console.log(JSON.stringify(await scanner.scanRoots([process.env.ROOT], false)))
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             value = json.loads(completed.stdout)
-            self.assertEqual(value["runs"][0]["discovery"], "completed")
+            self.assertEqual(value["runs"][0]["discovery"], "waiting")
             self.assertEqual(value["observation"]["state"], "healthy")
 
     def test_built_scanner_reuses_installed_preset_checkout(self) -> None:

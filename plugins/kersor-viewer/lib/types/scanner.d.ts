@@ -6,8 +6,8 @@ import type { KersorDiagnosticIssue } from './diagnostics.ts';
 import type { KersorWorkflowResultView } from './fold.ts';
 /** Default roots scanned in addition to configured ones. */
 export declare const DEFAULT_KERSOR_ROOTS: string[];
-/** Lifecycle classification of one discovered run directory. */
-export type KersorRunDiscovery = 'active' | 'completed' | 'failed';
+/** Summary-derived lifecycle; `workflow_status` takes precedence over legacy `status`. */
+export type KersorRunDiscovery = 'active' | 'completed' | 'waiting' | 'failed';
 /** Storage family of one executable Workflow run. */
 export type KersorRunKind = 'autonomous' | 'classic-round';
 /** One discovered run: identity paths plus classification. */
@@ -21,6 +21,13 @@ export interface KersorRunRef {
     readonly result?: KersorWorkflowResultView;
     readonly discovery: KersorRunDiscovery;
 }
+/**
+ * Read the scan-local generation of a run's atomically written summary.
+ * This internal signal is intentionally absent from the Remote inventory.
+ * @param ref - Exact run reference returned by the scanner.
+ * @returns Opaque summary generation, or `undefined` before a summary exists.
+ */
+export declare function scannedRunSummaryRevision(ref: KersorRunRef): string | undefined;
 /** How a root entered the scanner. */
 export type KersorRootOrigin = 'configured' | 'default' | 'checkout' | 'workspace';
 /** Result of inspecting one root during the latest completed scan. */

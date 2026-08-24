@@ -98,6 +98,44 @@ describe('KerSor conversation view registration', () => {
     expect(b.ctx.slots.entries('conversation.view')).toHaveLength(0)
   })
 
+  it('renders a waiting Mission as resumable with warning indicators', () => {
+    const store = new KersorViewerStore()
+    const sessionDir = '/work/current/.kersor/session'
+    const runDir = `${sessionDir}/autonomous-runs/run-waiting`
+    store.setSnapshot({
+      ...EMPTY_SNAPSHOT,
+      runs: [{
+        runId: 'run-waiting', runDir, sessionDir, root: '/work/current/.kersor',
+        kind: 'autonomous', discovery: 'waiting',
+      }],
+    })
+    store.applyFrame({
+      kind: 'run',
+      run: {
+        runId: 'run-waiting', runDir, sessionDir, status: 'waiting',
+        currentPhase: 'Execute', phases: [],
+        totals: { calls: 1, completed: 0, failed: 1, tokens: 0 },
+      },
+    })
+    store.select(runDir)
+    const props = {
+      t: makeTranslate(zh, commonZh), store,
+      currentWorkspace: '/work/current',
+      refresh: vi.fn(() => Promise.resolve()),
+      loadRun: vi.fn(() => Promise.resolve()),
+      loadCallDetail: vi.fn(() => Promise.resolve()),
+      loadClassic: vi.fn(() => Promise.resolve()),
+      start: vi.fn(() => Promise.resolve()),
+      stop: vi.fn(() => Promise.resolve()),
+    } as unknown as Parameters<typeof KersorView>[0]
+
+    const { container } = render(<KersorView {...props} />)
+
+    expect(screen.getByText('等待恢复')).toBeTruthy()
+    expect(container.querySelector('[data-run-status="waiting"] button [data-state="warning"]')).toBeTruthy()
+    expect(container.querySelector('[data-status="waiting"] [data-state="warning"]')).toBeTruthy()
+  })
+
   it('visualizes the runtime pipeline, parallel calls, and selected candidate', async () => {
     const store = new KersorViewerStore()
     const sessionDir = '/work/other/.kersor/20260821-134926'

@@ -6,6 +6,7 @@ import json
 import hashlib
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,8 @@ from pathlib import Path
 
 contract = Path(sys.argv[sys.argv.index("--contract") + 1])
 request = json.loads(contract.read_text(encoding="utf-8"))
+if request.get("launch_marker"):
+    Path(request["launch_marker"]).write_text("launched", encoding="utf-8")
 if request.get("mode") == "descendant":
     marker = request["marker"]
     subprocess.Popen([
@@ -75,7 +78,13 @@ const exec = {
   callId: 'call-test-evolve',
   agent: {session: {
     header: {cwd: request.cwd, origin: request.origin ?? 'user'},
-    events: [{type: 'tool/call', data: {turn: 1, step: 1, callId: 'call-test-evolve', name: 'kersor_evolve'}}],
+    events: request.historical_call === true
+      ? [
+          {type: 'tool/call', data: {turn: 1, step: 1, callId: 'call-previous-evolve', name: 'kersor_evolve'}},
+          {type: 'turn/end', data: {turn: 1}},
+          {type: 'tool/call', data: {turn: 2, step: 1, callId: 'call-test-evolve', name: 'kersor_evolve'}},
+        ]
+      : [{type: 'tool/call', data: {turn: 1, step: 1, callId: 'call-test-evolve', name: 'kersor_evolve'}}],
   }},
   signal: controller.signal,
   concludeTurn() { concludeCount += 1 },
@@ -146,21 +155,677 @@ const telemetry = {
 }
 const topLevelGuards = []
 let registeredTool
+const quotaFailure = {
+  message: '[Service quota exceeded.]',
+  code: 'QUOTA',
+  status: 429,
+}
+const serverFailure = {
+  message: 'provider request failed after metering',
+  code: 'SERVER',
+  status: 503,
+}
+const unknownFailure = {
+  message: 'provider request failed before usage was observed',
+  code: 'UNKNOWN',
+}
+const withSeq = events => events.map((event, index) => ({...event, seq: index}))
+const completedEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/message',
+    data: {
+      turn: 1,
+      step: 1,
+      usage: {
+        inputTokens: 11,
+        cacheReadTokens: 3,
+        cacheWriteTokens: 2,
+        outputTokens: 7,
+      },
+    },
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'completed'}}},
+])
+const quotaLifecycle = failure => withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: failure}}},
+])
+const quotaEvents = quotaLifecycle(quotaFailure)
+const quotaCodeVariantEvents = new Map([
+  ['quota-code-leading-space', quotaLifecycle({...quotaFailure, code: ' QUOTA '})],
+  ['quota-code-trailing-newline', quotaLifecycle({...quotaFailure, code: 'QUOTA\n'})],
+  ['quota-code-lowercase', quotaLifecycle({...quotaFailure, code: 'quota'})],
+])
+const quotaAfterContentEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'text-delta', text: 'partial output'}},
+  },
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const usageChunkFailureEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 1,
+      chunk: {type: 'usage', usage: {inputTokens: 9, outputTokens: 1}},
+    },
+  },
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: serverFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: serverFailure}}},
+])
+const unknownFailureEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: unknownFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: unknownFailure}}},
+])
+const multiStepFailureEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 1,
+      chunk: {type: 'usage', usage: {inputTokens: 4, outputTokens: 1}},
+    },
+  },
+  {
+    type: 'assistant/message',
+    data: {
+      turn: 1,
+      step: 1,
+      usage: {inputTokens: 6, cacheReadTokens: 2, outputTokens: 2},
+    },
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'step/start', data: {turn: 1, step: 2}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 2,
+      chunk: {type: 'usage', usage: {inputTokens: 3, outputTokens: 4}},
+    },
+  },
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 2, chunk: {type: 'finish', reason: {kind: 'error', failure: serverFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 2}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: serverFailure}}},
+])
+const terminalStepPriorAssistantOutput = [
+  {type: 'reasoning', text: 'Inspect the final artifact before reporting completion.'},
+  {type: 'text', text: 'I will read the final artifact once more.'},
+  {type: 'tool-call', id: 'read-2', name: 'read', arguments: '{"file_path":"dag_engine.py"}'},
+]
+const terminalStepQuotaAfterMeteredProgressEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 1,
+      chunk: {
+        type: 'usage',
+        usage: {inputTokens: 10, cacheReadTokens: 2, outputTokens: 1},
+      },
+    },
+  },
+  {
+    type: 'assistant/message',
+    data: {
+      turn: 1,
+      step: 1,
+      message: {
+        id: 'assistant-step-1',
+        role: 'assistant',
+        content: [{
+          type: 'tool-call',
+          id: 'read-1',
+          name: 'read',
+          arguments: '{"file_path":"README.md"}',
+        }],
+        source: {
+          kind: 'model',
+          provider: 'deepseek-official',
+          model: 'deepseek-v4-flash',
+        },
+      },
+    },
+  },
+  {type: 'tool/call', data: {turn: 1, step: 1, callId: 'read-1', name: 'read'}},
+  {type: 'tool/result', data: {turn: 1, step: 1, callId: 'read-1'}},
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'step/start', data: {turn: 1, step: 2}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 2,
+      chunk: {
+        type: 'usage',
+        usage: {inputTokens: 20, cacheWriteTokens: 3, outputTokens: 2},
+      },
+    },
+  },
+  {type: 'tool/call', data: {turn: 1, step: 2, callId: 'write-1', name: 'write'}},
+  {type: 'tool/result', data: {turn: 1, step: 2, callId: 'write-1'}},
+  {type: 'step/end', data: {turn: 1, step: 2}},
+  {type: 'step/start', data: {turn: 1, step: 3}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 3,
+      chunk: {
+        type: 'usage',
+        usage: {
+          inputTokens: 30,
+          cacheReadTokens: 4,
+          cacheWriteTokens: 1,
+          outputTokens: 3,
+        },
+      },
+    },
+  },
+  {
+    type: 'assistant/message',
+    data: {
+      turn: 1,
+      step: 3,
+      message: {
+        id: 'assistant-step-3',
+        role: 'assistant',
+        content: terminalStepPriorAssistantOutput,
+        source: {
+          kind: 'model',
+          provider: 'deepseek-official',
+          model: 'deepseek-v4-flash',
+        },
+      },
+    },
+  },
+  {type: 'tool/call', data: {turn: 1, step: 3, callId: 'read-2', name: 'read'}},
+  {type: 'tool/result', data: {turn: 1, step: 3, callId: 'read-2'}},
+  {type: 'step/end', data: {turn: 1, step: 3}},
+  {type: 'step/start', data: {turn: 1, step: 4}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 4,
+      chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}},
+    },
+  },
+  {type: 'step/end', data: {turn: 1, step: 4}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const terminalStepQuotaFailureVariant = failure => withSeq(
+  terminalStepQuotaAfterMeteredProgressEvents.map(event => {
+    if (event.type === 'assistant/chunk' && event.data?.chunk?.type === 'finish') {
+      return {
+        ...event,
+        data: {
+          ...event.data,
+          chunk: {
+            ...event.data.chunk,
+            reason: {kind: 'error', failure},
+          },
+        },
+      }
+    }
+    if (event.type === 'turn/end') {
+      return {...event, data: {...event.data, reason: {kind: 'error', error: failure}}}
+    }
+    return event
+  }),
+)
+const terminalStepQuotaFailureVariants = new Map([
+  [
+    'terminal-step-quota-code-lowercase',
+    terminalStepQuotaFailureVariant({...quotaFailure, code: 'quota'}),
+  ],
+  [
+    'terminal-step-quota-status-drift',
+    terminalStepQuotaFailureVariant({...quotaFailure, status: 430}),
+  ],
+])
+const terminalQuotaStepStartIndex = terminalStepQuotaAfterMeteredProgressEvents.findIndex(
+  event => event.type === 'step/start' && event.data?.step === 4,
+)
+const terminalStepQuotaLifecycleVariants = new Map([
+  [
+    'terminal-step-quota-missing-step-end',
+    withSeq(terminalStepQuotaAfterMeteredProgressEvents.filter(
+      event => !(event.type === 'step/end' && event.data?.step === 4),
+    )),
+  ],
+  [
+    'terminal-step-quota-duplicate-step-start',
+    withSeq([
+      ...terminalStepQuotaAfterMeteredProgressEvents.slice(0, terminalQuotaStepStartIndex + 1),
+      terminalStepQuotaAfterMeteredProgressEvents[terminalQuotaStepStartIndex],
+      ...terminalStepQuotaAfterMeteredProgressEvents.slice(terminalQuotaStepStartIndex + 1),
+    ]),
+  ],
+  [
+    'terminal-step-quota-drifted-step-end',
+    withSeq(terminalStepQuotaAfterMeteredProgressEvents.map(event => (
+      event.type === 'step/end' && event.data?.step === 4
+        ? {...event, data: {...event.data, step: 5}}
+        : event
+    ))),
+  ],
+])
+const terminalQuotaFinishIndex = terminalStepQuotaAfterMeteredProgressEvents.findIndex(
+  event => event.type === 'assistant/chunk'
+    && event.data?.step === 4
+    && event.data?.chunk?.type === 'finish',
+)
+const withTerminalStepEvents = additions => withSeq([
+  ...terminalStepQuotaAfterMeteredProgressEvents.slice(0, terminalQuotaFinishIndex),
+  ...additions,
+  ...terminalStepQuotaAfterMeteredProgressEvents.slice(terminalQuotaFinishIndex),
+])
+const terminalStepQuotaOutputEvents = withTerminalStepEvents([{
+  type: 'assistant/chunk',
+  data: {turn: 1, step: 4, chunk: {type: 'text-delta', text: 'partial output'}},
+}])
+const terminalStepQuotaToolEvents = withTerminalStepEvents([
+  {type: 'tool/call', data: {turn: 1, step: 4, callId: 'read-after-quota', name: 'read'}},
+  {type: 'tool/result', data: {turn: 1, step: 4, callId: 'read-after-quota'}},
+])
+const terminalStepQuotaRetryEvents = withTerminalStepEvents([{
+  type: 'llm/retry-started',
+  data: {turn: 1, step: 4, retryId: 'retry-terminal', retry: 1},
+}])
+const terminalStepQuotaTurnRetryEvents = withSeq(
+  terminalStepQuotaAfterMeteredProgressEvents.map(event => (
+    event.type === 'turn/start'
+      ? {...event, data: {...event.data, trigger: {kind: 'retry'}}}
+      : event
+  )),
+)
+const priorStepToolIndex = terminalStepQuotaAfterMeteredProgressEvents.findIndex(
+  event => event.type === 'tool/call' && event.data?.step === 2,
+)
+const terminalStepQuotaPriorRetryEvents = withSeq([
+  ...terminalStepQuotaAfterMeteredProgressEvents.slice(0, priorStepToolIndex),
+  {
+    type: 'llm/retry-started',
+    data: {turn: 1, step: 2, retryId: 'retry-prior', retry: 1},
+  },
+  ...terminalStepQuotaAfterMeteredProgressEvents.slice(priorStepToolIndex),
+])
+const terminalStepQuotaMismatchedFailureEvents = withSeq(
+  terminalStepQuotaAfterMeteredProgressEvents.map(event => (
+    event.type === 'assistant/chunk' && event.data?.chunk?.type === 'finish'
+      ? {
+          ...event,
+          data: {
+            ...event.data,
+            chunk: {
+              ...event.data.chunk,
+              reason: {
+                kind: 'error',
+                failure: {...quotaFailure, requestId: 'finish-only'},
+              },
+            },
+          },
+        }
+      : event
+  )),
+)
+const terminalStepQuotaUsageEvents = withTerminalStepEvents([{
+  type: 'assistant/chunk',
+  data: {
+    turn: 1,
+    step: 4,
+    chunk: {type: 'usage', usage: {inputTokens: 7, outputTokens: 1}},
+  },
+}])
+const terminalStepQuotaPriorUsageMissingEvents = withSeq(
+  terminalStepQuotaAfterMeteredProgressEvents.filter(event => !(
+    event.type === 'assistant/chunk'
+    && event.data?.step === 2
+    && event.data?.chunk?.type === 'usage'
+  )),
+)
+const terminalStepQuotaZeroMeteredEvents = withSeq(
+  terminalStepQuotaAfterMeteredProgressEvents.map(event => (
+    event.type === 'assistant/chunk' && event.data?.chunk?.type === 'usage'
+      ? {
+          ...event,
+          data: {
+            ...event.data,
+            chunk: {
+              ...event.data.chunk,
+              usage: {inputTokens: 0, outputTokens: 0},
+            },
+          },
+        }
+      : event
+  )),
+)
+const terminalStepQuotaWithoutPriorAssistantEvents = withSeq(
+  terminalStepQuotaAfterMeteredProgressEvents.filter(
+    event => event.type !== 'assistant/message',
+  ),
+)
+const quotaDuplicateTurnStartEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'turn/start', data: {turn: 1, trigger: {kind: 'retry'}}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const quotaDuplicateStepStartEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const quotaDuplicateTurnEndEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const quotaMissingStepEndEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const quotaTerminalBeforeFinishEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+])
+const quotaOtherCoordinateContentEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 9, step: 9, chunk: {type: 'text-delta', text: 'ambiguous content'}},
+  },
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const quotaMismatchedFailureEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 1,
+      chunk: {
+        type: 'finish',
+        reason: {kind: 'error', failure: {...quotaFailure, requestId: 'finish-request'}},
+      },
+    },
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {
+    type: 'turn/end',
+    data: {
+      turn: 1,
+      reason: {kind: 'error', error: {...quotaFailure, requestId: 'terminal-request'}},
+    },
+  },
+])
+const quotaRetryMarkerEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {type: 'llm/retry-started', data: {turn: 1, step: 1, retryId: 'retry-1', retry: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const quotaNonFreshCoordinatesEvents = withSeq([
+  {type: 'turn/start', data: {turn: 9}},
+  {type: 'step/start', data: {turn: 9, step: 9}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 9, step: 9, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 9, step: 9}},
+  {type: 'turn/end', data: {turn: 9, reason: {kind: 'error', error: quotaFailure}}},
+])
+const quotaToolResultEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'tool/result',
+    data: {
+      turn: 1,
+      step: 1,
+      message: {role: 'tool', toolCallId: 'call-1', content: [{type: 'text', text: 'content'}]},
+    },
+  },
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const quotaPostTerminalExecutionEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+  {type: 'request/context', data: {turn: 1, step: 1}},
+])
+const usageMissingStepEndEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 1,
+      chunk: {type: 'usage', usage: {inputTokens: 9, outputTokens: 1}},
+    },
+  },
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: serverFailure}}},
+  },
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: serverFailure}}},
+])
+const duplicateStepUsageEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 1,
+      chunk: {type: 'usage', usage: {inputTokens: 100, outputTokens: 0}},
+    },
+  },
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 1,
+      chunk: {type: 'usage', usage: {inputTokens: 1, outputTokens: 0}},
+    },
+  },
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: serverFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: serverFailure}}},
+])
+// Public replay of the existing child 2aac0987-e73d-4033-b19c-fde5fe240623,
+// retaining its event types, coordinates, ordering, and contiguous seq values.
+const exportedQuotaEvents = withSeq([
+  {type: 'sandbox/mode', data: {mode: 'workspace-write', source: 'delegation'}},
+  {type: 'approval/policy', data: {policy: 'never', source: 'delegation'}},
+  {type: 'agent/inbox/spliced', data: {}},
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'agent/inbox/spliced', data: {}},
+  {type: 'subagent/descriptor', data: {}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {type: 'user/message', data: {}},
+  {type: 'user/message', data: {}},
+  {type: 'user/message', data: {}},
+  {type: 'session/title', data: {}},
+  {type: 'request/header', data: {}},
+  {type: 'request/context', data: {}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const blockedEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'blocked'}}},
+])
+const abortedEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'aborted', reason: {kind: 'user'}}}},
+])
+const interruptedEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'interrupted'}}},
+])
+const malformedSeqEvents = completedEvents.map((event, index) => (
+  index === 2 ? {...event, seq: 'not-an-integer'} : event
+))
+const nonmonotonicSeqEvents = completedEvents.map((event, index) => (
+  index === 1 ? {...event, seq: 12} : index === 2 ? {...event, seq: 11} : event
+))
+const duplicateSeqEvents = completedEvents.map((event, index) => (
+  index === 3 ? {...event, seq: completedEvents[2].seq} : event
+))
+const gapSeqEvents = completedEvents.map((event, index) => (
+  index < 2 ? event : {...event, seq: event.seq + 1}
+))
+const eventsByMode = new Map([
+  ['quota', quotaEvents],
+  ...quotaCodeVariantEvents,
+  ['quota-after-content', quotaAfterContentEvents],
+  ['quota-duplicate-turn-start', quotaDuplicateTurnStartEvents],
+  ['quota-duplicate-step-start', quotaDuplicateStepStartEvents],
+  ['quota-duplicate-turn-end', quotaDuplicateTurnEndEvents],
+  ['quota-missing-step-end', quotaMissingStepEndEvents],
+  ['quota-terminal-before-finish', quotaTerminalBeforeFinishEvents],
+  ['quota-other-coordinate-content', quotaOtherCoordinateContentEvents],
+  ['quota-mismatched-failure', quotaMismatchedFailureEvents],
+  ['quota-retry-marker', quotaRetryMarkerEvents],
+  ['quota-nonfresh-coordinates', quotaNonFreshCoordinatesEvents],
+  ['quota-tool-result', quotaToolResultEvents],
+  ['quota-post-terminal-execution', quotaPostTerminalExecutionEvents],
+  ['quota-exported-replay', exportedQuotaEvents],
+  ['usage-chunk-failure', usageChunkFailureEvents],
+  ['unknown-failure', unknownFailureEvents],
+  ['multi-step-failure', multiStepFailureEvents],
+  ['terminal-step-quota-after-metered-progress', terminalStepQuotaAfterMeteredProgressEvents],
+  ...terminalStepQuotaFailureVariants,
+  ...terminalStepQuotaLifecycleVariants,
+  ['terminal-step-quota-after-output', terminalStepQuotaOutputEvents],
+  ['terminal-step-quota-with-mismatched-result-output', terminalStepQuotaAfterMeteredProgressEvents],
+  ['terminal-step-quota-after-tool', terminalStepQuotaToolEvents],
+  ['terminal-step-quota-after-retry', terminalStepQuotaRetryEvents],
+  ['terminal-step-quota-retry-turn', terminalStepQuotaTurnRetryEvents],
+  ['terminal-step-quota-prior-retry', terminalStepQuotaPriorRetryEvents],
+  ['terminal-step-quota-mismatched-failure', terminalStepQuotaMismatchedFailureEvents],
+  ['terminal-step-quota-after-usage', terminalStepQuotaUsageEvents],
+  ['terminal-step-quota-prior-usage-missing', terminalStepQuotaPriorUsageMissingEvents],
+  ['terminal-step-quota-zero-metered-progress', terminalStepQuotaZeroMeteredEvents],
+  ['terminal-step-quota-without-prior-assistant', terminalStepQuotaWithoutPriorAssistantEvents],
+  ['usage-missing-step-end', usageMissingStepEndEvents],
+  ['duplicate-step-usage', duplicateStepUsageEvents],
+  ['blocked', blockedEvents],
+  ['aborted', abortedEvents],
+  ['interrupted', interruptedEvents],
+  ['malformed-seq', malformedSeqEvents],
+  ['nonmonotonic-seq', nonmonotonicSeqEvents],
+  ['duplicate-seq', duplicateSeqEvents],
+  ['gap-seq', gapSeqEvents],
+])
+const childEvents = eventsByMode.get(request.child_mode) ?? completedEvents
 const child = {
   id: 'dsh-child-route-probe',
   options: {provider: plugin.DSH_PROVIDER, model: plugin.DSH_MODEL},
   session: {
-    events: [{
-      type: 'assistant/message',
-      data: {
-        usage: {
-          inputTokens: 11,
-          cacheReadTokens: 3,
-          cacheWriteTokens: 2,
-          outputTokens: 7,
-        },
-      },
-    }],
+    events: childEvents,
   },
   ctx: {
     tools: {
@@ -207,6 +872,10 @@ const ctx = {
         output_schema: value.outputSchema,
         prompt: value.prompt,
       })
+      if (request.swap_workspace_to !== undefined) {
+        fs.unlinkSync(request.cwd)
+        fs.symlinkSync(request.swap_workspace_to, request.cwd, 'dir')
+      }
       for (const listener of listeners.get('agent/created') ?? []) listener({agent: child})
       if (typeof telemetry.guard !== 'function') throw new Error('child guard was not installed during agent/created')
       const guardProbes = {
@@ -214,8 +883,24 @@ const ctx = {
         glob: {name: 'glob', arguments: {pattern: '*.json'}},
         grep: {name: 'grep', arguments: {pattern: 'runtime'}},
         structured_output: {name: 'structured_output', arguments: {observed: true}},
-        edit: {name: 'edit', arguments: {}},
-        write: {name: 'write', arguments: {}},
+        edit: {name: 'edit', arguments: request.transaction_artifact === undefined
+          ? {}
+          : {file_path: request.transaction_artifact}},
+        write: {name: 'write', arguments: request.transaction_artifact === undefined
+          ? {}
+          : {file_path: request.transaction_artifact}},
+        edit_undeclared: {name: 'edit', arguments: request.undeclared_artifact === undefined
+          ? {}
+          : {file_path: request.undeclared_artifact}},
+        write_undeclared: {name: 'write', arguments: request.undeclared_artifact === undefined
+          ? {}
+          : {file_path: request.undeclared_artifact}},
+        edit_alias: {name: 'edit', arguments: request.transaction_alias === undefined
+          ? {}
+          : {file_path: request.transaction_alias}},
+        write_alias: {name: 'write', arguments: request.transaction_alias === undefined
+          ? {}
+          : {file_path: request.transaction_alias}},
         bash: {name: 'bash', arguments: {}},
         subagent: {name: 'subagent', arguments: {}},
         workflow: {name: 'workflow', arguments: {}},
@@ -240,6 +925,67 @@ const ctx = {
           if (value.signal.aborted) settle()
           else value.signal.addEventListener('abort', settle, {once: true})
         })
+      } else if (request.child_mode === 'terminal-step-quota-without-prior-assistant') {
+        result = Promise.resolve({output: [], stopReason: 'error'})
+      } else if (request.child_mode === 'terminal-step-quota-with-mismatched-result-output') {
+        result = Promise.resolve({
+          output: [{type: 'text', text: 'partial output'}],
+          stopReason: 'error',
+        })
+      } else if (
+        typeof request.child_mode === 'string'
+        && request.child_mode.startsWith('terminal-step-quota-')
+        && eventsByMode.has(request.child_mode)
+      ) {
+        result = Promise.resolve({
+          output: terminalStepPriorAssistantOutput,
+          stopReason: 'error',
+        })
+      } else if ([
+        'quota',
+        'quota-code-leading-space',
+        'quota-code-trailing-newline',
+        'quota-code-lowercase',
+        'quota-after-content',
+        'quota-duplicate-turn-start',
+        'quota-duplicate-step-start',
+        'quota-duplicate-turn-end',
+        'quota-missing-step-end',
+        'quota-terminal-before-finish',
+        'quota-other-coordinate-content',
+        'quota-mismatched-failure',
+        'quota-retry-marker',
+        'quota-nonfresh-coordinates',
+        'quota-tool-result',
+        'quota-post-terminal-execution',
+        'quota-exported-replay',
+        'usage-chunk-failure',
+        'unknown-failure',
+        'multi-step-failure',
+        'terminal-step-quota-after-metered-progress',
+        'terminal-step-quota-code-lowercase',
+        'terminal-step-quota-status-drift',
+        'terminal-step-quota-missing-step-end',
+        'terminal-step-quota-duplicate-step-start',
+        'terminal-step-quota-drifted-step-end',
+        'terminal-step-quota-after-output',
+        'terminal-step-quota-after-tool',
+        'terminal-step-quota-after-retry',
+        'terminal-step-quota-retry-turn',
+        'terminal-step-quota-prior-retry',
+        'terminal-step-quota-mismatched-failure',
+        'terminal-step-quota-after-usage',
+        'terminal-step-quota-prior-usage-missing',
+        'terminal-step-quota-zero-metered-progress',
+        'usage-missing-step-end',
+        'duplicate-step-usage',
+        'interrupted',
+      ].includes(request.child_mode)) {
+        result = Promise.resolve({output: [], stopReason: 'error'})
+      } else if (request.child_mode === 'blocked') {
+        result = Promise.resolve({output: [], stopReason: 'refusal'})
+      } else if (request.child_mode === 'aborted') {
+        result = Promise.resolve({output: [], stopReason: 'aborted'})
       } else {
         result = Promise.resolve({
           output: [{type: 'text', text: 'DSH route probe completed'}],
@@ -368,6 +1114,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         abort_after_ms: int | None = None,
         timeout_ms: int = 5_000,
         second_call: bool = False,
+        historical_call: bool = False,
     ) -> tuple[dict[str, object], float]:
         request: dict[str, object] = {
             "module": str(self.module),
@@ -376,6 +1123,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             "args": args,
             "timeout_ms": timeout_ms,
             "second_call": second_call,
+            "historical_call": historical_call,
         }
         if abort_after_ms is not None:
             request["abort_after_ms"] = abort_after_ms
@@ -461,7 +1209,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             "    'label': contract_value.get('activation_label', 'plan-revision-1-attempt-1'),\n"
             "    'prompt': 'Inspect the workspace without mutation.',\n"
             "    'schema': {'type': 'object', 'properties': {'observed': {'type': 'boolean'}}, 'required': ['observed']},\n"
-            "    'options': {},\n"
+            "    'options': contract_value.get('activation_options', {}),\n"
             f"    'project_root': {str(self.workspace)!r},\n"
             "  },\n"
             "}\n"
@@ -502,6 +1250,9 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             "  chunks.extend(sock.recv(size - len(chunks)))\n"
             "response = json.loads(chunks)\n"
             "if response.get('ok') is not True:\n"
+            "  if contract_value.get('probe_mode') == 'capture-error':\n"
+            "    print(json.dumps({'status': 'failed', 'error': response['error']['message'], 'dsh_response': response}))\n"
+            "    raise SystemExit(2)\n"
             "  raise RuntimeError(response)\n"
             "socket_path = Path(os.environ['KERSOR_DSH_RPC_SOCKET'])\n"
             "terminal = {\n"
@@ -542,10 +1293,15 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         abort_after_ms: int | None = None,
         child_mode: str | None = None,
         guard_probe: bool = False,
+        transaction_artifact: Path | None = None,
+        undeclared_artifact: Path | None = None,
+        transaction_alias: str | None = None,
+        cwd: Path | None = None,
+        swap_workspace_to: Path | None = None,
     ) -> dict[str, object]:
         request: dict[str, object] = {
             "module": str(self.module),
-            "cwd": str(self.workspace),
+            "cwd": str(self.workspace if cwd is None else cwd),
             "args": {"contract": str(contract)},
             "outside_file": str(self.outside_secret),
             "outside_directory": str(self.home),
@@ -557,6 +1313,14 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             request["child_mode"] = child_mode
         if guard_probe:
             request["guard_probe"] = True
+        if transaction_artifact is not None:
+            request["transaction_artifact"] = str(transaction_artifact)
+        if undeclared_artifact is not None:
+            request["undeclared_artifact"] = str(undeclared_artifact)
+        if transaction_alias is not None:
+            request["transaction_alias"] = transaction_alias
+        if swap_workspace_to is not None:
+            request["swap_workspace_to"] = str(swap_workspace_to)
         completed = subprocess.run(
             [NODE, "--input-type=module", "-e", DSH_NODE_DRIVER],
             input=json.dumps(request),
@@ -567,6 +1331,72 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         return json.loads(completed.stdout)
+
+    def write_dsh_failure_contract(self, mission_id: str) -> Path:
+        return self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / mission_id),
+            runtime="dsh",
+            probe_mode="capture-error",
+            mission={
+                "mission_id": mission_id,
+                "goal": "surface one child terminal failure safely",
+                "authority": ["read workspace"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{"name": "inspect", "side_effect": "read"}],
+        )
+
+    def assert_unproven_quota_receipt(
+        self,
+        mode: str,
+        provider_code: str = "QUOTA",
+    ) -> dict[str, object]:
+        contract = self.write_dsh_failure_contract(mode)
+        result = self.invoke_dsh_native(contract, child_mode=mode)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_CHILD_TERMINAL_ERROR")
+        self.assertEqual(response["error"]["provider_code"], provider_code)
+        self.assertEqual(response["error"]["provider_status"], 429)
+        self.assertEqual(response["result"]["usage"], {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        })
+        self.assertFalse(response["result"]["usage_observed"])
+        self.assertFalse(response["result"]["usage_complete"])
+
+    def assert_terminal_step_quota_is_incomplete(
+        self,
+        mode: str,
+        *,
+        provider_code: str = "QUOTA",
+        provider_status: int = 429,
+        expected_usage: dict[str, int] | None = None,
+    ) -> None:
+        contract = self.write_dsh_failure_contract(mode)
+        result = self.invoke_dsh_native(contract, child_mode=mode)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_CHILD_TERMINAL_ERROR")
+        self.assertEqual(response["error"]["provider_code"], provider_code)
+        self.assertEqual(response["error"]["provider_status"], provider_status)
+        self.assertEqual(response["result"]["usage"], expected_usage or {
+            "input_tokens": 60,
+            "cached_input_tokens": 10,
+            "output_tokens": 6,
+            "total_tokens": 76,
+        })
+        self.assertTrue(response["result"]["usage_observed"])
+        self.assertFalse(response["result"]["usage_complete"])
+        return response
 
     def test_public_tool_routes_read_only_dsh_mission_to_pinned_spawn_child(self) -> None:
         self.prepare_dsh_native_core()
@@ -668,6 +1498,379 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self.assertEqual(receipt["model_role"], "worker")
         self.assertEqual(receipt["provider"], "deepseek-official")
         self.assertEqual(receipt["model"], "deepseek-v4-flash")
+
+    def test_public_host_reports_exact_pre_usage_quota_as_complete_zero_receipt(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("quota-before-usage")
+
+        result = self.invoke_dsh_native(contract, child_mode="quota")
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        response = result["value"]["dsh_response"]
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error"], {
+            "code": "DSH_CHILD_QUOTA",
+            "message": "[Service quota exceeded.]",
+            "provider_code": "QUOTA",
+            "provider_status": 429,
+        })
+        self.assertEqual(response["result"], {
+            "output": [],
+            "structured": None,
+            "stop_reason": "error",
+            "usage": {
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+            "usage_observed": False,
+            "usage_complete": True,
+            "thread_id": "dsh-child-route-probe",
+            "provider": "deepseek-official",
+            "model": "deepseek-v4-flash",
+            "model_role": "planner",
+            "isolation": "fresh-dsh-subagent",
+            "artifacts": [],
+        })
+
+    def test_public_host_requires_exact_raw_quota_machine_code_for_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        for mode, raw_code in (
+            ("quota-code-leading-space", " QUOTA "),
+            ("quota-code-trailing-newline", "QUOTA\n"),
+            ("quota-code-lowercase", "quota"),
+        ):
+            with self.subTest(raw_code=raw_code):
+                self.assert_unproven_quota_receipt(mode, provider_code=raw_code)
+
+    def test_public_host_rejects_duplicate_quota_turn_start_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-duplicate-turn-start")
+
+    def test_public_host_rejects_duplicate_quota_step_start_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-duplicate-step-start")
+
+    def test_public_host_rejects_duplicate_quota_turn_end_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-duplicate-turn-end")
+
+    def test_public_host_rejects_quota_without_step_end_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-missing-step-end")
+
+    def test_public_host_rejects_quota_terminal_before_finish_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-terminal-before-finish")
+
+    def test_public_host_rejects_quota_with_other_coordinate_content_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-other-coordinate-content")
+
+    def test_public_host_rejects_mismatched_quota_failure_facts_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-mismatched-failure")
+
+    def test_public_host_rejects_quota_retry_marker_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-retry-marker")
+
+    def test_public_host_rejects_nonfresh_quota_coordinates_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-nonfresh-coordinates")
+
+    def test_public_host_rejects_quota_tool_result_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-tool-result")
+
+    def test_public_host_rejects_post_terminal_execution_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-post-terminal-execution")
+
+    def test_public_host_accepts_the_exported_real_quota_lifecycle_replay(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("quota-exported-replay")
+
+        result = self.invoke_dsh_native(contract, child_mode="quota-exported-replay")
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_CHILD_QUOTA")
+        self.assertFalse(response["result"]["usage_observed"])
+        self.assertTrue(response["result"]["usage_complete"])
+
+    def test_public_host_keeps_usage_chunk_when_child_fails_after_metering(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("failure-after-usage")
+
+        result = self.invoke_dsh_native(contract, child_mode="usage-chunk-failure")
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_CHILD_TERMINAL_ERROR")
+        self.assertEqual(response["error"]["provider_code"], "SERVER")
+        self.assertEqual(response["error"]["provider_status"], 503)
+        self.assertEqual(response["result"]["usage"], {
+            "input_tokens": 9,
+            "cached_input_tokens": 0,
+            "output_tokens": 1,
+            "total_tokens": 10,
+        })
+        self.assertTrue(response["result"]["usage_observed"])
+        self.assertTrue(response["result"]["usage_complete"])
+
+    def test_public_host_reports_strict_terminal_step_quota_after_metered_progress(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("terminal-step-quota-after-metered-progress")
+
+        result = self.invoke_dsh_native(
+            contract,
+            child_mode="terminal-step-quota-after-metered-progress",
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"], {
+            "code": "DSH_CHILD_QUOTA",
+            "message": "[Service quota exceeded.]",
+            "provider_code": "QUOTA",
+            "provider_status": 429,
+        })
+        self.assertEqual(response["result"]["usage"], {
+            "input_tokens": 60,
+            "cached_input_tokens": 10,
+            "output_tokens": 6,
+            "total_tokens": 76,
+        })
+        self.assertEqual(response["result"]["output"], [])
+        self.assertIsNone(response["result"]["structured"])
+        self.assertTrue(response["result"]["usage_observed"])
+        self.assertTrue(response["result"]["usage_complete"])
+
+    def test_public_host_requires_exact_terminal_step_quota_code_and_status(self) -> None:
+        self.prepare_dsh_native_core()
+        for mode, provider_code, provider_status in (
+            ("terminal-step-quota-code-lowercase", "quota", 429),
+            ("terminal-step-quota-status-drift", "QUOTA", 430),
+        ):
+            with self.subTest(mode=mode):
+                self.assert_terminal_step_quota_is_incomplete(
+                    mode,
+                    provider_code=provider_code,
+                    provider_status=provider_status,
+                )
+
+    def test_public_host_requires_closed_unique_terminal_step_quota_lifecycle(self) -> None:
+        self.prepare_dsh_native_core()
+        for mode in (
+            "terminal-step-quota-missing-step-end",
+            "terminal-step-quota-duplicate-step-start",
+            "terminal-step-quota-drifted-step-end",
+        ):
+            with self.subTest(mode=mode):
+                self.assert_terminal_step_quota_is_incomplete(mode)
+
+    def test_public_host_rejects_terminal_step_quota_after_output(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_terminal_step_quota_is_incomplete("terminal-step-quota-after-output")
+
+    def test_public_host_rejects_terminal_step_quota_with_mismatched_result_output(self) -> None:
+        self.prepare_dsh_native_core()
+        response = self.assert_terminal_step_quota_is_incomplete(
+            "terminal-step-quota-with-mismatched-result-output",
+        )
+        self.assertEqual(response["result"]["output"], [{
+            "type": "text",
+            "text": "partial output",
+        }])
+
+    def test_public_host_rejects_terminal_step_quota_after_tool_activity(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_terminal_step_quota_is_incomplete("terminal-step-quota-after-tool")
+
+    def test_public_host_rejects_terminal_step_quota_after_retry(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_terminal_step_quota_is_incomplete("terminal-step-quota-after-retry")
+
+    def test_public_host_rejects_terminal_step_quota_from_retry_turn(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_terminal_step_quota_is_incomplete("terminal-step-quota-retry-turn")
+
+    def test_public_host_rejects_terminal_step_quota_after_prior_step_retry(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_terminal_step_quota_is_incomplete("terminal-step-quota-prior-retry")
+
+    def test_public_host_requires_matching_terminal_step_quota_failures(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_terminal_step_quota_is_incomplete(
+            "terminal-step-quota-mismatched-failure",
+        )
+
+    def test_public_host_rejects_terminal_step_quota_after_usage(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_terminal_step_quota_is_incomplete(
+            "terminal-step-quota-after-usage",
+            expected_usage={
+                "input_tokens": 67,
+                "cached_input_tokens": 10,
+                "output_tokens": 7,
+                "total_tokens": 84,
+            },
+        )
+
+    def test_public_host_requires_every_prior_step_to_be_metered(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_terminal_step_quota_is_incomplete(
+            "terminal-step-quota-prior-usage-missing",
+            expected_usage={
+                "input_tokens": 40,
+                "cached_input_tokens": 7,
+                "output_tokens": 4,
+                "total_tokens": 51,
+            },
+        )
+
+    def test_public_host_requires_positive_prior_usage_for_terminal_step_quota(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_terminal_step_quota_is_incomplete(
+            "terminal-step-quota-zero-metered-progress",
+            expected_usage={
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+        )
+
+    def test_public_host_requires_prior_canonical_assistant_output_for_terminal_quota(self) -> None:
+        self.prepare_dsh_native_core()
+        response = self.assert_terminal_step_quota_is_incomplete(
+            "terminal-step-quota-without-prior-assistant",
+        )
+        self.assertEqual(response["result"]["output"], [])
+
+    def test_public_host_does_not_claim_known_zero_quota_after_content(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("quota-after-content")
+
+        result = self.invoke_dsh_native(contract, child_mode="quota-after-content")
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_CHILD_TERMINAL_ERROR")
+        self.assertEqual(response["error"]["provider_code"], "QUOTA")
+        self.assertEqual(response["error"]["provider_status"], 429)
+        self.assertFalse(response["result"]["usage_observed"])
+        self.assertFalse(response["result"]["usage_complete"])
+
+    def test_public_host_marks_unknown_unmetered_failure_usage_incomplete(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("unknown-before-usage")
+
+        result = self.invoke_dsh_native(contract, child_mode="unknown-failure")
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_CHILD_TERMINAL_ERROR")
+        self.assertEqual(response["error"]["provider_code"], "UNKNOWN")
+        self.assertEqual(response["result"]["usage"], {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        })
+        self.assertFalse(response["result"]["usage_observed"])
+        self.assertFalse(response["result"]["usage_complete"])
+
+    def test_public_host_folds_chunk_and_message_usage_last_wins_per_step(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("multi-step-metering")
+
+        result = self.invoke_dsh_native(contract, child_mode="multi-step-failure")
+
+        self.assertTrue(result["ok"], result.get("error"))
+        receipt = result["value"]["dsh_response"]["result"]
+        self.assertEqual(receipt["usage"], {
+            "input_tokens": 9,
+            "cached_input_tokens": 2,
+            "output_tokens": 6,
+            "total_tokens": 17,
+        })
+        self.assertTrue(receipt["usage_observed"])
+        self.assertTrue(receipt["usage_complete"])
+
+    def test_public_host_marks_metered_failure_with_missing_step_end_incomplete(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("usage-missing-step-end")
+
+        result = self.invoke_dsh_native(contract, child_mode="usage-missing-step-end")
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_CHILD_TERMINAL_ERROR")
+        self.assertEqual(response["result"]["usage"], {
+            "input_tokens": 9,
+            "cached_input_tokens": 0,
+            "output_tokens": 1,
+            "total_tokens": 10,
+        })
+        self.assertTrue(response["result"]["usage_observed"])
+        self.assertFalse(response["result"]["usage_complete"])
+
+    def test_public_host_marks_duplicate_same_coordinate_step_usage_incomplete(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("duplicate-step-usage")
+
+        result = self.invoke_dsh_native(contract, child_mode="duplicate-step-usage")
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_CHILD_TERMINAL_ERROR")
+        self.assertEqual(response["result"]["usage"], {
+            "input_tokens": 1,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 1,
+        })
+        self.assertTrue(response["result"]["usage_observed"])
+        self.assertFalse(response["result"]["usage_complete"])
+
+    def test_public_host_requires_strict_unique_monotonic_event_sequences(self) -> None:
+        self.prepare_dsh_native_core()
+        for mode in (
+            "malformed-seq",
+            "nonmonotonic-seq",
+            "duplicate-seq",
+            "gap-seq",
+        ):
+            with self.subTest(mode=mode):
+                contract = self.write_dsh_failure_contract(mode)
+                result = self.invoke_dsh_native(contract, child_mode=mode)
+
+                self.assertTrue(result["ok"], result.get("error"))
+                response = result["value"]["dsh_response"]
+                self.assertEqual(response["error"]["code"], "DSH_CHILD_USAGE_INCOMPLETE")
+                self.assertTrue(response["result"]["usage_observed"])
+                self.assertFalse(response["result"]["usage_complete"])
+
+    def test_public_host_maps_durable_terminal_stop_reasons(self) -> None:
+        self.prepare_dsh_native_core()
+        for mode, stop_reason in (
+            ("blocked", "refusal"),
+            ("aborted", "aborted"),
+            ("interrupted", "error"),
+        ):
+            with self.subTest(mode=mode):
+                contract = self.write_dsh_failure_contract(f"terminal-{mode}")
+                result = self.invoke_dsh_native(contract, child_mode=mode)
+
+                self.assertTrue(result["ok"], result.get("error"))
+                response = result["value"]["dsh_response"]
+                self.assertEqual(response["error"]["code"], "DSH_CHILD_TERMINAL_ERROR")
+                self.assertEqual(response["result"]["stop_reason"], stop_reason)
+                self.assertFalse(response["result"]["usage_complete"])
 
     def test_public_host_rejects_unknown_activation_phase_before_child_start(self) -> None:
         self.prepare_dsh_native_core()
@@ -811,7 +2014,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self.assertEqual(result["telemetry"].get("conclude_count", 0), 0)
         self.assertLess(time.monotonic() - started, 4)
 
-    def test_public_tool_rejects_dsh_mutation_before_child_start(self) -> None:
+    def test_public_tool_rejects_dsh_write_without_transaction_artifact(self) -> None:
         contract = self.write_contract(
             contract_version="kersor-mission-v1",
             workspace=str(self.workspace),
@@ -828,7 +2031,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             capabilities=[{
                 "name": "mutate",
                 "side_effect": "write",
-                "transaction_artifacts": ["candidate.py"],
+                "transaction_artifacts": [],
             }],
         )
 
@@ -837,11 +2040,692 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["value"]["status"], "failed")
         self.assertIn(
-            "read-only Mission capabilities only",
+            "write capability must declare",
             result["value"]["error"],
         )
         self.assertEqual(result["telemetry"]["conclude_count"], 1)
         self.assertEqual(result["telemetry"]["starts"], [])
+
+    def test_public_host_allows_only_declared_dsh_transaction_artifact_tools(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        undeclared = self.workspace / "undeclared.py"
+        undeclared.write_text("protected = True\n", encoding="utf-8")
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "write-transaction"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_candidate",
+            activation_options={
+                "transaction": {
+                    "artifacts": [candidate.name],
+                    "rollback_on_noncompleted_status": True,
+                },
+            },
+            mission={
+                "mission_id": "write-transaction",
+                "goal": "mutate one declared candidate",
+                "authority": ["write candidate.py"],
+                "required_artifacts": ["candidate_source"],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": [candidate.name],
+            }],
+        )
+
+        result = self.invoke_dsh_native(
+            contract,
+            transaction_artifact=candidate,
+            undeclared_artifact=undeclared,
+            transaction_alias=f"{self.workspace}/./{candidate.name}",
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "completed", result)
+        self.assertEqual(len(result["telemetry"]["starts"]), 1)
+        self.assertEqual(
+            result["telemetry"]["starts"][0]["tool_filter"],
+            {"allow": ["read", "glob", "grep", "edit", "write"]},
+        )
+        for allowed in ("read", "glob", "grep", "structured_output", "edit", "write"):
+            self.assertIsNone(result["telemetry"]["guards"][allowed])
+        for forbidden in ("edit_undeclared", "write_undeclared", "edit_alias", "write_alias"):
+            self.assertIn("declared transaction artifact", result["telemetry"]["guards"][forbidden])
+        self.assertEqual(candidate.read_text(encoding="utf-8"), "baseline = True\n")
+        self.assertEqual(undeclared.read_text(encoding="utf-8"), "protected = True\n")
+
+    def test_public_host_rechecks_the_actual_write_path_after_cwd_alias_drift(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        workspace_alias = self.root / "workspace-alias"
+        workspace_alias.symlink_to(self.workspace, target_is_directory=True)
+        alternate = self.root / "alternate-workspace"
+        alternate.mkdir()
+        alternate_candidate = alternate / candidate.name
+        alternate_candidate.write_text("must stay unchanged\n", encoding="utf-8")
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "cwd-alias-drift"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_candidate",
+            activation_options={"transaction": {
+                "artifacts": [candidate.name],
+                "rollback_on_noncompleted_status": True,
+            }},
+            mission={
+                "mission_id": "cwd-alias-drift",
+                "goal": "reject a changed child cwd alias",
+                "authority": ["write candidate"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": [candidate.name],
+            }],
+        )
+
+        result = self.invoke_dsh_native(
+            contract,
+            transaction_artifact=workspace_alias / candidate.name,
+            cwd=workspace_alias,
+            swap_workspace_to=alternate,
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "completed", result)
+        for tool in ("edit", "write"):
+            self.assertIn("identity is unsafe", result["telemetry"]["guards"][tool])
+        self.assertEqual(candidate.read_text(encoding="utf-8"), "baseline = True\n")
+        self.assertEqual(
+            alternate_candidate.read_text(encoding="utf-8"),
+            "must stay unchanged\n",
+        )
+
+    def test_public_host_rejects_transaction_on_planner_activation(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "planner-transaction"),
+            runtime="dsh",
+            activation_phase="Plan revision 1",
+            activation_label="plan-revision-1-attempt-1",
+            activation_options={
+                "transaction": {
+                    "artifacts": [candidate.name],
+                    "rollback_on_noncompleted_status": True,
+                },
+            },
+            mission={
+                "mission_id": "planner-transaction",
+                "goal": "reject planner mutation",
+                "authority": ["write candidate.py"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": [candidate.name],
+            }],
+        )
+
+        result = self.invoke_dsh_native(contract)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("Execute revision worker", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(candidate.read_text(encoding="utf-8"), "baseline = True\n")
+
+    def test_public_host_rejects_symlink_transaction_artifact_before_child_start(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.symlink_to(self.outside_secret)
+        original = self.outside_secret.read_bytes()
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "symlink-transaction"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_candidate",
+            activation_options={"transaction": {
+                "artifacts": [candidate.name],
+                "rollback_on_noncompleted_status": True,
+            }},
+            mission={
+                "mission_id": "symlink-transaction",
+                "goal": "reject aliased mutation",
+                "authority": ["write candidate.py"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": [candidate.name],
+            }],
+        )
+
+        result = self.invoke_dsh_native(contract)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("regular single-link file", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(self.outside_secret.read_bytes(), original)
+
+    def test_public_host_rejects_hardlink_transaction_artifact_before_child_start(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        os.link(self.outside_secret, candidate)
+        original = self.outside_secret.read_bytes()
+        original_mode = stat.S_IMODE(self.outside_secret.stat().st_mode)
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "hardlink-transaction"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_candidate",
+            activation_options={"transaction": {
+                "artifacts": [candidate.name],
+                "rollback_on_noncompleted_status": True,
+            }},
+            mission={
+                "mission_id": "hardlink-transaction",
+                "goal": "reject shared-inode mutation",
+                "authority": ["write candidate.py"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": [candidate.name],
+            }],
+        )
+
+        result = self.invoke_dsh_native(contract)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("regular single-link file", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(self.outside_secret.read_bytes(), original)
+        self.assertEqual(stat.S_IMODE(self.outside_secret.stat().st_mode), original_mode)
+
+    def test_public_host_accepts_bound_candidate_evaluator_transaction(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        immutable_input = self.workspace / "inputs.json"
+        immutable_input.write_text("{}\n", encoding="utf-8")
+        evaluator_request = {
+            "protocol": "command-v1",
+            "argv": ["python3", "-B", "verify.py"],
+            "cwd": ".",
+            "artifacts": [candidate.name, immutable_input.name],
+            "filesystem_policy": "read-only",
+            "network_policy": "denied",
+            "output_policy": "sealed",
+            "timeout_seconds": 5,
+        }
+        fact_projections = [{
+            "output_name": "verified",
+            "result_path": "passed",
+        }]
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "candidate-gate"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_candidate",
+            activation_options={
+                "transaction": {
+                    "artifacts": [candidate.name],
+                    "rollback_on_noncompleted_status": True,
+                    "candidate_gate": {
+                        "verifier": "verify_candidate",
+                        "request": evaluator_request,
+                        "result_artifact": "measurement",
+                        "fact_projections": fact_projections,
+                    },
+                },
+            },
+            mission={
+                "mission_id": "candidate-gate",
+                "goal": "mutate and verify one candidate",
+                "authority": ["write candidate.py", "run registered verifier"],
+                "required_artifacts": ["candidate_summary", "measurement"],
+                "required_facts": {"verified": True},
+                "max_revisions": 1,
+            },
+            capabilities=[
+                {
+                    "name": "mutate",
+                    "side_effect": "write",
+                    "transaction_artifacts": [candidate.name],
+                    "candidate_verifier": "verify_candidate",
+                    "produces_artifacts": ["candidate_summary"],
+                    "produces_facts": [],
+                },
+                {
+                    "name": "repair",
+                    "side_effect": "write",
+                    "transaction_artifacts": [candidate.name],
+                    "candidate_verifier": "verify_candidate",
+                    "produces_artifacts": ["repair_summary"],
+                    "produces_facts": [],
+                },
+                {
+                    "name": "verify_candidate",
+                    "side_effect": "read",
+                    "produces_artifacts": ["measurement"],
+                    "produces_facts": ["verified"],
+                    "execution": {
+                        "kind": "host_evaluator",
+                        "retryable": False,
+                        "request": evaluator_request,
+                        "fact_projections": fact_projections,
+                    },
+                },
+            ],
+        )
+
+        result = self.invoke_dsh_native(contract, transaction_artifact=candidate)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "completed", result)
+        self.assertEqual(len(result["telemetry"]["starts"]), 1)
+        self.assertEqual(
+            result["telemetry"]["starts"][0]["tool_filter"],
+            {"allow": ["read", "glob", "grep", "edit", "write"]},
+        )
+
+    def test_public_host_rejects_candidate_gate_drift_before_child_start(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        evaluator_request = {
+            "protocol": "command-v1",
+            "argv": ["python3", "-B", "verify.py"],
+            "cwd": ".",
+            "artifacts": [candidate.name],
+            "filesystem_policy": "read-only",
+            "network_policy": "denied",
+            "output_policy": "sealed",
+            "timeout_seconds": 5,
+        }
+        fact_projections = [{"output_name": "verified", "result_path": "passed"}]
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "candidate-gate-drift"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_candidate",
+            activation_options={
+                "transaction": {
+                    "artifacts": [candidate.name],
+                    "rollback_on_noncompleted_status": True,
+                    "candidate_gate": {
+                        "verifier": "verify_candidate",
+                        "request": {**evaluator_request, "argv": ["/bin/cat", "/etc/passwd"]},
+                        "result_artifact": "measurement",
+                        "fact_projections": fact_projections,
+                    },
+                },
+            },
+            mission={
+                "mission_id": "candidate-gate-drift",
+                "goal": "reject activation drift",
+                "authority": ["write candidate.py", "run registered verifier"],
+                "required_artifacts": ["candidate_summary", "measurement"],
+                "required_facts": {"verified": True},
+                "max_revisions": 1,
+            },
+            capabilities=[
+                {
+                    "name": "mutate",
+                    "side_effect": "write",
+                    "transaction_artifacts": [candidate.name],
+                    "candidate_verifier": "verify_candidate",
+                    "produces_artifacts": ["candidate_summary"],
+                    "produces_facts": [],
+                },
+                {
+                    "name": "verify_candidate",
+                    "side_effect": "read",
+                    "produces_artifacts": ["measurement"],
+                    "produces_facts": ["verified"],
+                    "execution": {
+                        "kind": "host_evaluator",
+                        "retryable": False,
+                        "request": evaluator_request,
+                        "fact_projections": fact_projections,
+                    },
+                },
+            ],
+        )
+
+        result = self.invoke_dsh_native(contract, transaction_artifact=candidate)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("candidate gate does not match", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(candidate.read_text(encoding="utf-8"), "baseline = True\n")
+
+    def test_public_host_rejects_transaction_rollback_policy_drift(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "rollback-drift"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_candidate",
+            activation_options={
+                "transaction": {
+                    "artifacts": [candidate.name],
+                    "rollback_on_noncompleted_status": False,
+                },
+            },
+            mission={
+                "mission_id": "rollback-drift",
+                "goal": "reject rollback policy drift",
+                "authority": ["write candidate"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "required_authorities": ["write candidate"],
+                "side_effect": "write",
+                "transaction_artifacts": [candidate.name],
+            }],
+        )
+
+        result = self.invoke_dsh_native(contract, transaction_artifact=candidate)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("rollback policy", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(candidate.read_text(encoding="utf-8"), "baseline = True\n")
+
+    def test_public_host_rejects_unadmitted_transaction_capability(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "authority-drift"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_candidate",
+            activation_options={
+                "transaction": {
+                    "artifacts": [candidate.name],
+                    "rollback_on_noncompleted_status": True,
+                },
+            },
+            mission={
+                "mission_id": "authority-drift",
+                "goal": "reject unadmitted mutation",
+                "authority": ["read workspace"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[
+                {
+                    "name": "inspect",
+                    "required_authorities": ["read workspace"],
+                    "side_effect": "read",
+                },
+                {
+                    "name": "mutate",
+                    "required_authorities": ["write candidate"],
+                    "side_effect": "write",
+                    "transaction_artifacts": [candidate.name],
+                },
+            ],
+        )
+
+        result = self.invoke_dsh_native(contract, transaction_artifact=candidate)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("does not match one Mission capability", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(candidate.read_text(encoding="utf-8"), "baseline = True\n")
+
+    def test_public_host_rejects_runtime_control_transaction_artifact(self) -> None:
+        self.prepare_dsh_native_core()
+        control = self.workspace / ".kersor-autonomous" / "control.json"
+        control.parent.mkdir()
+        control.write_text("{}\n", encoding="utf-8")
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "control-session"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_control",
+            activation_options={"transaction": {
+                "artifacts": [".kersor-autonomous/control.json"],
+                "rollback_on_noncompleted_status": True,
+            }},
+            mission={
+                "mission_id": "runtime-control-transaction",
+                "goal": "reject runtime control mutation",
+                "authority": ["write runtime control"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": [".kersor-autonomous/control.json"],
+            }],
+        )
+
+        result = self.invoke_dsh_native(contract, transaction_artifact=control)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("runtime control", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(control.read_text(encoding="utf-8"), "{}\n")
+
+    def test_public_host_rejects_runtime_config_as_transaction_artifact(self) -> None:
+        self.prepare_dsh_native_core()
+        runtime_config = self.workspace / "runtime-dsh.json"
+        runtime_config.write_bytes(
+            (self.core / "config" / "runtime-dsh-autonomous.json").read_bytes()
+        )
+        original = runtime_config.read_bytes()
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "runtime-config-control"),
+            runtime="dsh",
+            runtime_config=runtime_config.name,
+            activation_phase="Execute revision 1",
+            activation_label="mutate_runtime_config",
+            activation_options={"transaction": {
+                "artifacts": [runtime_config.name],
+                "rollback_on_noncompleted_status": True,
+            }},
+            mission={
+                "mission_id": "runtime-config-control",
+                "goal": "reject runtime config mutation",
+                "authority": ["write runtime config"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": [runtime_config.name],
+            }],
+        )
+
+        result = self.invoke_dsh_native(contract, transaction_artifact=runtime_config)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("runtime config", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(runtime_config.read_bytes(), original)
+
+    def test_public_host_rejects_custom_mission_session_as_transaction_artifact(self) -> None:
+        self.prepare_dsh_native_core()
+        session = self.workspace / "custom-session"
+        session_config = session / "session-config.json"
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(session),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_session",
+            activation_options={"transaction": {
+                "artifacts": ["custom-session/session-config.json"],
+                "rollback_on_noncompleted_status": True,
+            }},
+            mission={
+                "mission_id": "custom-session-control",
+                "goal": "reject custom Session mutation",
+                "authority": ["write Session config"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": ["custom-session/session-config.json"],
+            }],
+        )
+
+        result = self.invoke_dsh_native(contract, transaction_artifact=session_config)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("Mission Session", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertTrue(session_config.is_file())
+
+    def test_public_host_rejects_symlinked_custom_session_transaction_alias(self) -> None:
+        self.prepare_dsh_native_core()
+        session_alias = self.workspace / "custom-link-session"
+        real_session = self.workspace / "custom-real-session"
+        session_alias.symlink_to(real_session, target_is_directory=True)
+        real_session_config = real_session / "session-config.json"
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(session_alias),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_session_alias",
+            activation_options={"transaction": {
+                "artifacts": ["custom-real-session/session-config.json"],
+                "rollback_on_noncompleted_status": True,
+            }},
+            mission={
+                "mission_id": "custom-session-alias",
+                "goal": "reject Session alias mutation",
+                "authority": ["write Session config"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": ["custom-real-session/session-config.json"],
+            }],
+        )
+
+        result = self.invoke_dsh_native(contract, transaction_artifact=real_session_config)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("Session path must not use symlinks", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+
+    def test_public_host_rejects_mission_contract_as_transaction_artifact(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.workspace / "mission-owned-control.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-mission-v1",
+                "workspace": str(self.workspace),
+                "session": str(self.workspace / ".kersor-autonomous" / "mission-control"),
+                "runtime": "dsh",
+                "activation_phase": "Execute revision 1",
+                "activation_label": "mutate_contract",
+                "activation_options": {
+                    "transaction": {
+                        "artifacts": [contract.name],
+                        "rollback_on_noncompleted_status": True,
+                    },
+                },
+                "mission": {
+                    "mission_id": "mission-control-transaction",
+                    "goal": "reject Mission mutation",
+                    "authority": ["write Mission contract"],
+                    "required_artifacts": [],
+                    "required_facts": {},
+                    "max_revisions": 1,
+                },
+                "capabilities": [{
+                    "name": "mutate",
+                    "side_effect": "write",
+                    "transaction_artifacts": [contract.name],
+                }],
+            }),
+            encoding="utf-8",
+        )
+        original = contract.read_bytes()
+
+        result = self.invoke_dsh_native(contract, transaction_artifact=contract)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("Mission contract", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(contract.read_bytes(), original)
 
     def test_core_disconnect_aborts_and_disposes_only_that_dsh_child(self) -> None:
         self.prepare_dsh_native_core()
@@ -932,12 +2816,61 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["value"]["status"], "failed")
         self.assertIn(
-            "rejects Host evaluator and command",
+            "Host evaluator has an invalid bounded output contract",
             result["value"]["error"],
         )
         self.assertEqual(result["telemetry"]["conclude_count"], 1)
         self.assertEqual(result["telemetry"]["starts"], [])
         self.assertNotIn("outside-secret-must-not-leak", json.dumps(result))
+
+    def test_public_tool_accepts_a_safe_standalone_host_evaluator_mission(self) -> None:
+        self.prepare_dsh_native_core()
+        immutable_input = self.workspace / "input.txt"
+        immutable_input.write_text("frozen\n", encoding="utf-8")
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "standalone-evaluator"),
+            runtime="dsh",
+            mission={
+                "mission_id": "standalone-evaluator",
+                "goal": "run one Core-owned read-only evaluator",
+                "authority": ["run registered verifier"],
+                "required_artifacts": ["measurement"],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "check",
+                "required_authorities": ["run registered verifier"],
+                "side_effect": "read",
+                "produces_artifacts": ["measurement"],
+                "produces_facts": [],
+                "execution": {
+                    "kind": "host_evaluator",
+                    "request": {
+                        "protocol": "command-v1",
+                        "argv": ["/usr/bin/true"],
+                        "cwd": ".",
+                        "artifacts": [],
+                        "filesystem_policy": "read-only",
+                        "network_policy": "denied",
+                        "output_policy": "sealed",
+                    },
+                    "fact_projections": [],
+                },
+            }],
+        )
+
+        result = self.invoke_dsh_native(contract)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "completed", result)
+        self.assertEqual(len(result["telemetry"]["starts"]), 1)
+        self.assertEqual(
+            result["telemetry"]["starts"][0]["tool_filter"],
+            {"allow": ["read", "glob", "grep"]},
+        )
 
     def test_calls_frozen_bridge_once_from_current_workspace_and_concludes(self) -> None:
         contract = self.write_contract(status="completed")
@@ -1011,6 +2944,49 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["conclude_count"], 1)
         self.assertIn("only one call per top-level DSH session", result["second_error"])
+
+    def test_durable_history_rejects_a_second_call_after_process_reconstruction(self) -> None:
+        marker = self.workspace / "bridge-launched"
+        contract = self.write_contract(status="completed", launch_marker=str(marker))
+
+        result, _ = self.invoke(
+            {"contract": str(contract)},
+            historical_call=True,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["conclude_count"], 0)
+        self.assertIn("only one call per top-level DSH session", result["error"])
+        self.assertFalse(marker.exists(), "second durable call reached the bridge")
+
+    def test_fresh_top_level_session_can_resume_one_exact_run_directory(self) -> None:
+        contract = self.write_contract(status="completed")
+        run_dir = self.workspace / ".kersor" / "session" / "autonomous-runs" / "run-1"
+        run_dir.mkdir(parents=True)
+        physical_run_dir = run_dir.resolve()
+
+        result, _ = self.invoke({
+            "contract": str(contract),
+            "run_dir": str(physical_run_dir),
+            "resume": True,
+        })
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["conclude_count"], 1)
+        self.assertEqual(
+            result["value"]["argv"],
+            [
+                "evolve",
+                "--host-execution",
+                "--contract",
+                str(contract.resolve()),
+                "--expected-contract-sha256",
+                hashlib.sha256(contract.read_bytes()).hexdigest(),
+                "--run-dir",
+                str(physical_run_dir),
+                "--resume",
+            ],
+        )
 
     def test_failed_call_also_consumes_the_top_level_session(self) -> None:
         contract = self.write_contract(status="cancelled", exit=2)

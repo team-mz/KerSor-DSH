@@ -46,7 +46,7 @@ import { createIssue, issueFromError, mergeIssue } from "./diagnostics.js";
 import { readCallDetail } from "./detail.js";
 import { applyWorkflowResult, createRunView, foldEvent } from "./fold.js";
 import { readWorkflowResult } from "./result.js";
-import { scanRoots } from "./scanner.js";
+import { scannedRunSummaryRevision, scanRoots } from "./scanner.js";
 import { EventsTailer } from "./tailer.js";
 export { EventsTailer } from "./tailer.js";
 export { DEFAULT_KERSOR_ROOTS, scanRoots } from "./scanner.js";
@@ -114,8 +114,10 @@ let KersorViewerService = (() => {
         /** Start discovery and tailing under the plugin's fiber once ready. */
         *[Service.init]() {
             yield () => {
-                for (const tracked of this.tracked.values())
+                for (const tracked of this.tracked.values()) {
+                    tracked.generation += 1;
                     tracked.tailer?.stop();
+                }
                 this.tracked.clear();
                 if (this.scanTimer !== undefined)
                     clearInterval(this.scanTimer);
@@ -165,7 +167,11 @@ let KersorViewerService = (() => {
             const tracked = this.tracked.get(runDir);
             if (tracked === undefined)
                 return undefined;
+            const generation = tracked.generation;
             const result = tracked.view.result ?? await readWorkflowResult(runDir);
+            if (tracked.generation !== generation || this.tracked.get(runDir) !== tracked) {
+                return this.tracked.get(runDir)?.view;
+            }
             if (result !== undefined)
                 applyWorkflowResult(tracked.view, result);
             return tracked.view;
@@ -262,6 +268,7 @@ let KersorViewerService = (() => {
             for (const [runDir, tracked] of this.tracked) {
                 if (byRunDir.has(runDir))
                     continue;
+                tracked.generation += 1;
                 tracked.tailer?.stop();
                 this.tracked.delete(runDir);
             }
@@ -271,24 +278,19 @@ let KersorViewerService = (() => {
                 if (existing !== undefined) {
                     if (issue !== undefined)
                         this.recordRunIssue(existing, issue);
-                    if (existing.ref.discovery !== ref.discovery) {
-                        if (existing.ref.discovery !== 'active' && ref.discovery === 'active')
-                            continue;
+                    const nextSummaryRevision = scannedRunSummaryRevision(ref);
+                    const lifecycleChanged = existing.ref.discovery !== ref.discovery;
+                    const summaryChanged = existing.summaryRevision !== nextSummaryRevision;
+                    if (existing.ref.discovery !== 'active' && ref.discovery === 'active')
+                        continue;
+                    if (ref.discovery !== 'active' && (lifecycleChanged || summaryChanged)) {
+                        await this.rebackfillTerminated(existing, ref, issue);
+                        continue;
+                    }
+                    if (lifecycleChanged) {
                         existing.ref = ref;
-                        if (ref.discovery !== 'active') {
-                            existing.tailer?.stop();
-                            existing.tailer = undefined;
-                            existing.view.status = terminalStatus(ref);
-                            existing.observation = {
-                                ...existing.observation,
-                                state: existing.observation.lastIssue === undefined ? 'complete' : 'degraded',
-                            };
-                            this.publishRun(existing.view);
-                            void this.loadRunResult(existing);
-                        }
-                        else {
-                            this.attachTailer(existing);
-                        }
+                        existing.summaryRevision = nextSummaryRevision;
+                        this.attachTailer(existing);
                     }
                     if (existing.view.result === undefined && ref.discovery !== 'active')
                         void this.loadRunResult(existing);
@@ -296,6 +298,8 @@ let KersorViewerService = (() => {
                 }
                 const tracked = {
                     ref,
+                    summaryRevision: scannedRunSummaryRevision(ref),
+                    generation: 0,
                     view: createRunView(ref.runId, ref.runDir, ref.sessionDir),
                     tailer: undefined,
                     observation: {
@@ -315,6 +319,24 @@ let KersorViewerService = (() => {
                     void this.backfillTerminated(tracked);
             }
             this.publishSnapshot();
+        }
+        async rebackfillTerminated(tracked, ref, issue) {
+            tracked.tailer?.stop();
+            tracked.tailer = undefined;
+            tracked.generation += 1;
+            tracked.ref = ref;
+            tracked.summaryRevision = scannedRunSummaryRevision(ref);
+            tracked.view = createRunView(ref.runId, ref.runDir, ref.sessionDir);
+            tracked.observation = {
+                runDir: ref.runDir,
+                mode: 'backfill',
+                state: issue === undefined ? 'waiting' : 'degraded',
+                byteOffset: 0,
+                linesRead: 0,
+                linesRejected: 0,
+                ...(issue === undefined ? {} : { lastIssue: issue }),
+            };
+            await this.backfillTerminated(tracked);
         }
         /** Merge managed Workspaces with durable Session cwd values, retaining the last good durable list on failure. */
         async discoverWorkspaceRoots() {
@@ -343,11 +365,14 @@ let KersorViewerService = (() => {
         }
         async backfillTerminated(tracked) {
             const { ref, view } = tracked;
+            const generation = tracked.generation;
             let text;
             try {
                 text = await (await import('node:fs/promises')).readFile(`${ref.runDir}/.runtime/events.jsonl`, 'utf8');
             }
             catch (error) {
+                if (tracked.generation !== generation)
+                    return;
                 view.status = terminalStatus(ref);
                 this.recordRunIssue(tracked, issueFromError('backfill_read', error));
                 tracked.observation = { ...tracked.observation, state: 'failed' };
@@ -357,6 +382,8 @@ let KersorViewerService = (() => {
                 }
                 return;
             }
+            if (tracked.generation !== generation)
+                return;
             for (const line of text.split('\n')) {
                 if (line.length === 0)
                     continue;
@@ -367,9 +394,10 @@ let KersorViewerService = (() => {
                 };
                 this.foldLine(tracked, line);
             }
-            if (view.status !== 'completed' && view.status !== 'failed')
-                view.status = terminalStatus(ref);
+            view.status = terminalStatus(ref);
             const result = await readWorkflowResult(ref.runDir);
+            if (tracked.generation !== generation)
+                return;
             if (result !== undefined)
                 applyWorkflowResult(view, result);
             tracked.observation = {
@@ -386,7 +414,10 @@ let KersorViewerService = (() => {
             if (tracked.tailer !== undefined)
                 return;
             const { ref, view } = tracked;
+            const generation = tracked.generation;
             const tailer = new EventsTailer(`${ref.runDir}/.runtime/events.jsonl`, (lines) => {
+                if (tracked.generation !== generation)
+                    return;
                 for (const line of lines)
                     this.foldLine(tracked, line);
                 tracked.observation = {
@@ -407,10 +438,12 @@ let KersorViewerService = (() => {
                     void this.loadRunResult(tracked);
                 }
             }, () => {
-                if (tracked.tailer === tailer)
+                if (tracked.generation === generation && tracked.tailer === tailer)
                     tracked.tailer = undefined;
             }, {
                 onObservation: (observation) => {
+                    if (tracked.generation !== generation)
+                        return;
                     const previousFingerprint = observationFingerprint(tracked.observation);
                     const currentIssue = tracked.observation.lastIssue;
                     const tailerIssue = observation.lastIssue;
@@ -447,8 +480,10 @@ let KersorViewerService = (() => {
             }
         }
         async loadRunResult(tracked) {
+            const generation = tracked.generation;
             const result = await readWorkflowResult(tracked.ref.runDir);
-            if (result === undefined || this.tracked.get(tracked.ref.runDir) !== tracked)
+            if (result === undefined || tracked.generation !== generation
+                || this.tracked.get(tracked.ref.runDir) !== tracked)
                 return;
             applyWorkflowResult(tracked.view, result);
             this.publishRun(tracked.view);
@@ -515,8 +550,11 @@ function rank(ref) {
         return 1;
     return 0;
 }
+/** Reapply summary-derived display status so terminal events cannot overwrite waiting or failed. */
 function terminalStatus(ref) {
-    return ref.discovery === 'failed' ? 'failed' : 'completed';
+    if (ref.discovery === 'failed')
+        return 'failed';
+    return ref.discovery === 'waiting' ? 'waiting' : 'completed';
 }
 function observationFingerprint(observation) {
     const issue = observation.lastIssue;

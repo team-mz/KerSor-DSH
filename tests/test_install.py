@@ -410,7 +410,7 @@ class InstallTests(unittest.TestCase):
             },
         ]
 
-    def test_generic_host_evaluator_has_one_sealed_candidate_call_surface(
+    def test_generic_host_evaluator_has_a_sealed_candidate_call_surface(
         self,
     ) -> None:
         capabilities = self.candidate_verifier_capabilities()
@@ -420,11 +420,15 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(
             BRIDGE.mission_needs_write({"capabilities": without_output_limit})
         )
+        without_timeout = json.loads(json.dumps(capabilities))
+        without_timeout[1]["execution"]["request"].pop("timeout_seconds")
+        self.assertTrue(
+            BRIDGE.mission_needs_write({"capabilities": without_timeout})
+        )
 
         standalone = json.loads(json.dumps(capabilities))
         standalone[0].pop("candidate_verifier")
-        with self.assertRaisesRegex(RuntimeError, "exactly one"):
-            BRIDGE.mission_needs_write({"capabilities": standalone})
+        self.assertTrue(BRIDGE.mission_needs_write({"capabilities": standalone}))
 
         duplicate = json.loads(json.dumps(capabilities))
         duplicate.insert(1, {
@@ -433,8 +437,7 @@ class InstallTests(unittest.TestCase):
             "transaction_artifacts": ["other.py"],
             "candidate_verifier": "verify",
         })
-        with self.assertRaisesRegex(RuntimeError, "exactly one"):
-            BRIDGE.mission_needs_write({"capabilities": duplicate})
+        self.assertTrue(BRIDGE.mission_needs_write({"capabilities": duplicate}))
 
         wrong_kind = json.loads(json.dumps(capabilities))
         wrong_kind[0]["candidate_verifier"] = "another_agent"
@@ -450,7 +453,6 @@ class InstallTests(unittest.TestCase):
             (("request", "network_policy"), "allowed", "network_policy=denied"),
             (("request", "output_policy"), None, "output_policy=sealed"),
             (("request", "output_policy"), "raw", "output_policy=sealed"),
-            (("request", "timeout_seconds"), None, "timeout_seconds"),
             (("request", "timeout_seconds"), 0, "timeout_seconds"),
             (("request", "timeout_seconds"), 121, "timeout_seconds"),
             (("request", "timeout_seconds"), True, "timeout_seconds"),
@@ -1672,9 +1674,9 @@ class InstallTests(unittest.TestCase):
         self.assertIn("Never translate a generic contract", skill)
         self.assertIn("never call `kersor_start` for it", skill)
         self.assertIn("the user must not prepare Session JSON by hand", skill)
-        self.assertIn("first DSH-native Mission slice", skill)
-        self.assertIn("`side_effect=none|read`", skill)
-        self.assertIn("no Host evaluator or", skill)
+        self.assertIn("one-file write capabilities", skill)
+        self.assertIn("live Core transaction", skill)
+        self.assertIn("non-retryable, sealed, read-only `command-v1`", skill)
         self.assertIn("`deepseek-official/deepseek-v4-flash`", skill)
         self.assertIn("outside the workspace", skill)
         self.assertIn("external product-stack route", skill)

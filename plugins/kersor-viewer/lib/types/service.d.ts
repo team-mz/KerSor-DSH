@@ -89,6 +89,7 @@ export declare class KersorViewerService extends TypertRemoteService {
     /** Rescan roots once; concurrent callers share the in-flight scan. */
     rescan(): Promise<void>;
     private performRescan;
+    private rebackfillTerminated;
     /** Merge managed Workspaces with durable Session cwd values, retaining the last good durable list on failure. */
     private discoverWorkspaceRoots;
     private backfillTerminated;
