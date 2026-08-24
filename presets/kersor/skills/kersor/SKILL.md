@@ -119,10 +119,12 @@ not invent permissions, verifier commands, output names, or Completion facts.
 For an external runtime, bind acceptance to an existing workspace-owned
 deterministic command through a Host evaluator; declare `side_effect: "read"`, use `command-v1` with
 `filesystem_policy: "read-only"`, `network_policy: "denied"`,
-`output_policy: "sealed"`, `timeout_seconds` in `(0,120]`, an optional
-`max_output_bytes` in `[1,4194304]`, and never use `materialize`. Every Host
-evaluator must be referenced by exactly one agent capability's
-`candidate_verifier`; standalone and shared evaluators are forbidden. Its fact
+`output_policy: "sealed"`, an optional `timeout_seconds` in `(0,120]`, an optional
+`max_output_bytes` in `[1,4194304]`, and never use `materialize`. Core may execute a
+safe standalone Host evaluator directly. When an agent capability names an evaluator
+through `candidate_verifier`, that evaluator additionally must be non-retryable and
+its exact Host-owned outputs and full gate must bind the candidate transaction;
+several candidate capabilities may share one evaluator. Its fact
 projections may read only `passed`, `exit_code`, `timed_out`, or
 `artifact_set_sha256`, never raw stdout/stderr or parsed output. This policy is a
 real fail-closed Host filesystem boundary for the evaluator and all descendants,
@@ -149,19 +151,23 @@ SHA-256 again at launch. A completed DSH turn is not Mission success: only a
 Host-owned `kersor_evolve` status of `completed` plus the matching Core result
 may be reported as successful.
 
-The first DSH-native Mission slice accepts only `runtime=dsh` agent capabilities
-with `side_effect=none|read`, no transaction artifacts, and no Host evaluator or
-`command-v1` execution. It binds the admitted contract bytes and runtime before
-the bridge starts, then routes every activation through the Host-owned AF_UNIX
-endpoint to a fresh DSH `spawn` child pinned to
-`deepseek-official/deepseek-v4-flash`. The child receives only
-`read`/`glob`/`grep` plus schema-scoped `structured_output`; a synchronous guard
-also denies Bash, edits, writes, subagents, Workflows, recursive KerSor, paths
-outside the workspace, and symlink escapes. Missing usage, route drift,
-disconnect, or cancellation fails closed and disposes the child. Do not put a
-write capability, Host verifier, or arbitrary command into `runtime=dsh`; use an
-implemented external runtime until a later transaction slice opens that
-authority.
+The DSH-native Mission route accepts `runtime=dsh` read-only capabilities and
+one-file write capabilities admitted by the Mission authority and backed by a
+live Core transaction. Planner and read-only activations receive only
+`read`/`glob`/`grep`; an Execute worker with a bound transaction additionally
+receives `edit`/`write`. A synchronous guard permits those mutation tools only
+for the exact declared artifact, so the worker may revise that file repeatedly
+without gaining arbitrary workspace write access. It denies aliases, links,
+KerSor control trees, the frozen Mission/runtime config/Session, Bash,
+subagents, Workflows, recursive KerSor, and paths outside the workspace. A
+candidate verifier must be a non-retryable, sealed, read-only `command-v1` Host
+evaluator whose full request, rollback policy, and candidate gate match the
+frozen Mission; Core runs it while the snapshot is live and commits only an
+accepted candidate. Every activation still uses the owner-only AF_UNIX endpoint
+and a fresh DSH `spawn` child pinned to `deepseek-official/deepseek-v4-flash`.
+Missing usage, route drift, disconnect, cancellation, or an unsafe transaction
+fails closed and disposes the child. Use an external runtime for multi-file or
+otherwise unsupported mutation contracts.
 
 For `runtime=claude`, the bridge removes ambient `CLAUDE*`, `ANTHROPIC*`, and
 KerSor routing controls and publishes only the Claude-compatible executable and

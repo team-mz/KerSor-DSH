@@ -6,6 +6,7 @@ import json
 import hashlib
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -207,6 +208,10 @@ const ctx = {
         output_schema: value.outputSchema,
         prompt: value.prompt,
       })
+      if (request.swap_workspace_to !== undefined) {
+        fs.unlinkSync(request.cwd)
+        fs.symlinkSync(request.swap_workspace_to, request.cwd, 'dir')
+      }
       for (const listener of listeners.get('agent/created') ?? []) listener({agent: child})
       if (typeof telemetry.guard !== 'function') throw new Error('child guard was not installed during agent/created')
       const guardProbes = {
@@ -214,8 +219,24 @@ const ctx = {
         glob: {name: 'glob', arguments: {pattern: '*.json'}},
         grep: {name: 'grep', arguments: {pattern: 'runtime'}},
         structured_output: {name: 'structured_output', arguments: {observed: true}},
-        edit: {name: 'edit', arguments: {}},
-        write: {name: 'write', arguments: {}},
+        edit: {name: 'edit', arguments: request.transaction_artifact === undefined
+          ? {}
+          : {file_path: request.transaction_artifact}},
+        write: {name: 'write', arguments: request.transaction_artifact === undefined
+          ? {}
+          : {file_path: request.transaction_artifact}},
+        edit_undeclared: {name: 'edit', arguments: request.undeclared_artifact === undefined
+          ? {}
+          : {file_path: request.undeclared_artifact}},
+        write_undeclared: {name: 'write', arguments: request.undeclared_artifact === undefined
+          ? {}
+          : {file_path: request.undeclared_artifact}},
+        edit_alias: {name: 'edit', arguments: request.transaction_alias === undefined
+          ? {}
+          : {file_path: request.transaction_alias}},
+        write_alias: {name: 'write', arguments: request.transaction_alias === undefined
+          ? {}
+          : {file_path: request.transaction_alias}},
         bash: {name: 'bash', arguments: {}},
         subagent: {name: 'subagent', arguments: {}},
         workflow: {name: 'workflow', arguments: {}},
@@ -461,7 +482,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             "    'label': contract_value.get('activation_label', 'plan-revision-1-attempt-1'),\n"
             "    'prompt': 'Inspect the workspace without mutation.',\n"
             "    'schema': {'type': 'object', 'properties': {'observed': {'type': 'boolean'}}, 'required': ['observed']},\n"
-            "    'options': {},\n"
+            "    'options': contract_value.get('activation_options', {}),\n"
             f"    'project_root': {str(self.workspace)!r},\n"
             "  },\n"
             "}\n"
@@ -542,10 +563,15 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         abort_after_ms: int | None = None,
         child_mode: str | None = None,
         guard_probe: bool = False,
+        transaction_artifact: Path | None = None,
+        undeclared_artifact: Path | None = None,
+        transaction_alias: str | None = None,
+        cwd: Path | None = None,
+        swap_workspace_to: Path | None = None,
     ) -> dict[str, object]:
         request: dict[str, object] = {
             "module": str(self.module),
-            "cwd": str(self.workspace),
+            "cwd": str(self.workspace if cwd is None else cwd),
             "args": {"contract": str(contract)},
             "outside_file": str(self.outside_secret),
             "outside_directory": str(self.home),
@@ -557,6 +583,14 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             request["child_mode"] = child_mode
         if guard_probe:
             request["guard_probe"] = True
+        if transaction_artifact is not None:
+            request["transaction_artifact"] = str(transaction_artifact)
+        if undeclared_artifact is not None:
+            request["undeclared_artifact"] = str(undeclared_artifact)
+        if transaction_alias is not None:
+            request["transaction_alias"] = transaction_alias
+        if swap_workspace_to is not None:
+            request["swap_workspace_to"] = str(swap_workspace_to)
         completed = subprocess.run(
             [NODE, "--input-type=module", "-e", DSH_NODE_DRIVER],
             input=json.dumps(request),
@@ -811,7 +845,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self.assertEqual(result["telemetry"].get("conclude_count", 0), 0)
         self.assertLess(time.monotonic() - started, 4)
 
-    def test_public_tool_rejects_dsh_mutation_before_child_start(self) -> None:
+    def test_public_tool_rejects_dsh_write_without_transaction_artifact(self) -> None:
         contract = self.write_contract(
             contract_version="kersor-mission-v1",
             workspace=str(self.workspace),
@@ -828,7 +862,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             capabilities=[{
                 "name": "mutate",
                 "side_effect": "write",
-                "transaction_artifacts": ["candidate.py"],
+                "transaction_artifacts": [],
             }],
         )
 
@@ -837,11 +871,692 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["value"]["status"], "failed")
         self.assertIn(
-            "read-only Mission capabilities only",
+            "write capability must declare",
             result["value"]["error"],
         )
         self.assertEqual(result["telemetry"]["conclude_count"], 1)
         self.assertEqual(result["telemetry"]["starts"], [])
+
+    def test_public_host_allows_only_declared_dsh_transaction_artifact_tools(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        undeclared = self.workspace / "undeclared.py"
+        undeclared.write_text("protected = True\n", encoding="utf-8")
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "write-transaction"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_candidate",
+            activation_options={
+                "transaction": {
+                    "artifacts": [candidate.name],
+                    "rollback_on_noncompleted_status": True,
+                },
+            },
+            mission={
+                "mission_id": "write-transaction",
+                "goal": "mutate one declared candidate",
+                "authority": ["write candidate.py"],
+                "required_artifacts": ["candidate_source"],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": [candidate.name],
+            }],
+        )
+
+        result = self.invoke_dsh_native(
+            contract,
+            transaction_artifact=candidate,
+            undeclared_artifact=undeclared,
+            transaction_alias=f"{self.workspace}/./{candidate.name}",
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "completed", result)
+        self.assertEqual(len(result["telemetry"]["starts"]), 1)
+        self.assertEqual(
+            result["telemetry"]["starts"][0]["tool_filter"],
+            {"allow": ["read", "glob", "grep", "edit", "write"]},
+        )
+        for allowed in ("read", "glob", "grep", "structured_output", "edit", "write"):
+            self.assertIsNone(result["telemetry"]["guards"][allowed])
+        for forbidden in ("edit_undeclared", "write_undeclared", "edit_alias", "write_alias"):
+            self.assertIn("declared transaction artifact", result["telemetry"]["guards"][forbidden])
+        self.assertEqual(candidate.read_text(encoding="utf-8"), "baseline = True\n")
+        self.assertEqual(undeclared.read_text(encoding="utf-8"), "protected = True\n")
+
+    def test_public_host_rechecks_the_actual_write_path_after_cwd_alias_drift(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        workspace_alias = self.root / "workspace-alias"
+        workspace_alias.symlink_to(self.workspace, target_is_directory=True)
+        alternate = self.root / "alternate-workspace"
+        alternate.mkdir()
+        alternate_candidate = alternate / candidate.name
+        alternate_candidate.write_text("must stay unchanged\n", encoding="utf-8")
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "cwd-alias-drift"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_candidate",
+            activation_options={"transaction": {
+                "artifacts": [candidate.name],
+                "rollback_on_noncompleted_status": True,
+            }},
+            mission={
+                "mission_id": "cwd-alias-drift",
+                "goal": "reject a changed child cwd alias",
+                "authority": ["write candidate"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": [candidate.name],
+            }],
+        )
+
+        result = self.invoke_dsh_native(
+            contract,
+            transaction_artifact=workspace_alias / candidate.name,
+            cwd=workspace_alias,
+            swap_workspace_to=alternate,
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "completed", result)
+        for tool in ("edit", "write"):
+            self.assertIn("identity is unsafe", result["telemetry"]["guards"][tool])
+        self.assertEqual(candidate.read_text(encoding="utf-8"), "baseline = True\n")
+        self.assertEqual(
+            alternate_candidate.read_text(encoding="utf-8"),
+            "must stay unchanged\n",
+        )
+
+    def test_public_host_rejects_transaction_on_planner_activation(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "planner-transaction"),
+            runtime="dsh",
+            activation_phase="Plan revision 1",
+            activation_label="plan-revision-1-attempt-1",
+            activation_options={
+                "transaction": {
+                    "artifacts": [candidate.name],
+                    "rollback_on_noncompleted_status": True,
+                },
+            },
+            mission={
+                "mission_id": "planner-transaction",
+                "goal": "reject planner mutation",
+                "authority": ["write candidate.py"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": [candidate.name],
+            }],
+        )
+
+        result = self.invoke_dsh_native(contract)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("Execute revision worker", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(candidate.read_text(encoding="utf-8"), "baseline = True\n")
+
+    def test_public_host_rejects_symlink_transaction_artifact_before_child_start(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.symlink_to(self.outside_secret)
+        original = self.outside_secret.read_bytes()
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "symlink-transaction"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_candidate",
+            activation_options={"transaction": {
+                "artifacts": [candidate.name],
+                "rollback_on_noncompleted_status": True,
+            }},
+            mission={
+                "mission_id": "symlink-transaction",
+                "goal": "reject aliased mutation",
+                "authority": ["write candidate.py"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": [candidate.name],
+            }],
+        )
+
+        result = self.invoke_dsh_native(contract)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("regular single-link file", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(self.outside_secret.read_bytes(), original)
+
+    def test_public_host_rejects_hardlink_transaction_artifact_before_child_start(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        os.link(self.outside_secret, candidate)
+        original = self.outside_secret.read_bytes()
+        original_mode = stat.S_IMODE(self.outside_secret.stat().st_mode)
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "hardlink-transaction"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_candidate",
+            activation_options={"transaction": {
+                "artifacts": [candidate.name],
+                "rollback_on_noncompleted_status": True,
+            }},
+            mission={
+                "mission_id": "hardlink-transaction",
+                "goal": "reject shared-inode mutation",
+                "authority": ["write candidate.py"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": [candidate.name],
+            }],
+        )
+
+        result = self.invoke_dsh_native(contract)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("regular single-link file", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(self.outside_secret.read_bytes(), original)
+        self.assertEqual(stat.S_IMODE(self.outside_secret.stat().st_mode), original_mode)
+
+    def test_public_host_accepts_bound_candidate_evaluator_transaction(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        immutable_input = self.workspace / "inputs.json"
+        immutable_input.write_text("{}\n", encoding="utf-8")
+        evaluator_request = {
+            "protocol": "command-v1",
+            "argv": ["python3", "-B", "verify.py"],
+            "cwd": ".",
+            "artifacts": [candidate.name, immutable_input.name],
+            "filesystem_policy": "read-only",
+            "network_policy": "denied",
+            "output_policy": "sealed",
+            "timeout_seconds": 5,
+        }
+        fact_projections = [{
+            "output_name": "verified",
+            "result_path": "passed",
+        }]
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "candidate-gate"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_candidate",
+            activation_options={
+                "transaction": {
+                    "artifacts": [candidate.name],
+                    "rollback_on_noncompleted_status": True,
+                    "candidate_gate": {
+                        "verifier": "verify_candidate",
+                        "request": evaluator_request,
+                        "result_artifact": "measurement",
+                        "fact_projections": fact_projections,
+                    },
+                },
+            },
+            mission={
+                "mission_id": "candidate-gate",
+                "goal": "mutate and verify one candidate",
+                "authority": ["write candidate.py", "run registered verifier"],
+                "required_artifacts": ["candidate_summary", "measurement"],
+                "required_facts": {"verified": True},
+                "max_revisions": 1,
+            },
+            capabilities=[
+                {
+                    "name": "mutate",
+                    "side_effect": "write",
+                    "transaction_artifacts": [candidate.name],
+                    "candidate_verifier": "verify_candidate",
+                    "produces_artifacts": ["candidate_summary"],
+                    "produces_facts": [],
+                },
+                {
+                    "name": "repair",
+                    "side_effect": "write",
+                    "transaction_artifacts": [candidate.name],
+                    "candidate_verifier": "verify_candidate",
+                    "produces_artifacts": ["repair_summary"],
+                    "produces_facts": [],
+                },
+                {
+                    "name": "verify_candidate",
+                    "side_effect": "read",
+                    "produces_artifacts": ["measurement"],
+                    "produces_facts": ["verified"],
+                    "execution": {
+                        "kind": "host_evaluator",
+                        "retryable": False,
+                        "request": evaluator_request,
+                        "fact_projections": fact_projections,
+                    },
+                },
+            ],
+        )
+
+        result = self.invoke_dsh_native(contract, transaction_artifact=candidate)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "completed", result)
+        self.assertEqual(len(result["telemetry"]["starts"]), 1)
+        self.assertEqual(
+            result["telemetry"]["starts"][0]["tool_filter"],
+            {"allow": ["read", "glob", "grep", "edit", "write"]},
+        )
+
+    def test_public_host_rejects_candidate_gate_drift_before_child_start(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        evaluator_request = {
+            "protocol": "command-v1",
+            "argv": ["python3", "-B", "verify.py"],
+            "cwd": ".",
+            "artifacts": [candidate.name],
+            "filesystem_policy": "read-only",
+            "network_policy": "denied",
+            "output_policy": "sealed",
+            "timeout_seconds": 5,
+        }
+        fact_projections = [{"output_name": "verified", "result_path": "passed"}]
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "candidate-gate-drift"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_candidate",
+            activation_options={
+                "transaction": {
+                    "artifacts": [candidate.name],
+                    "rollback_on_noncompleted_status": True,
+                    "candidate_gate": {
+                        "verifier": "verify_candidate",
+                        "request": {**evaluator_request, "argv": ["/bin/cat", "/etc/passwd"]},
+                        "result_artifact": "measurement",
+                        "fact_projections": fact_projections,
+                    },
+                },
+            },
+            mission={
+                "mission_id": "candidate-gate-drift",
+                "goal": "reject activation drift",
+                "authority": ["write candidate.py", "run registered verifier"],
+                "required_artifacts": ["candidate_summary", "measurement"],
+                "required_facts": {"verified": True},
+                "max_revisions": 1,
+            },
+            capabilities=[
+                {
+                    "name": "mutate",
+                    "side_effect": "write",
+                    "transaction_artifacts": [candidate.name],
+                    "candidate_verifier": "verify_candidate",
+                    "produces_artifacts": ["candidate_summary"],
+                    "produces_facts": [],
+                },
+                {
+                    "name": "verify_candidate",
+                    "side_effect": "read",
+                    "produces_artifacts": ["measurement"],
+                    "produces_facts": ["verified"],
+                    "execution": {
+                        "kind": "host_evaluator",
+                        "retryable": False,
+                        "request": evaluator_request,
+                        "fact_projections": fact_projections,
+                    },
+                },
+            ],
+        )
+
+        result = self.invoke_dsh_native(contract, transaction_artifact=candidate)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("candidate gate does not match", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(candidate.read_text(encoding="utf-8"), "baseline = True\n")
+
+    def test_public_host_rejects_transaction_rollback_policy_drift(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "rollback-drift"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_candidate",
+            activation_options={
+                "transaction": {
+                    "artifacts": [candidate.name],
+                    "rollback_on_noncompleted_status": False,
+                },
+            },
+            mission={
+                "mission_id": "rollback-drift",
+                "goal": "reject rollback policy drift",
+                "authority": ["write candidate"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "required_authorities": ["write candidate"],
+                "side_effect": "write",
+                "transaction_artifacts": [candidate.name],
+            }],
+        )
+
+        result = self.invoke_dsh_native(contract, transaction_artifact=candidate)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("rollback policy", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(candidate.read_text(encoding="utf-8"), "baseline = True\n")
+
+    def test_public_host_rejects_unadmitted_transaction_capability(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "authority-drift"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_candidate",
+            activation_options={
+                "transaction": {
+                    "artifacts": [candidate.name],
+                    "rollback_on_noncompleted_status": True,
+                },
+            },
+            mission={
+                "mission_id": "authority-drift",
+                "goal": "reject unadmitted mutation",
+                "authority": ["read workspace"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[
+                {
+                    "name": "inspect",
+                    "required_authorities": ["read workspace"],
+                    "side_effect": "read",
+                },
+                {
+                    "name": "mutate",
+                    "required_authorities": ["write candidate"],
+                    "side_effect": "write",
+                    "transaction_artifacts": [candidate.name],
+                },
+            ],
+        )
+
+        result = self.invoke_dsh_native(contract, transaction_artifact=candidate)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("does not match one Mission capability", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(candidate.read_text(encoding="utf-8"), "baseline = True\n")
+
+    def test_public_host_rejects_runtime_control_transaction_artifact(self) -> None:
+        self.prepare_dsh_native_core()
+        control = self.workspace / ".kersor-autonomous" / "control.json"
+        control.parent.mkdir()
+        control.write_text("{}\n", encoding="utf-8")
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "control-session"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_control",
+            activation_options={"transaction": {
+                "artifacts": [".kersor-autonomous/control.json"],
+                "rollback_on_noncompleted_status": True,
+            }},
+            mission={
+                "mission_id": "runtime-control-transaction",
+                "goal": "reject runtime control mutation",
+                "authority": ["write runtime control"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": [".kersor-autonomous/control.json"],
+            }],
+        )
+
+        result = self.invoke_dsh_native(contract, transaction_artifact=control)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("runtime control", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(control.read_text(encoding="utf-8"), "{}\n")
+
+    def test_public_host_rejects_runtime_config_as_transaction_artifact(self) -> None:
+        self.prepare_dsh_native_core()
+        runtime_config = self.workspace / "runtime-dsh.json"
+        runtime_config.write_bytes(
+            (self.core / "config" / "runtime-dsh-autonomous.json").read_bytes()
+        )
+        original = runtime_config.read_bytes()
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "runtime-config-control"),
+            runtime="dsh",
+            runtime_config=runtime_config.name,
+            activation_phase="Execute revision 1",
+            activation_label="mutate_runtime_config",
+            activation_options={"transaction": {
+                "artifacts": [runtime_config.name],
+                "rollback_on_noncompleted_status": True,
+            }},
+            mission={
+                "mission_id": "runtime-config-control",
+                "goal": "reject runtime config mutation",
+                "authority": ["write runtime config"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": [runtime_config.name],
+            }],
+        )
+
+        result = self.invoke_dsh_native(contract, transaction_artifact=runtime_config)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("runtime config", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(runtime_config.read_bytes(), original)
+
+    def test_public_host_rejects_custom_mission_session_as_transaction_artifact(self) -> None:
+        self.prepare_dsh_native_core()
+        session = self.workspace / "custom-session"
+        session_config = session / "session-config.json"
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(session),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_session",
+            activation_options={"transaction": {
+                "artifacts": ["custom-session/session-config.json"],
+                "rollback_on_noncompleted_status": True,
+            }},
+            mission={
+                "mission_id": "custom-session-control",
+                "goal": "reject custom Session mutation",
+                "authority": ["write Session config"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": ["custom-session/session-config.json"],
+            }],
+        )
+
+        result = self.invoke_dsh_native(contract, transaction_artifact=session_config)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("Mission Session", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertTrue(session_config.is_file())
+
+    def test_public_host_rejects_symlinked_custom_session_transaction_alias(self) -> None:
+        self.prepare_dsh_native_core()
+        session_alias = self.workspace / "custom-link-session"
+        real_session = self.workspace / "custom-real-session"
+        session_alias.symlink_to(real_session, target_is_directory=True)
+        real_session_config = real_session / "session-config.json"
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(session_alias),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="mutate_session_alias",
+            activation_options={"transaction": {
+                "artifacts": ["custom-real-session/session-config.json"],
+                "rollback_on_noncompleted_status": True,
+            }},
+            mission={
+                "mission_id": "custom-session-alias",
+                "goal": "reject Session alias mutation",
+                "authority": ["write Session config"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": ["custom-real-session/session-config.json"],
+            }],
+        )
+
+        result = self.invoke_dsh_native(contract, transaction_artifact=real_session_config)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("Session path must not use symlinks", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+
+    def test_public_host_rejects_mission_contract_as_transaction_artifact(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.workspace / "mission-owned-control.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-mission-v1",
+                "workspace": str(self.workspace),
+                "session": str(self.workspace / ".kersor-autonomous" / "mission-control"),
+                "runtime": "dsh",
+                "activation_phase": "Execute revision 1",
+                "activation_label": "mutate_contract",
+                "activation_options": {
+                    "transaction": {
+                        "artifacts": [contract.name],
+                        "rollback_on_noncompleted_status": True,
+                    },
+                },
+                "mission": {
+                    "mission_id": "mission-control-transaction",
+                    "goal": "reject Mission mutation",
+                    "authority": ["write Mission contract"],
+                    "required_artifacts": [],
+                    "required_facts": {},
+                    "max_revisions": 1,
+                },
+                "capabilities": [{
+                    "name": "mutate",
+                    "side_effect": "write",
+                    "transaction_artifacts": [contract.name],
+                }],
+            }),
+            encoding="utf-8",
+        )
+        original = contract.read_bytes()
+
+        result = self.invoke_dsh_native(contract, transaction_artifact=contract)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("Mission contract", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(contract.read_bytes(), original)
 
     def test_core_disconnect_aborts_and_disposes_only_that_dsh_child(self) -> None:
         self.prepare_dsh_native_core()
@@ -932,12 +1647,61 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["value"]["status"], "failed")
         self.assertIn(
-            "rejects Host evaluator and command",
+            "Host evaluator has an invalid bounded output contract",
             result["value"]["error"],
         )
         self.assertEqual(result["telemetry"]["conclude_count"], 1)
         self.assertEqual(result["telemetry"]["starts"], [])
         self.assertNotIn("outside-secret-must-not-leak", json.dumps(result))
+
+    def test_public_tool_accepts_a_safe_standalone_host_evaluator_mission(self) -> None:
+        self.prepare_dsh_native_core()
+        immutable_input = self.workspace / "input.txt"
+        immutable_input.write_text("frozen\n", encoding="utf-8")
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "standalone-evaluator"),
+            runtime="dsh",
+            mission={
+                "mission_id": "standalone-evaluator",
+                "goal": "run one Core-owned read-only evaluator",
+                "authority": ["run registered verifier"],
+                "required_artifacts": ["measurement"],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "check",
+                "required_authorities": ["run registered verifier"],
+                "side_effect": "read",
+                "produces_artifacts": ["measurement"],
+                "produces_facts": [],
+                "execution": {
+                    "kind": "host_evaluator",
+                    "request": {
+                        "protocol": "command-v1",
+                        "argv": ["/usr/bin/true"],
+                        "cwd": ".",
+                        "artifacts": [],
+                        "filesystem_policy": "read-only",
+                        "network_policy": "denied",
+                        "output_policy": "sealed",
+                    },
+                    "fact_projections": [],
+                },
+            }],
+        )
+
+        result = self.invoke_dsh_native(contract)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "completed", result)
+        self.assertEqual(len(result["telemetry"]["starts"]), 1)
+        self.assertEqual(
+            result["telemetry"]["starts"][0]["tool_filter"],
+            {"allow": ["read", "glob", "grep"]},
+        )
 
     def test_calls_frozen_bridge_once_from_current_workspace_and_concludes(self) -> None:
         contract = self.write_contract(status="completed")

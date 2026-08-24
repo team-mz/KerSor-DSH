@@ -510,7 +510,7 @@ def mission_needs_write(value: dict[str, Any]) -> bool:
                     "DSH generic Host evaluators require output_policy=sealed"
                 )
             timeout_seconds = request.get("timeout_seconds")
-            if (
+            if timeout_seconds is not None and (
                 isinstance(timeout_seconds, bool)
                 or not isinstance(timeout_seconds, (int, float))
                 or not math.isfinite(float(timeout_seconds))
@@ -583,36 +583,7 @@ def mission_needs_write(value: dict[str, Any]) -> bool:
             raise RuntimeError(
                 "DSH agent candidate_verifier must reference a Host evaluator"
             )
-    for evaluator in host_evaluators:
-        if len(verifier_references.get(evaluator, [])) != 1:
-            raise RuntimeError(
-                "each DSH Host evaluator must be referenced by exactly one agent "
-                "candidate_verifier"
-            )
     return needs_write
-
-
-def validate_dsh_first_slice(value: dict[str, Any]) -> None:
-    """Reject mutation and Host command execution from the first DSH-native slice."""
-    capabilities = value.get("capabilities")
-    if not isinstance(capabilities, list):
-        raise RuntimeError("Mission capabilities must be an array")
-    for capability in capabilities:
-        if not isinstance(capability, dict):
-            raise RuntimeError("each Mission capability must be an object")
-        execution = capability.get("execution", {"kind": "agent"})
-        if not isinstance(execution, dict) or execution.get("kind", "agent") != "agent":
-            raise RuntimeError(
-                "runtime=dsh first slice rejects Host evaluator and command capabilities"
-            )
-        if capability.get("side_effect") not in ("none", "read"):
-            raise RuntimeError(
-                "runtime=dsh first slice supports read-only Mission capabilities only"
-            )
-        if capability.get("transaction_artifacts", []):
-            raise RuntimeError(
-                "runtime=dsh first slice supports read-only Mission capabilities only"
-            )
 
 
 def validated_mission_id(value: dict[str, Any]) -> str:
@@ -873,7 +844,7 @@ def validate_dsh_runtime_config(
     contract: Path,
     value: dict[str, Any],
 ) -> tuple[Path, str]:
-    """Bind the read-only DSH Host RPC broker and its pinned model route."""
+    """Bind the trusted DSH Host RPC broker and its pinned model route."""
     expected_config = (root / "config" / "runtime-dsh-autonomous.json").resolve()
     configured = value.get("runtime_config")
     config_path = (
@@ -1104,14 +1075,8 @@ def exec_evolve(root: Path, args: list[str]) -> None:
     needs_outer_workspace_write = version == "kersor-task-v1"
     if version == "kersor-mission-v1":
         mission_id = validated_mission_id(value)
-        if runtime == "dsh":
-            validate_dsh_first_slice(value)
         needs_write = mission_needs_write(value)
         if runtime == "dsh":
-            if needs_write:
-                raise RuntimeError(
-                    "runtime=dsh first slice supports read-only Mission capabilities only"
-                )
             _, runtime_config_sha256 = validate_dsh_runtime_config(
                 root,
                 contract,

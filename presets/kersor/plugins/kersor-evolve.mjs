@@ -3,7 +3,7 @@
 import { spawn } from 'node:child_process'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
-import { constants, realpathSync } from 'node:fs'
+import { constants, lstatSync, realpathSync } from 'node:fs'
 import { access, chmod, lstat, mkdtemp, readFile, realpath, rm, stat } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import path from 'node:path'
@@ -27,6 +27,7 @@ export const DSH_MODEL = 'deepseek-v4-flash'
 const DSH_RPC_SOCKET_ENV = 'KERSOR_DSH_RPC_SOCKET'
 const DSH_RPC_NONCE_ENV = 'KERSOR_DSH_RPC_NONCE'
 const DSH_READ_TOOLS = Object.freeze(['read', 'glob', 'grep'])
+const DSH_WRITE_TOOLS = Object.freeze(['edit', 'write'])
 const DSH_STRUCTURED_OUTPUT_TOOL = 'structured_output'
 const DSH_MAX_ACTIVATION_TIMEOUT_SECONDS = 900
 const MAX_RPC_CONNECTIONS = 64
@@ -318,7 +319,101 @@ function activationModelRole(value) {
   )
 }
 
-async function readOnlyActivation(value, workspace) {
+function sameStringSet(left, right) {
+  const sortedRight = [...right].sort()
+  return left.length === right.length && [...left].sort().every((value, index) => value === sortedRight[index])
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalJson)
+  if (!isRecord(value)) return value
+  return Object.fromEntries(
+    Object.keys(value).sort().map(key => [key, canonicalJson(value[key])]),
+  )
+}
+
+function sameJson(left, right) {
+  return JSON.stringify(canonicalJson(left)) === JSON.stringify(canonicalJson(right))
+}
+
+function safeTransactionArtifact(value) {
+  if (typeof value !== 'string' || !value || path.isAbsolute(value)) return false
+  const segments = value.split(/[\\/]+/u)
+  return !segments.some(segment => !segment || segment === '.' || segment === '..')
+}
+
+function runtimeControlArtifact(value) {
+  const [head] = value.split(/[\\/]+/u)
+  return ['.git', '.conformance', '.kersor', '.kersor-autonomous'].includes(head)
+}
+
+async function rejectSymlinkSegments(root, relative, label) {
+  let current = root
+  for (const segment of relative.split(path.sep)) {
+    current = path.join(current, segment)
+    try {
+      if ((await lstat(current)).isSymbolicLink()) {
+        throw new Error(`${label} path must not use symlinks`)
+      }
+    } catch (cause) {
+      if (cause?.code === 'ENOENT') return
+      throw cause
+    }
+  }
+}
+
+async function prepareTransactionArtifacts(
+  workspace,
+  artifacts,
+  protectedFiles = [],
+  protectedRoots = [],
+) {
+  const currentProtectedRoots = []
+  for (const root of protectedRoots) {
+    let metadata
+    let physical
+    try {
+      metadata = await lstat(root)
+      physical = await realpath(root)
+    } catch (cause) {
+      throw new Error('DSH Mission Session identity is unavailable during activation', {cause})
+    }
+    if (!metadata.isDirectory() || metadata.isSymbolicLink() || physical !== root) {
+      throw new Error('DSH Mission Session identity changed before activation')
+    }
+    currentProtectedRoots.push(root, physical)
+  }
+  const prepared = []
+  for (const artifact of artifacts) {
+    if (!safeTransactionArtifact(artifact)) {
+      throw new Error('DSH transaction artifacts must be canonical non-empty relative paths')
+    }
+    if (runtimeControlArtifact(artifact)) {
+      throw new Error('DSH transaction artifact must not target KerSor runtime control paths')
+    }
+    const absolute = path.resolve(workspace, artifact)
+    if (!inside(workspace, absolute)) throw new Error('DSH transaction artifact escapes the workspace')
+    const metadata = await lstat(absolute)
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1) {
+      throw new Error('DSH transaction artifact must be one regular single-link file')
+    }
+    const physical = await realpath(absolute)
+    if (physical !== absolute || !inside(workspace, physical)) {
+      throw new Error('DSH transaction artifact must not use a symlink or path alias')
+    }
+    const protectedFile = protectedFiles.find(item => item.path === physical)
+    if (protectedFile !== undefined) {
+      throw new Error(`DSH transaction artifact must not target the frozen ${protectedFile.label}`)
+    }
+    if (currentProtectedRoots.some(root => inside(root, absolute) || inside(root, physical))) {
+      throw new Error('DSH transaction artifact must not target the Mission Session')
+    }
+    prepared.push({relative: artifact, absolute, physical})
+  }
+  return prepared
+}
+
+async function readOnlyActivation(value, workspace, missionPolicy) {
   if (!isRecord(value)) throw new Error('DSH RPC activation must be an object')
   if (value.contract_version !== 'akw-js-runtime-v1') {
     throw new Error('DSH RPC activation contract_version is invalid')
@@ -340,9 +435,6 @@ async function readOnlyActivation(value, workspace) {
   if (!isRecord(value.options)) {
     throw new Error('DSH RPC activation options must be an object')
   }
-  if (value.options?.transaction !== undefined && value.options.transaction !== null) {
-    throw new Error('DSH-native first slice is read-only and rejects transactions')
-  }
   if (value.schema !== undefined && !isRecord(value.schema)) {
     throw new Error('DSH RPC activation schema must be an object')
   }
@@ -355,12 +447,71 @@ async function readOnlyActivation(value, workspace) {
   ) {
     throw new Error(`DSH RPC activation timeout_seconds must be in (0, ${DSH_MAX_ACTIVATION_TIMEOUT_SECONDS}]`)
   }
+  const modelRole = activationModelRole(value)
+  let transactionArtifacts = []
+  const transaction = value.options.transaction
+  if (transaction !== undefined && transaction !== null) {
+    if (modelRole !== 'worker') throw new Error('DSH transaction activation must be an Execute revision worker')
+    if (!isRecord(transaction)) throw new Error('DSH activation transaction must be an object')
+    const allowedKeys = new Set(['artifacts', 'rollback_on_noncompleted_status', 'candidate_gate'])
+    if (Object.keys(transaction).some(key => !allowedKeys.has(key))) {
+      throw new Error('DSH activation transaction contains unsupported fields')
+    }
+    if (
+      !Array.isArray(transaction.artifacts)
+      || transaction.artifacts.length !== 1
+      || new Set(transaction.artifacts).size !== transaction.artifacts.length
+      || !transaction.artifacts.every(safeTransactionArtifact)
+    ) {
+      throw new Error('DSH activation transaction must declare exactly one canonical artifact')
+    }
+    if (
+      transaction.rollback_on_noncompleted_status !== undefined
+      && typeof transaction.rollback_on_noncompleted_status !== 'boolean'
+    ) {
+      throw new Error('DSH activation rollback_on_noncompleted_status must be a boolean')
+    }
+    const declaredTransactions = (missionPolicy?.transactions ?? [])
+      .filter(item => sameStringSet(item.artifacts, transaction.artifacts))
+    if (declaredTransactions.length === 0) {
+      throw new Error('DSH activation transaction does not match one Mission capability')
+    }
+    const hasRollback = Object.prototype.hasOwnProperty.call(
+      transaction,
+      'rollback_on_noncompleted_status',
+    )
+    const rollbackMatches = declaredTransactions.filter(item => (
+      item.rollbackOnNoncompletedStatus === undefined
+        ? !hasRollback
+        : hasRollback && transaction.rollback_on_noncompleted_status === item.rollbackOnNoncompletedStatus
+    ))
+    if (rollbackMatches.length === 0) {
+      throw new Error('DSH activation transaction rollback policy does not match the Mission capability')
+    }
+    const hasCandidateGate = Object.prototype.hasOwnProperty.call(transaction, 'candidate_gate')
+    const declared = rollbackMatches.find(item => (
+      item.candidateGate === null
+        ? !hasCandidateGate
+        : hasCandidateGate && isRecord(transaction.candidate_gate)
+          && sameJson(transaction.candidate_gate, item.candidateGate)
+    ))
+    if (declared === undefined) {
+      throw new Error('DSH activation candidate gate does not match the Mission evaluator contract')
+    }
+    transactionArtifacts = await prepareTransactionArtifacts(
+      workspace,
+      transaction.artifacts,
+      missionPolicy?.protectedFiles ?? [],
+      missionPolicy?.protectedRoots ?? [],
+    )
+  }
   return {
     label: typeof value.label === 'string' && value.label.trim() ? value.label.trim() : 'KerSor DSH activation',
     prompt: [{type: 'text', text: value.prompt}],
     outputSchema: value.schema === undefined ? undefined : jsonClone(value.schema, 'DSH output schema'),
     timeoutSeconds,
-    modelRole: activationModelRole(value),
+    modelRole,
+    transactionArtifacts,
   }
 }
 
@@ -380,10 +531,60 @@ function pathInsideWorkspace(workspace, lexicalWorkspace, value, label) {
   return undefined
 }
 
-function readOnlyChildGuard(workspace, lexicalWorkspace, execution) {
+function transactionWritePathProblem(workspace, lexicalWorkspace, transactionArtifacts, value, label) {
+  if (typeof value !== 'string' || !value) return `${label} must be a non-empty string`
+  const match = transactionArtifacts.find(artifact => (
+    value === artifact.relative
+    || value === artifact.absolute
+    || value === path.resolve(lexicalWorkspace, artifact.relative)
+  ))
+  if (match === undefined) return `${label} must name the declared transaction artifact exactly`
+  let metadata
+  let physical
+  try {
+    if (realpathSync(lexicalWorkspace) !== workspace) {
+      return `${label} transaction workspace identity is unsafe`
+    }
+    const actual = path.isAbsolute(value)
+      ? path.resolve(value)
+      : path.resolve(lexicalWorkspace, value)
+    metadata = lstatSync(actual)
+    physical = realpathSync(actual)
+  } catch {
+    return `${label} must remain one existing declared transaction artifact`
+  }
+  if (
+    !metadata.isFile()
+    || metadata.isSymbolicLink()
+    || metadata.nlink !== 1
+    || physical !== match.physical
+    || !inside(workspace, physical)
+  ) {
+    return `${label} transaction artifact identity is unsafe`
+  }
+  return undefined
+}
+
+function readOnlyChildGuard(workspace, lexicalWorkspace, activation, execution) {
   if (execution.name === DSH_STRUCTURED_OUTPUT_TOOL) return undefined
+  if (DSH_WRITE_TOOLS.includes(execution.name)) {
+    if (activation.transactionArtifacts.length === 0) {
+      return `KerSor DSH-native read-only activation denies tool ${JSON.stringify(execution.name)}`
+    }
+    if (!isRecord(execution.arguments)) {
+      return `KerSor DSH-native ${execution.name} arguments must be an object`
+    }
+    return transactionWritePathProblem(
+      workspace,
+      lexicalWorkspace,
+      activation.transactionArtifacts,
+      execution.arguments.file_path,
+      `${execution.name}.file_path`,
+    )
+  }
   if (!DSH_READ_TOOLS.includes(execution.name)) {
-    return `KerSor DSH-native read-only activation denies tool ${JSON.stringify(execution.name)}`
+    const mode = activation.transactionArtifacts.length > 0 ? 'transaction' : 'read-only'
+    return `KerSor DSH-native ${mode} activation denies tool ${JSON.stringify(execution.name)}`
   }
   if (!isRecord(execution.arguments)) {
     return `KerSor DSH-native ${execution.name} arguments must be an object`
@@ -425,12 +626,12 @@ function activationSignal(parent, timeoutSeconds) {
   }
 }
 
-async function executeDshActivation(ctx, parent, workspace, lexicalWorkspace, activationValue, hostSignal) {
-  const activation = await readOnlyActivation(activationValue, workspace)
+async function executeDshActivation(ctx, parent, workspace, lexicalWorkspace, missionPolicy, activationValue, hostSignal) {
+  const activation = await readOnlyActivation(activationValue, workspace, missionPolicy)
   const operation = activationSignal(hostSignal, activation.timeoutSeconds)
   const policy = {
     guardedAgents: new Set(),
-    guard: execution => readOnlyChildGuard(workspace, lexicalWorkspace, execution),
+    guard: execution => readOnlyChildGuard(workspace, lexicalWorkspace, activation, execution),
   }
   let run
   try {
@@ -441,7 +642,10 @@ async function executeDshActivation(ctx, parent, workspace, lexicalWorkspace, ac
       signal: operation.signal,
       agentOptions: {provider: DSH_PROVIDER, model: DSH_MODEL},
       ...activation.outputSchema === undefined ? {} : {outputSchema: activation.outputSchema},
-      toolFilter: {allow: [...DSH_READ_TOOLS]},
+      toolFilter: {allow: [
+        ...DSH_READ_TOOLS,
+        ...(activation.transactionArtifacts.length > 0 ? DSH_WRITE_TOOLS : []),
+      ]},
     }))
     if (!run?.localAgent || !policy.guardedAgents.has(run.localAgent)) {
       throw new Error('DSH spawn did not publish a locally guarded child')
@@ -575,7 +779,7 @@ function writeRpcFrame(socket, value) {
   })
 }
 
-async function missionRuntime(contract) {
+async function missionRuntime(contract, workspace) {
   let bytes
   let value
   try {
@@ -593,25 +797,226 @@ async function missionRuntime(contract) {
   if (value.contract_version !== 'kersor-mission-v1') {
     throw new Error('runtime=dsh is supported only for kersor-mission-v1')
   }
+  const contractOwnedPath = (candidate, label) => {
+    if (typeof candidate !== 'string' || !candidate) {
+      throw new Error(`runtime=dsh Mission ${label} must be a non-empty path`)
+    }
+    return path.isAbsolute(candidate)
+      ? path.resolve(candidate)
+      : path.resolve(path.dirname(contract), candidate)
+  }
+  const lexicalDeclaredWorkspace = contractOwnedPath(value.workspace, 'workspace')
+  const declaredWorkspace = await realpath(lexicalDeclaredWorkspace)
+  if (declaredWorkspace !== workspace) {
+    throw new Error('runtime=dsh Mission workspace does not match the top-level DSH workspace')
+  }
+  const lexicalSessionRoot = contractOwnedPath(value.session, 'session')
+  const sessionRelative = path.relative(lexicalDeclaredWorkspace, lexicalSessionRoot)
+  if (
+    !sessionRelative
+    || sessionRelative === '..'
+    || sessionRelative.startsWith(`..${path.sep}`)
+    || path.isAbsolute(sessionRelative)
+  ) {
+    throw new Error('runtime=dsh Mission Session must be one proper workspace descendant')
+  }
+  await rejectSymlinkSegments(workspace, sessionRelative, 'runtime=dsh Mission Session')
+  const sessionRoot = path.resolve(workspace, sessionRelative)
+  const protectedFiles = [{path: contract, label: 'Mission contract'}]
+  if (value.runtime_config !== undefined) {
+    protectedFiles.push({
+      path: await realpath(contractOwnedPath(value.runtime_config, 'runtime_config')),
+      label: 'runtime config',
+    })
+  }
   if (!Array.isArray(value.capabilities)) {
     throw new Error('runtime=dsh Mission capabilities must be an array')
   }
+  if (
+    !isRecord(value.mission)
+    || !Array.isArray(value.mission.authority)
+    || value.mission.authority.some(item => typeof item !== 'string' || !item)
+  ) {
+    throw new Error('runtime=dsh Mission authority must be an array of non-empty strings')
+  }
+  const authority = new Set(value.mission.authority)
+  const transactions = []
+  const capabilityNames = new Set()
+  const hostEvaluators = new Map()
+  const verifierReferences = new Set()
+  let admittedCount = 0
   for (const capability of value.capabilities) {
     if (!isRecord(capability)) throw new Error('runtime=dsh Mission capabilities must be objects')
-    if (capability.execution !== undefined && (
-      !isRecord(capability.execution)
-      || (capability.execution.kind ?? 'agent') !== 'agent'
-    )) {
-      throw new Error('runtime=dsh first slice rejects Host evaluator and command capabilities')
+    if (typeof capability.name !== 'string' || !capability.name || capabilityNames.has(capability.name)) {
+      throw new Error('runtime=dsh Mission capability names must be unique and non-empty')
     }
-    if (capability.side_effect === 'write' || (Array.isArray(capability.transaction_artifacts) && capability.transaction_artifacts.length > 0)) {
-      throw new Error('runtime=dsh first slice supports read-only Mission capabilities only')
+    capabilityNames.add(capability.name)
+    const requiredAuthorities = capability.required_authorities ?? []
+    if (
+      !Array.isArray(requiredAuthorities)
+      || requiredAuthorities.some(item => typeof item !== 'string' || !item)
+    ) {
+      throw new Error('runtime=dsh capability required_authorities must contain non-empty strings')
+    }
+    const admitted = requiredAuthorities.every(item => authority.has(item))
+    if (admitted) admittedCount += 1
+    const execution = capability.execution ?? {kind: 'agent'}
+    if (!isRecord(execution)) throw new Error('runtime=dsh Mission capability execution must be an object')
+    const executionKind = execution.kind ?? 'agent'
+    if (executionKind === 'host_evaluator') {
+      const request = execution.request
+      if (
+        capability.side_effect !== 'read'
+        || (capability.transaction_artifacts ?? []).length !== 0
+        || !isRecord(request)
+        || request.protocol !== 'command-v1'
+        || !Array.isArray(request.argv)
+        || request.argv.length === 0
+        || request.argv.some(item => typeof item !== 'string')
+        || request.filesystem_policy !== 'read-only'
+        || request.network_policy !== 'denied'
+        || request.output_policy !== 'sealed'
+        || (request.materialize ?? []).length !== 0
+      ) {
+        throw new Error('runtime=dsh Host evaluator must use the registered read-only command-v1 contract')
+      }
+      const requestArtifacts = request.artifacts ?? []
+      const timeoutSeconds = request.timeout_seconds
+      const maxOutputBytes = request.max_output_bytes
+      if (
+        (execution.retryable !== undefined && typeof execution.retryable !== 'boolean')
+        || !Array.isArray(requestArtifacts)
+        || new Set(requestArtifacts).size !== requestArtifacts.length
+        || !requestArtifacts.every(safeTransactionArtifact)
+        || !Array.isArray(capability.produces_artifacts)
+        || new Set(capability.produces_artifacts).size !== capability.produces_artifacts.length
+        || capability.produces_artifacts.some(item => typeof item !== 'string' || !item)
+        || !Array.isArray(capability.produces_facts)
+        || new Set(capability.produces_facts).size !== capability.produces_facts.length
+        || capability.produces_facts.some(item => typeof item !== 'string' || !item)
+        || !Array.isArray(execution.fact_projections)
+        || (timeoutSeconds !== undefined && (
+          typeof timeoutSeconds !== 'number'
+          || !Number.isFinite(timeoutSeconds)
+          || timeoutSeconds <= 0
+          || timeoutSeconds > 120
+        ))
+        || (maxOutputBytes !== undefined && (
+          !Number.isSafeInteger(maxOutputBytes)
+          || maxOutputBytes < 1
+          || maxOutputBytes > 4_194_304
+        ))
+      ) {
+        throw new Error('runtime=dsh Host evaluator has an invalid bounded output contract')
+      }
+      if (admitted) {
+        hostEvaluators.set(capability.name, {
+          request: jsonClone(request, `runtime=dsh Host evaluator ${capability.name} request`),
+          retryable: execution.retryable,
+          producesArtifacts: [...capability.produces_artifacts],
+          producesFacts: [...capability.produces_facts],
+          artifactOutputPrefixes: [...(capability.artifact_output_prefixes ?? [])],
+          factOutputPrefixes: [...(capability.fact_output_prefixes ?? [])],
+          factProjections: jsonClone(
+            execution.fact_projections,
+            `runtime=dsh Host evaluator ${capability.name} fact projections`,
+          ),
+          inputArtifactField: execution.input_artifact_field,
+          commitProjection: execution.candidate_commit === undefined
+            ? undefined
+            : jsonClone(
+              execution.candidate_commit,
+              `runtime=dsh Host evaluator ${capability.name} commit projection`,
+            ),
+        })
+      }
+      continue
+    }
+    if (executionKind !== 'agent') {
+      throw new Error('runtime=dsh capabilities require agent or host_evaluator execution')
+    }
+    const artifacts = capability.transaction_artifacts ?? []
+    if (!Array.isArray(artifacts)) {
+      throw new Error('runtime=dsh transaction_artifacts must be an array')
+    }
+    if (
+      capability.commit_failed_outputs !== undefined
+      && typeof capability.commit_failed_outputs !== 'boolean'
+    ) {
+      throw new Error('runtime=dsh commit_failed_outputs must be a boolean')
+    }
+    if (capability.side_effect === 'write') {
+      if (
+        artifacts.length !== 1
+        || new Set(artifacts).size !== artifacts.length
+        || !artifacts.every(safeTransactionArtifact)
+      ) {
+        throw new Error('runtime=dsh write capability must declare exactly one canonical transaction artifact')
+      }
+      if (artifacts.some(runtimeControlArtifact)) {
+        throw new Error('runtime=dsh transaction artifacts must not target KerSor runtime control paths')
+      }
+      const verifier = capability.candidate_verifier ?? null
+      if (verifier !== null && (typeof verifier !== 'string' || !verifier)) {
+        throw new Error('runtime=dsh candidate_verifier must be a non-empty string')
+      }
+      if (verifier !== null && capability.commit_failed_outputs === true) {
+        throw new Error('runtime=dsh candidate_verifier cannot commit failed outputs')
+      }
+      if (admitted) transactions.push({
+        artifacts: [...artifacts],
+        verifier,
+        candidateGate: null,
+        rollbackOnNoncompletedStatus: capability.commit_failed_outputs === true ? undefined : true,
+      })
+      if (admitted && verifier !== null) {
+        verifierReferences.add(verifier)
+      }
+    } else if (artifacts.length > 0) {
+      throw new Error('runtime=dsh transaction artifacts require side_effect=write')
     }
   }
+  if (admittedCount === 0) throw new Error('runtime=dsh Mission authority admits no capabilities')
+  for (const verifier of verifierReferences) {
+    if (!hostEvaluators.has(verifier)) {
+      throw new Error('runtime=dsh candidate_verifier must reference one Host evaluator')
+    }
+  }
+  for (const transaction of transactions) {
+    if (transaction.verifier === null) continue
+    const evaluator = hostEvaluators.get(transaction.verifier)
+    if (
+      evaluator.retryable !== false
+      || evaluator.producesArtifacts.length !== 1
+      || evaluator.artifactOutputPrefixes.length !== 0
+      || evaluator.producesFacts.length === 0
+      || evaluator.factOutputPrefixes.length !== 0
+      || evaluator.factProjections.length === 0
+      || evaluator.factProjections.some(projection => !isRecord(projection) || !projection.output_name)
+      || evaluator.inputArtifactField !== undefined
+      || !Array.isArray(evaluator.request.artifacts)
+      || evaluator.request.artifacts.length === 0
+    ) {
+      throw new Error('runtime=dsh Host evaluator is not a bounded candidate gate')
+    }
+    if (!transaction.artifacts.every(artifact => evaluator.request.artifacts.includes(artifact))) {
+      throw new Error('runtime=dsh Host evaluator artifacts must include its candidate transaction')
+    }
+    transaction.candidateGate = {
+      verifier: transaction.verifier,
+      request: evaluator.request,
+      result_artifact: evaluator.producesArtifacts[0],
+      fact_projections: evaluator.factProjections,
+      ...(evaluator.commitProjection === undefined
+        ? {}
+        : {commit_projection: evaluator.commitProjection}),
+    }
+  }
+  selected.missionPolicy = {transactions, protectedFiles, protectedRoots: [sessionRoot]}
   return selected
 }
 
-async function createDshRpcHost({ctx, parent, workspace, lexicalWorkspace, runtime, signal}) {
+async function createDshRpcHost({ctx, parent, workspace, lexicalWorkspace, runtime, missionPolicy, signal}) {
   const directory = await mkdtemp(path.join(runtime.temp, 'k-'))
   await chmod(directory, 0o700)
   const socketPath = path.join(directory, 's')
@@ -657,6 +1062,7 @@ async function createDshRpcHost({ctx, parent, workspace, lexicalWorkspace, runti
           parent,
           workspace,
           lexicalWorkspace,
+          missionPolicy,
           request.activation,
           connection.signal,
         )
@@ -862,7 +1268,7 @@ export function createTool({ctx, timeoutMs = DEFAULT_TIMEOUT_MS} = {}) {
         const resume = args.resume === true
         const runDir = optionalRunDir(args.run_dir, workspace, resume)
         const runtime = await installedRuntime(workspace)
-        const selectedContract = await missionRuntime(contract)
+        const selectedContract = await missionRuntime(contract, workspace)
         if (selectedContract.runtime === 'dsh' && !ctx?.subagents) {
           throw new Error('runtime=dsh requires the DSH subagent Host service')
         }
@@ -890,6 +1296,7 @@ export function createTool({ctx, timeoutMs = DEFAULT_TIMEOUT_MS} = {}) {
               workspace,
               lexicalWorkspace,
               runtime,
+              missionPolicy: selectedContract.missionPolicy,
               signal: exec.signal,
             })
           }
