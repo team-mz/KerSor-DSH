@@ -9,6 +9,13 @@ import type { KersorClassicSnapshot } from './classic.ts'
 import type { KersorDiagnosticIssue } from './diagnostics.ts'
 import type { KersorRunRef, KersorScanObservation } from './scanner.ts'
 
+export type {
+  KersorCallActivityView,
+  KersorCallDetailView,
+  KersorCallMessageView,
+  KersorCallUsageView,
+} from './detail.ts'
+
 // Re-exported here so every `@Remote` boundary type resolves from the public
 // `./types` subpath, as the Typert generator's boundary rule requires.
 export type {
@@ -25,16 +32,21 @@ export type {
   KersorBaselineAction,
   KersorClassicArtifact,
   KersorClassicAuthoringDetail,
+  KersorClassicCycleLineage,
   KersorClassicDispatchDetail,
   KersorClassicGate,
   KersorClassicHealth,
   KersorClassicLifecycle,
+  KersorClassicRound,
+  KersorClassicRoundEstimate,
+  KersorClassicRoundMeasurement,
   KersorClassicSelectionDetail,
   KersorClassicSession,
   KersorClassicSessionDetail,
   KersorClassicSnapshot,
   KersorClassicSource,
   KersorClassicStatus,
+  KersorClassicStopReason,
   KersorClassicStep,
   KersorClassicStepId,
   KersorClassicStepStatus,

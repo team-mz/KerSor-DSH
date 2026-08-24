@@ -7,8 +7,9 @@ import type { KersorRunView } from './fold.ts';
 import type { KersorClassicSnapshot } from './classic.ts';
 import type { KersorDiagnosticIssue } from './diagnostics.ts';
 import type { KersorRunRef, KersorScanObservation } from './scanner.ts';
+export type { KersorCallActivityView, KersorCallDetailView, KersorCallMessageView, KersorCallUsageView, } from './detail.ts';
 export type { KersorCandidateResultView, KersorRunStatus, KersorCallStatus, KersorCallKind, KersorCallView, KersorPhaseView, KersorRunView, KersorWorkflowResultView, } from './fold.ts';
-export type { KersorBaselineAction, KersorClassicArtifact, KersorClassicAuthoringDetail, KersorClassicDispatchDetail, KersorClassicGate, KersorClassicHealth, KersorClassicLifecycle, KersorClassicSelectionDetail, KersorClassicSession, KersorClassicSessionDetail, KersorClassicSnapshot, KersorClassicSource, KersorClassicStatus, KersorClassicStep, KersorClassicStepId, KersorClassicStepStatus, KersorClassicValidationCheck, KersorClassicValidationDetail, KersorClassicWorkflowDesign, } from './classic.ts';
+export type { KersorBaselineAction, KersorClassicArtifact, KersorClassicAuthoringDetail, KersorClassicCycleLineage, KersorClassicDispatchDetail, KersorClassicGate, KersorClassicHealth, KersorClassicLifecycle, KersorClassicRound, KersorClassicRoundEstimate, KersorClassicRoundMeasurement, KersorClassicSelectionDetail, KersorClassicSession, KersorClassicSessionDetail, KersorClassicSnapshot, KersorClassicSource, KersorClassicStatus, KersorClassicStopReason, KersorClassicStep, KersorClassicStepId, KersorClassicStepStatus, KersorClassicValidationCheck, KersorClassicValidationDetail, KersorClassicWorkflowDesign, } from './classic.ts';
 export type { KersorDiagnosticCode, KersorDiagnosticIssue, KersorDiagnosticStage } from './diagnostics.ts';
 export type { KersorRootObservation, KersorRootOrigin, KersorRunDiscovery, KersorRunKind, KersorRunRef, KersorScanObservation, } from './scanner.ts';
 /** Current ingestion state for one discovered run. */

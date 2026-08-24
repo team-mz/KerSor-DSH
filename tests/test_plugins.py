@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -44,6 +45,34 @@ class BuiltPluginTests(unittest.TestCase):
                     (package / target).is_file(),
                     f"{package.name}: missing export target {target}",
                 )
+
+    def test_kersor_manifest_ships_generated_control_chunks(self) -> None:
+        package = ROOT / "plugins" / "kersor"
+        manifest = json.loads((package / "package.json").read_text(encoding="utf-8"))
+        control = (package / "lib" / "control.js").read_text(encoding="utf-8")
+        chunks = {
+            match.removeprefix("./")
+            for match in re.findall(r'from\s+["\'](\./types-[^"\']+\.js)["\']', control)
+        }
+        self.assertTrue(chunks, "control.js must expose its generated runtime chunk imports")
+        self.assertIn("lib/types-*.js", manifest["files"])
+        for chunk in chunks:
+            self.assertTrue((package / "lib" / chunk).is_file(), chunk)
+
+    def test_kersor_control_preserves_the_authoring_escape_before_terminal(self) -> None:
+        package = ROOT / "plugins" / "kersor"
+        for path in (package / "src" / "control.ts", package / "lib" / "control.js"):
+            control = path.read_text(encoding="utf-8")
+            self.assertIn(
+                "selected_workflow.name is STALLED is a recoverable routing gap",
+                control,
+                str(path),
+            )
+            self.assertIn(
+                "complete Phase 3.6 and the full same-round selection sequence",
+                control,
+                str(path),
+            )
 
     def test_web_bundle_owns_the_read_only_composition(self) -> None:
         bundle = ROOT / "bundles" / "kersor-web"
@@ -96,7 +125,10 @@ class BuiltPluginTests(unittest.TestCase):
         self.assertIn('session.lifecycle === "stalled"', client)
         self.assertIn('session.lifecycle === "cancelled"', client)
         self.assertIn("routeBadge", client)
-        self.assertIn("Authoring · budget {budget}", client)
+        self.assertIn("Authoring · used {used}/{budget}", client)
+        self.assertIn("Round history", client)
+        self.assertIn("KerSor experiment round tree", client)
+        self.assertIn("Estimate excluded from results", client)
         self.assertIn("baseline_witness", client)
         self.assertIn("baseline_next_action", client)
         self.assertIn("baseline_reason", client)
@@ -337,13 +369,19 @@ console.log(JSON.stringify(await viewer.readClassicSessions(1)))
         self.assertIn("`--yolo` is not a creation grant", skill)
         self.assertIn("commands/research.md", skill)
 
-    def test_built_viewer_depends_on_the_dsh_workspace_registry(self) -> None:
+    def test_built_viewer_combines_workspace_and_session_persistence_roots(self) -> None:
         package = ROOT / "plugins" / "kersor-viewer"
         manifest = json.loads((package / "package.json").read_text(encoding="utf-8"))
         self.assertIn("@deepseek-ai/dsh-workspace", manifest["peerDependencies"])
+        self.assertIn(
+            "@deepseek-ai/dsh-session-persistence", manifest["peerDependencies"]
+        )
         host = (package / "lib" / "index.js").read_text(encoding="utf-8")
-        self.assertIn('static inject = ["workspaceRegistry"]', host)
+        self.assertIn(
+            'static inject = ["workspaceRegistry", "sessionPersistence"]', host
+        )
         self.assertIn("workspaceRegistry.list()", host)
+        self.assertIn("sessionPersistence.list()", host)
 
 
 if __name__ == "__main__":

@@ -37,11 +37,13 @@ var __esDecorate = (this && this.__esDecorate) || function (ctor, descriptorIn, 
     if (target) Object.defineProperty(target, contextIn.name, descriptor);
     done = true;
 };
+import path from 'node:path';
 import { Service } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
 import { readClassicSessionDetail, readClassicSessions } from "./classic.js";
 import { createIssue, issueFromError, mergeIssue } from "./diagnostics.js";
+import { readCallDetail } from "./detail.js";
 import { applyWorkflowResult, createRunView, foldEvent } from "./fold.js";
 import { readWorkflowResult } from "./result.js";
 import { scanRoots } from "./scanner.js";
@@ -57,6 +59,7 @@ let KersorViewerService = (() => {
     let _snapshot_decorators;
     let _runBacklog_decorators;
     let _runResult_decorators;
+    let _runCallDetail_decorators;
     let _classicSessionDetail_decorators;
     return class KersorViewerService extends _classSuper {
         static {
@@ -64,14 +67,16 @@ let KersorViewerService = (() => {
             _snapshot_decorators = [Remote('snapshot')];
             _runBacklog_decorators = [Remote('runBacklog')];
             _runResult_decorators = [Remote('runResult')];
+            _runCallDetail_decorators = [Remote('runCallDetail')];
             _classicSessionDetail_decorators = [Remote('classicSessionDetail')];
             __esDecorate(this, null, _snapshot_decorators, { kind: "method", name: "snapshot", static: false, private: false, access: { has: obj => "snapshot" in obj, get: obj => obj.snapshot }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _runBacklog_decorators, { kind: "method", name: "runBacklog", static: false, private: false, access: { has: obj => "runBacklog" in obj, get: obj => obj.runBacklog }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _runResult_decorators, { kind: "method", name: "runResult", static: false, private: false, access: { has: obj => "runResult" in obj, get: obj => obj.runResult }, metadata: _metadata }, null, _instanceExtraInitializers);
+            __esDecorate(this, null, _runCallDetail_decorators, { kind: "method", name: "runCallDetail", static: false, private: false, access: { has: obj => "runCallDetail" in obj, get: obj => obj.runCallDetail }, metadata: _metadata }, null, _instanceExtraInitializers);
             __esDecorate(this, null, _classicSessionDetail_decorators, { kind: "method", name: "classicSessionDetail", static: false, private: false, access: { has: obj => "classicSessionDetail" in obj, get: obj => obj.classicSessionDetail }, metadata: _metadata }, null, _instanceExtraInitializers);
             if (_metadata) Object.defineProperty(this, Symbol.metadata, { enumerable: true, configurable: true, writable: true, value: _metadata });
         }
-        static inject = ['workspaceRegistry'];
+        static inject = ['workspaceRegistry', 'sessionPersistence'];
         static Config = z.object({
             roots: z.array(z.string()).default([]),
             noDefaultRoots: z.boolean().default(false),
@@ -89,11 +94,13 @@ let KersorViewerService = (() => {
         group;
         scanTimer;
         scanInFlight;
+        persistedWorkspaceRoots = [];
         scanObservation = { state: 'never', roots: [] };
         classicSnapshot = {
             sessions: [],
             source: { state: 'not_installed' },
         };
+        lastPublishedSnapshotFingerprint;
         /** Create the service under the Host composition. */
         constructor(ctx, config) {
             super(ctx, 'kersorViewer');
@@ -132,7 +139,10 @@ let KersorViewerService = (() => {
             this.group ??= this.rootCtx.plugin({ name: 'kersor-viewer-group', apply: () => { } });
             return this.group;
         }
-        /** Complete inventory and source-health snapshot for panel refresh/reconnect. */
+        /**
+         * Read the complete inventory and source-health snapshot for refresh or reconnect.
+         * @returns Current atomic Host projection with a fresh observation timestamp.
+         */
         snapshot() {
             return {
                 asOf: new Date().toISOString(),
@@ -146,7 +156,11 @@ let KersorViewerService = (() => {
                 },
             };
         }
-        /** Full folded view of one run (panel open / reconnect backlog). */
+        /**
+         * Read the full folded view of one discovered run.
+         * @param runDir - Exact run directory from the current inventory.
+         * @returns Folded backlog with bounded result, or `undefined` for an unknown run.
+         */
         async runBacklog(runDir) {
             const tracked = this.tracked.get(runDir);
             if (tracked === undefined)
@@ -156,11 +170,29 @@ let KersorViewerService = (() => {
                 applyWorkflowResult(tracked.view, result);
             return tracked.view;
         }
-        /** Bounded candidate-selection result for one discovered run. */
+        /**
+         * Read the bounded candidate-selection result for one discovered run.
+         * @param runDir - Exact run directory from the current inventory.
+         * @returns Candidate and Host verification projection, or `undefined` when absent.
+         */
         async runResult(runDir) {
             if (!this.tracked.has(runDir))
                 return undefined;
             return readWorkflowResult(runDir);
+        }
+        /**
+         * Read bounded worker messages and activity names for one folded call.
+         * @param runDir - Exact discovered run directory.
+         * @param callId - Exact call identity present in that run's folded event stream.
+         * @returns Bounded detail, or `undefined` when the run, call, or artifacts are absent.
+         */
+        async runCallDetail(runDir, callId) {
+            const tracked = this.tracked.get(runDir);
+            if (tracked === undefined)
+                return undefined;
+            const call = tracked.view.phases.flatMap(phase => phase.calls)
+                .find(candidate => candidate.callId === callId);
+            return call === undefined ? undefined : readCallDetail(runDir, call);
         }
         /**
          * Read sealed, bounded detail for one classic Session present in the snapshot.
@@ -181,7 +213,6 @@ let KersorViewerService = (() => {
                 state: 'running',
                 startedAt: new Date().toISOString(),
             };
-            this.publishSnapshot();
             const current = this.performRescan().catch((error) => {
                 const now = new Date().toISOString();
                 this.scanObservation = {
@@ -202,7 +233,8 @@ let KersorViewerService = (() => {
             }
         }
         async performRescan() {
-            const workspaceRoots = [...new Set(this.rootCtx.workspaceRegistry.list().map(workspace => workspace.path))];
+            const workspaceDiscovery = await this.discoverWorkspaceRoots();
+            const workspaceRoots = workspaceDiscovery.roots;
             const [scanned, classic] = await Promise.all([
                 scanRoots(this.configuredRoots, this.includeDefaults, workspaceRoots),
                 this.classicSessionLimit === 0
@@ -214,9 +246,16 @@ let KersorViewerService = (() => {
                     }),
             ]);
             const previousSuccess = this.scanObservation.lastSuccessfulAt;
-            this.scanObservation = scanned.observation.state === 'failed' && previousSuccess !== undefined
-                ? { ...scanned.observation, lastSuccessfulAt: previousSuccess }
-                : scanned.observation;
+            const observation = workspaceDiscovery.issue === undefined
+                ? scanned.observation
+                : {
+                    ...scanned.observation,
+                    state: scanned.observation.state === 'failed' ? 'failed' : 'degraded',
+                    lastIssue: mergeIssue(this.scanObservation.lastIssue, workspaceDiscovery.issue),
+                };
+            this.scanObservation = observation.state === 'failed' && previousSuccess !== undefined
+                ? { ...observation, lastSuccessfulAt: previousSuccess }
+                : observation;
             this.classicSnapshot = classic;
             const byRunDir = new Map(scanned.runs.map(ref => [ref.runDir, ref]));
             const scanIssues = new Map(scanned.runIssues.map(entry => [entry.runDir, entry.issue]));
@@ -276,6 +315,31 @@ let KersorViewerService = (() => {
                     void this.backfillTerminated(tracked);
             }
             this.publishSnapshot();
+        }
+        /** Merge managed Workspaces with durable Session cwd values, retaining the last good durable list on failure. */
+        async discoverWorkspaceRoots() {
+            const roots = new Set();
+            for (const workspace of this.rootCtx.workspaceRegistry.list()) {
+                const normalized = normalizeAbsoluteCwd(workspace.path);
+                if (normalized !== undefined)
+                    roots.add(normalized);
+            }
+            let issue;
+            try {
+                const persisted = new Set();
+                for (const header of await this.rootCtx.sessionPersistence.list()) {
+                    const normalized = normalizeAbsoluteCwd(header.cwd);
+                    if (normalized !== undefined)
+                        persisted.add(normalized);
+                }
+                this.persistedWorkspaceRoots = [...persisted].sort((left, right) => left.localeCompare(right));
+            }
+            catch (error) {
+                issue = issueFromError('root_scan', error, 'warning');
+            }
+            for (const persisted of this.persistedWorkspaceRoots)
+                roots.add(persisted);
+            return { roots: [...roots], ...(issue === undefined ? {} : { issue }) };
         }
         async backfillTerminated(tracked) {
             const { ref, view } = tracked;
@@ -425,7 +489,12 @@ let KersorViewerService = (() => {
             };
         }
         publishSnapshot() {
-            this.rootCtx.emit('kersor/event', { kind: 'snapshot', snapshot: this.snapshot() });
+            const snapshot = this.snapshot();
+            const fingerprint = snapshotFingerprint(snapshot);
+            if (fingerprint === this.lastPublishedSnapshotFingerprint)
+                return;
+            this.lastPublishedSnapshotFingerprint = fingerprint;
+            this.rootCtx.emit('kersor/event', { kind: 'snapshot', snapshot });
         }
         publishRun(run) {
             this.rootCtx.emit('kersor/event', { kind: 'run', run });
@@ -433,6 +502,12 @@ let KersorViewerService = (() => {
     };
 })();
 export { KersorViewerService };
+function normalizeAbsoluteCwd(value) {
+    if (typeof value !== 'string' || value.length === 0 || value.includes('\0') || !path.isAbsolute(value)) {
+        return undefined;
+    }
+    return path.normalize(value);
+}
 function rank(ref) {
     if (ref.discovery === 'active')
         return 2;
@@ -446,6 +521,44 @@ function terminalStatus(ref) {
 function observationFingerprint(observation) {
     const issue = observation.lastIssue;
     return `${observation.state}:${observation.byteOffset}:${observation.linesRead}:${issue?.stage ?? ''}:${issue?.code ?? ''}:${issue?.occurrences ?? 0}`;
+}
+function issueFingerprint(issue) {
+    return issue === undefined ? undefined : [issue.stage, issue.code, issue.severity];
+}
+/** Ignore scan clocks and repeated identical diagnostics when deciding whether browser state changed. */
+function snapshotFingerprint(snapshot) {
+    return JSON.stringify({
+        runs: snapshot.runs,
+        classic: {
+            sessions: snapshot.classic.sessions,
+            source: {
+                state: snapshot.classic.source.state,
+                issue: issueFingerprint(snapshot.classic.source.lastIssue),
+            },
+        },
+        scan: {
+            state: snapshot.diagnostics.scan.state,
+            roots: snapshot.diagnostics.scan.roots.map(root => ({
+                root: root.root,
+                origin: root.origin,
+                state: root.state,
+                sessionsExamined: root.sessionsExamined,
+                sessionsAccepted: root.sessionsAccepted,
+                runsFound: root.runsFound,
+                issue: issueFingerprint(root.lastIssue),
+            })),
+            issue: issueFingerprint(snapshot.diagnostics.scan.lastIssue),
+        },
+        readers: snapshot.diagnostics.runs.map(run => ({
+            runDir: run.runDir,
+            mode: run.mode,
+            state: run.state,
+            byteOffset: run.byteOffset,
+            linesRead: run.linesRead,
+            linesRejected: run.linesRejected,
+            issue: issueFingerprint(run.lastIssue),
+        })),
+    });
 }
 /** Cordis plugin entry: the service class itself. */
 export default KersorViewerService;

@@ -1,9 +1,9 @@
+import path from "node:path";
 import { Service } from "@deepseek-ai/cordis";
 import { Remote, TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
 import { execFile } from "node:child_process";
 import { access, open, readFile, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import path from "node:path";
 import { promisify } from "node:util";
 import { watch } from "node:fs";
 //#region ../../../vendor/cosmokit/src/misc.ts
@@ -803,11 +803,23 @@ defineMethod("transform", [
 * Bounded, content-free diagnostics shared by KerSor viewer sources.
 * @module @deepseek-ai/dsh-kersor-viewer
 */
-/** Create a safe issue from a runtime failure without retaining its message. */
+/**
+* Create a safe issue from a runtime failure without retaining its message.
+* @param stage - Operation that failed.
+* @param error - Untrusted runtime failure to classify without its text.
+* @param severity - Stable user-facing impact category.
+* @returns Content-free diagnostic safe for the Remote wire.
+*/
 function issueFromError(stage, error, severity = "error") {
 	return createIssue(stage, classifyError(stage, error), severity);
 }
-/** Create a safe issue for a validated failure code. */
+/**
+* Create a safe issue for a validated failure code.
+* @param stage - Operation that failed.
+* @param code - Stable failure classification.
+* @param severity - Stable user-facing impact category.
+* @returns Content-free diagnostic safe for the Remote wire.
+*/
 function createIssue(stage, code, severity = "error") {
 	return {
 		stage,
@@ -817,7 +829,12 @@ function createIssue(stage, code, severity = "error") {
 		lastSeenAt: (/* @__PURE__ */ new Date()).toISOString()
 	};
 }
-/** Merge repeated identical failures while bounding history to the latest kind. */
+/**
+* Merge repeated identical failures while bounding history to the latest kind.
+* @param previous - Previously retained issue, when one exists.
+* @param current - Newly observed issue.
+* @returns Current issue with an accumulated count only for the same kind.
+*/
 function mergeIssue(previous, current) {
 	if (previous?.stage !== current.stage || previous.code !== current.code) return current;
 	return {
@@ -825,7 +842,11 @@ function mergeIssue(previous, current) {
 		occurrences: previous.occurrences + 1
 	};
 }
-/** Return whether an unknown exception carries a Node-style error code. */
+/**
+* Read a Node-style error code from an unknown exception.
+* @param error - Unknown caught value.
+* @returns Stringified code, or `undefined` when none is present.
+*/
 function errorCode(error) {
 	return typeof error === "object" && error !== null && "code" in error ? String(error.code) : void 0;
 }
@@ -846,20 +867,24 @@ function classifyError(stage, error) {
 * @module @deepseek-ai/dsh-kersor-viewer
 */
 const execFileAsync = promisify(execFile);
+const MAX_CLASSIC_ROUNDS = 100;
 function dshHome() {
 	const configured = process.env.DSH_HOME?.trim();
 	if (!configured) return path.join(homedir(), ".dsh");
 	if (configured === "~") return homedir();
 	return configured.startsWith("~/") ? path.join(homedir(), configured.slice(2)) : path.resolve(configured);
 }
-/** Path copied by the portable preset installer. */
+/**
+* Resolve the bridge path copied by the portable preset installer.
+* @returns Absolute bridge path under the configured DSH home.
+*/
 function installedBridge() {
 	return path.join(dshHome(), ".agent-presets", "kersor", "bin", "kersor_bridge.py");
 }
 function kersorPython() {
 	return process.env.KERSOR_PYTHON?.trim() || "python3";
 }
-function optionalString$1(value) {
+function optionalString$2(value) {
 	return value === void 0 || value === null || typeof value === "string";
 }
 function optionalDetailString(value) {
@@ -868,8 +893,17 @@ function optionalDetailString(value) {
 function optionalBoolean(value) {
 	return value === void 0 || value === null || typeof value === "boolean";
 }
-function optionalNumber$1(value) {
+function optionalNumber$2(value) {
 	return value === void 0 || value === null || typeof value === "number";
+}
+function finiteNonNegative(value) {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+function optionalFiniteNonNegative(value) {
+	return value === void 0 || finiteNonNegative(value);
+}
+function optionalBoundedString(value, maximum) {
+	return value === void 0 || typeof value === "string" && Buffer.byteLength(value) <= maximum;
 }
 function optionalGate(value) {
 	return value === void 0 || value === null || value === "pass" || value === "fail" || value === "pending" || value === "not_required";
@@ -889,6 +923,70 @@ function isClassicValidationCheck(value) {
 	if (value === null || typeof value !== "object") return false;
 	const check = value;
 	return typeof check.name === "string" && typeof check.passed === "boolean";
+}
+function isClassicCycleLineage(value) {
+	if (value === null || typeof value !== "object") return false;
+	const lineage = value;
+	const fields = [
+		lineage.session_baseline_cycles,
+		lineage.best_cycles,
+		lineage.session_speedup,
+		lineage.task_baseline_cycles,
+		lineage.overall_speedup
+	];
+	return fields.some((field) => field !== void 0) && fields.every(optionalFiniteNonNegative);
+}
+function isClassicRoundEstimate(value) {
+	if (value === null || typeof value !== "object") return false;
+	const estimate = value;
+	const fields = [estimate.cycles, estimate.speedup];
+	return fields.some((field) => field !== void 0) && fields.every(optionalFiniteNonNegative);
+}
+function isClassicRoundMeasurement(value) {
+	if (value === null || typeof value !== "object") return false;
+	const measurement = value;
+	const fields = [
+		measurement.baseline_cycles,
+		measurement.candidate_cycles,
+		measurement.candidate_speedup,
+		measurement.incumbent_cycles,
+		measurement.incumbent_speedup,
+		measurement.overall_speedup
+	];
+	return fields.some((field) => field !== void 0) && fields.every(optionalFiniteNonNegative) && (measurement.best_improved === void 0 || typeof measurement.best_improved === "boolean");
+}
+function isClassicRound(value) {
+	if (value === null || typeof value !== "object") return false;
+	const round = value;
+	if (typeof round.number !== "number" || !Number.isInteger(round.number) || round.number < 1 || !optionalBoundedString(round.workflow, 1024) || !optionalBoundedString(round.candidate_id, 1024) || !optionalBoundedString(round.decision, 8192) || round.workflow_origin !== void 0 && !["catalog", "authored"].includes(round.workflow_origin) || ![
+		"pending",
+		"pass",
+		"fail"
+	].includes(round.host_verdict ?? "")) return false;
+	if (round.failure_kind !== void 0 && ![
+		"correctness",
+		"benchmark",
+		"infrastructure"
+	].includes(round.failure_kind)) return false;
+	if (round.estimate !== void 0 && !isClassicRoundEstimate(round.estimate)) return false;
+	if (round.measurement !== void 0 && !isClassicRoundMeasurement(round.measurement)) return false;
+	if (round.host_verdict !== "pass" && round.measurement !== void 0) return false;
+	if (round.host_verdict !== "fail" && round.failure_kind !== void 0) return false;
+	return true;
+}
+function isClassicRounds(value) {
+	if (!Array.isArray(value) || value.length > MAX_CLASSIC_ROUNDS || !value.every(isClassicRound)) return false;
+	return value.every((round, index) => index === 0 || round.number > (value[index - 1]?.number ?? 0));
+}
+function isClassicWorkflowPhase(value) {
+	if (value === null || typeof value !== "object") return false;
+	const phase = value;
+	return typeof phase.title === "string" && typeof phase.detail === "string";
+}
+function isClassicWorkflowDesign(value) {
+	if (value === null || typeof value !== "object") return false;
+	const design = value;
+	return optionalDetailString(design.name) && optionalDetailString(design.description) && optionalDetailString(design.whenToUse) && optionalDetailString(design.technique) && optionalDetailString(design.methodCategory) && optionalDetailString(design.topology) && (design.phases === void 0 || Array.isArray(design.phases) && design.phases.every(isClassicWorkflowPhase)) && stringArray(design.requiredArgs) && stringArray(design.languages) && stringArray(design.backends) && stringArray(design.integrationPatterns) && typeof design.rationale === "string" && typeof design.source === "string";
 }
 function isClassicSessionDetail(value) {
 	if (value === null || typeof value !== "object") return false;
@@ -932,8 +1030,7 @@ function isClassicSessionDetail(value) {
 		"hash_mismatch"
 	].includes(authoring.omittedReason)) return false;
 	if (authoring.design !== void 0) {
-		const design = authoring.design;
-		if (!optionalDetailString(design.name) || !optionalDetailString(design.technique) || !optionalDetailString(design.methodCategory) || !optionalDetailString(design.topology) || !stringArray(design.requiredArgs) || !stringArray(design.languages) || !stringArray(design.backends) || !stringArray(design.integrationPatterns) || typeof design.rationale !== "string" || typeof design.source !== "string") return false;
+		if (!isClassicWorkflowDesign(authoring.design)) return false;
 	}
 	const validation = detail.validation;
 	if (validation === void 0 || ![
@@ -941,6 +1038,7 @@ function isClassicSessionDetail(value) {
 		"passed",
 		"failed"
 	].includes(validation.status) || !Array.isArray(validation.checks) || !validation.checks.every(isClassicValidationCheck)) return false;
+	if (detail.rounds !== void 0 && !isClassicRounds(detail.rounds)) return false;
 	const dispatch = detail.dispatch;
 	return dispatch !== void 0 && [
 		"pending",
@@ -948,16 +1046,119 @@ function isClassicSessionDetail(value) {
 		"running",
 		"completed",
 		"failed"
-	].includes(dispatch.status) && optionalDetailString(dispatch.runDir) && optionalDetailString(dispatch.runtimeStatus);
+	].includes(dispatch.status) && optionalDetailString(dispatch.runDir) && optionalDetailString(dispatch.runtimeStatus) && (detail.workflow === void 0 || isClassicWorkflowDesign(detail.workflow));
 }
 function isClassicSession(value) {
 	if (value === null || typeof value !== "object") return false;
 	const row = value;
-	return typeof row.session_id === "string" && typeof row.session_dir === "string" && (row.storage_kind === "v2" || row.storage_kind === "legacy") && (row.lifecycle === "active" || row.lifecycle === "completed" || row.lifecycle === "stalled" || row.lifecycle === "cancelled") && (row.health === "active" || row.health === "stale" || row.health === "needs_resume" || row.health === "terminal" || row.health === "unknown") && (row.status === "terminal-complete" || row.status === "terminal-stalled" || row.status === "terminal-cancelled" || row.status === "resumable" || row.status === "in-progress" || row.status === "pre-round-1") && optionalString$1(row.kernel_language) && optionalString$1(row.backend) && optionalString$1(row.integration_pattern) && optionalBoolean(row.allow_workflow_authoring) && optionalNumber$1(row.workflow_authoring_budget) && (row.selection_status === void 0 || row.selection_status === null || [
+	return typeof row.session_id === "string" && typeof row.session_dir === "string" && (row.storage_kind === "v2" || row.storage_kind === "legacy") && (row.lifecycle === "active" || row.lifecycle === "completed" || row.lifecycle === "stalled" || row.lifecycle === "cancelled") && (row.health === "active" || row.health === "stale" || row.health === "needs_resume" || row.health === "terminal" || row.health === "unknown") && (row.status === "terminal-complete" || row.status === "terminal-stalled" || row.status === "terminal-cancelled" || row.status === "resumable" || row.status === "in-progress" || row.status === "pre-round-1") && optionalString$2(row.kernel_language) && optionalString$2(row.backend) && optionalString$2(row.integration_pattern) && optionalBoolean(row.allow_workflow_authoring) && optionalNumber$2(row.workflow_authoring_budget) && optionalNumber$2(row.workflow_authoring_used) && (row.workflow_authoring_used === void 0 || row.workflow_authoring_used === null || Number.isInteger(row.workflow_authoring_used) && row.workflow_authoring_used >= 0) && (row.workflow_authoring_budget === void 0 || row.workflow_authoring_budget === null || row.workflow_authoring_used === void 0 || row.workflow_authoring_used === null || row.workflow_authoring_used <= row.workflow_authoring_budget) && (row.selection_status === void 0 || row.selection_status === null || [
 		"pending",
 		"stalled",
 		"selected"
-	].includes(row.selection_status)) && optionalString$1(row.decision) && optionalString$1(row.fit_confidence) && optionalGate(row.baseline_witness) && optionalBaselineAction(row.baseline_next_action) && optionalString$1(row.baseline_reason) && optionalGate(row.profile_evidence) && optionalString$1(row.profile_reason) && optionalString$1(row.profile_owner) && optionalGate(row.dsh_compatibility) && optionalGate(row.candidate_ownership) && optionalGate(row.fresh_session) && Array.isArray(row.warnings) && row.warnings.every((item) => typeof item === "string");
+	].includes(row.selection_status)) && optionalString$2(row.decision) && optionalString$2(row.fit_confidence) && optionalGate(row.baseline_witness) && optionalBaselineAction(row.baseline_next_action) && optionalString$2(row.baseline_reason) && optionalGate(row.profile_evidence) && optionalString$2(row.profile_reason) && optionalString$2(row.profile_owner) && optionalGate(row.dsh_compatibility) && optionalGate(row.candidate_ownership) && optionalGate(row.fresh_session) && (row.stop_reason === void 0 || row.stop_reason === null || [
+		"target_met",
+		"execution_budget_exhausted",
+		"selection_stalled",
+		"authoring_budget_exhausted",
+		"cancelled",
+		"single_run_complete"
+	].includes(row.stop_reason)) && (row.cycle_lineage === void 0 || row.cycle_lineage === null || isClassicCycleLineage(row.cycle_lineage)) && Array.isArray(row.warnings) && row.warnings.every((item) => typeof item === "string");
+}
+function projectCycleLineage(value) {
+	return {
+		...value.session_baseline_cycles === void 0 ? {} : { session_baseline_cycles: value.session_baseline_cycles },
+		...value.best_cycles === void 0 ? {} : { best_cycles: value.best_cycles },
+		...value.session_speedup === void 0 ? {} : { session_speedup: value.session_speedup },
+		...value.task_baseline_cycles === void 0 ? {} : { task_baseline_cycles: value.task_baseline_cycles },
+		...value.overall_speedup === void 0 ? {} : { overall_speedup: value.overall_speedup }
+	};
+}
+function projectClassicRound(row) {
+	const estimate = row.estimate === void 0 ? void 0 : {
+		...row.estimate.cycles === void 0 ? {} : { cycles: row.estimate.cycles },
+		...row.estimate.speedup === void 0 ? {} : { speedup: row.estimate.speedup }
+	};
+	const measurement = row.measurement === void 0 ? void 0 : {
+		...row.measurement.baseline_cycles === void 0 ? {} : { baseline_cycles: row.measurement.baseline_cycles },
+		...row.measurement.candidate_cycles === void 0 ? {} : { candidate_cycles: row.measurement.candidate_cycles },
+		...row.measurement.candidate_speedup === void 0 ? {} : { candidate_speedup: row.measurement.candidate_speedup },
+		...row.measurement.incumbent_cycles === void 0 ? {} : { incumbent_cycles: row.measurement.incumbent_cycles },
+		...row.measurement.incumbent_speedup === void 0 ? {} : { incumbent_speedup: row.measurement.incumbent_speedup },
+		...row.measurement.best_improved === void 0 ? {} : { best_improved: row.measurement.best_improved },
+		...row.measurement.overall_speedup === void 0 ? {} : { overall_speedup: row.measurement.overall_speedup }
+	};
+	return {
+		number: row.number,
+		...row.workflow === void 0 ? {} : { workflow: row.workflow },
+		...row.workflow_origin === void 0 ? {} : { workflow_origin: row.workflow_origin },
+		...row.candidate_id === void 0 ? {} : { candidate_id: row.candidate_id },
+		host_verdict: row.host_verdict,
+		...row.failure_kind === void 0 ? {} : { failure_kind: row.failure_kind },
+		...estimate === void 0 ? {} : { estimate },
+		...measurement === void 0 ? {} : { measurement },
+		...row.decision === void 0 ? {} : { decision: row.decision }
+	};
+}
+function projectWorkflowDesign(design) {
+	return {
+		...design.name === void 0 ? {} : { name: design.name },
+		...design.description === void 0 ? {} : { description: design.description },
+		...design.whenToUse === void 0 ? {} : { whenToUse: design.whenToUse },
+		...design.technique === void 0 ? {} : { technique: design.technique },
+		...design.methodCategory === void 0 ? {} : { methodCategory: design.methodCategory },
+		...design.topology === void 0 ? {} : { topology: design.topology },
+		...design.phases === void 0 ? {} : { phases: design.phases.map((phase) => ({
+			title: phase.title,
+			detail: phase.detail
+		})) },
+		requiredArgs: [...design.requiredArgs],
+		languages: [...design.languages],
+		backends: [...design.backends],
+		integrationPatterns: [...design.integrationPatterns],
+		rationale: design.rationale,
+		source: design.source
+	};
+}
+function projectSessionDetail(row) {
+	return {
+		session_id: row.session_id,
+		session_dir: row.session_dir,
+		current_round: row.current_round,
+		steps: row.steps.map((step) => ({
+			id: step.id,
+			status: step.status
+		})),
+		selection: {
+			status: row.selection.status,
+			...row.selection.workflow === void 0 ? {} : { workflow: row.selection.workflow },
+			...row.selection.reason === void 0 ? {} : { reason: row.selection.reason },
+			rejectedCount: row.selection.rejectedCount
+		},
+		authoring: {
+			status: row.authoring.status,
+			files: row.authoring.files.map((file) => ({
+				name: file.name,
+				sha256: file.sha256,
+				bytes: file.bytes
+			})),
+			...row.authoring.design === void 0 ? {} : { design: projectWorkflowDesign(row.authoring.design) },
+			...row.authoring.omittedReason === void 0 ? {} : { omittedReason: row.authoring.omittedReason }
+		},
+		validation: {
+			status: row.validation.status,
+			checks: row.validation.checks.map((check) => ({
+				name: check.name,
+				passed: check.passed
+			}))
+		},
+		dispatch: {
+			status: row.dispatch.status,
+			...row.dispatch.runDir === void 0 ? {} : { runDir: row.dispatch.runDir },
+			...row.dispatch.runtimeStatus === void 0 ? {} : { runtimeStatus: row.dispatch.runtimeStatus }
+		},
+		rounds: (row.rounds ?? []).map(projectClassicRound),
+		...row.workflow === void 0 ? {} : { workflow: projectWorkflowDesign(row.workflow) }
+	};
 }
 function projectSession(row) {
 	return {
@@ -980,6 +1181,7 @@ function projectSession(row) {
 		integration_pattern: row.integration_pattern ?? null,
 		allow_workflow_authoring: row.allow_workflow_authoring ?? null,
 		workflow_authoring_budget: row.workflow_authoring_budget ?? null,
+		workflow_authoring_used: row.workflow_authoring_used ?? null,
 		kernel_name: row.kernel_name ?? null,
 		workflow: row.workflow ?? null,
 		selection_status: row.selection_status ?? null,
@@ -995,6 +1197,8 @@ function projectSession(row) {
 		candidate_ownership: row.candidate_ownership ?? null,
 		fresh_session: row.fresh_session ?? null,
 		best_speedup: row.best_speedup ?? null,
+		stop_reason: row.stop_reason ?? null,
+		cycle_lineage: row.cycle_lineage === void 0 || row.cycle_lineage === null ? null : projectCycleLineage(row.cycle_lineage),
 		warningCount: row.warnings.length
 	};
 }
@@ -1016,12 +1220,18 @@ async function readClassicSessionDetail(sessionDir) {
 			timeout: 1e4
 		});
 		const decoded = JSON.parse(stdout);
-		return isClassicSessionDetail(decoded) ? decoded : void 0;
+		return isClassicSessionDetail(decoded) ? projectSessionDetail(decoded) : void 0;
 	} catch {
 		return;
 	}
 }
-/** Invoke the installed bridge without a shell and return a bounded snapshot. */
+/**
+* Invoke the installed bridge without a shell and return a bounded snapshot.
+* @param limit - Maximum recent Sessions to retain.
+* @param staleAfterSeconds - Advisory unfinished-Session inactivity threshold.
+* @param roots - Configured, persisted, and Workspace roots supplied by the Host.
+* @returns Valid Session summaries plus structured bridge health.
+*/
 async function readClassicSessions(limit, staleAfterSeconds = 1800, roots = {}) {
 	const bridge = installedBridge();
 	try {
@@ -1094,6 +1304,157 @@ async function readClassicSessions(limit, staleAfterSeconds = 1800, roots = {}) 
 	}
 }
 //#endregion
+//#region lib/types/detail.js
+/** Bounded projection of one Workflow agent call's retained Codex artifacts. */
+const MAX_RESULT_BYTES = 1024 * 1024;
+const MAX_EVENTS_BYTES = 2 * 1024 * 1024;
+const MAX_MESSAGES = 12;
+const MAX_ACTIVITIES = 40;
+const MAX_MESSAGE_CHARS = 12e3;
+const MAX_ACTIVITY_LABEL_CHARS = 500;
+function optionalString$1(value) {
+	return typeof value === "string" && value.length > 0 ? value : void 0;
+}
+function optionalNumber$1(value) {
+	return typeof value === "number" && Number.isFinite(value) ? value : void 0;
+}
+function record(value) {
+	return value !== null && typeof value === "object" && !Array.isArray(value) ? value : void 0;
+}
+function stemOf(call) {
+	const label = call.label.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "agent";
+	return `${String(call.seq).padStart(5, "0")}-${label}`;
+}
+async function readBoundedJson(file) {
+	try {
+		const info = await stat(file);
+		if (!info.isFile() || info.size > MAX_RESULT_BYTES) return void 0;
+		return record(JSON.parse(await readFile(file, "utf8")));
+	} catch {
+		return;
+	}
+}
+async function readEventsPrefix(file) {
+	let handle;
+	try {
+		handle = await open(file, "r");
+		const buffer = Buffer.alloc(2097153);
+		const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+		const truncated = bytesRead > MAX_EVENTS_BYTES;
+		let text = buffer.subarray(0, Math.min(bytesRead, MAX_EVENTS_BYTES)).toString("utf8");
+		if (truncated) text = text.slice(0, Math.max(0, text.lastIndexOf("\n")));
+		return {
+			text,
+			truncated
+		};
+	} catch {
+		return { truncated: false };
+	} finally {
+		await handle?.close();
+	}
+}
+function usageOf(result) {
+	const usage = record(result?.usage);
+	if (usage === void 0) return void 0;
+	const inputTokens = optionalNumber$1(usage.input_tokens);
+	const cachedInputTokens = optionalNumber$1(usage.cached_input_tokens);
+	const outputTokens = optionalNumber$1(usage.output_tokens);
+	const totalTokens = optionalNumber$1(usage.total_tokens);
+	if (inputTokens === void 0 && cachedInputTokens === void 0 && outputTokens === void 0 && totalTokens === void 0) return void 0;
+	return {
+		...inputTokens === void 0 ? {} : { inputTokens },
+		...cachedInputTokens === void 0 ? {} : { cachedInputTokens },
+		...outputTokens === void 0 ? {} : { outputTokens },
+		...totalTokens === void 0 ? {} : { totalTokens }
+	};
+}
+/**
+* Read one discovered call's retained worker artifacts without forwarding tool payloads.
+* @param runDir - Exact discovered run directory.
+* @param call - Call already present in the folded run view.
+* @returns Bounded messages and activity names, or `undefined` when no artifacts exist.
+*/
+async function readCallDetail(runDir, call) {
+	const stem = stemOf(call);
+	const resultFile = path.join(runDir, ".runtime", "agent-results", `${stem}.json`);
+	const eventsFile = path.join(runDir, ".runtime", "agent-results", `${stem}.codex-events.jsonl`);
+	const [result, events] = await Promise.all([readBoundedJson(resultFile), readEventsPrefix(eventsFile)]);
+	if (result === void 0 && events.text === void 0) return void 0;
+	const messages = [];
+	const activities = [];
+	let truncated = events.truncated;
+	for (const line of events.text?.split("\n") ?? []) {
+		if (line.length === 0) continue;
+		let event;
+		try {
+			event = record(JSON.parse(line));
+		} catch {
+			truncated = true;
+			continue;
+		}
+		if (event?.type !== "item.completed") continue;
+		const item = record(event.item);
+		const id = optionalString$1(item?.id);
+		if (item?.type === "agent_message") {
+			const text = optionalString$1(item.text);
+			if (id === void 0 || text === void 0) continue;
+			if (messages.length >= MAX_MESSAGES) {
+				truncated = true;
+				continue;
+			}
+			if (text.length > MAX_MESSAGE_CHARS) truncated = true;
+			messages.push({
+				id,
+				text: text.slice(0, MAX_MESSAGE_CHARS)
+			});
+			continue;
+		}
+		if (activities.length >= MAX_ACTIVITIES) {
+			truncated = true;
+			continue;
+		}
+		if (item?.type === "mcp_tool_call") {
+			const server = optionalString$1(item.server);
+			const tool = optionalString$1(item.tool);
+			if (id === void 0 || tool === void 0) continue;
+			activities.push({
+				id,
+				kind: "tool",
+				label: `${server === void 0 ? "" : `${server}/`}${tool}`.slice(0, MAX_ACTIVITY_LABEL_CHARS),
+				status: optionalString$1(item.status) ?? "completed"
+			});
+		} else if (item?.type === "web_search") {
+			const query = optionalString$1(item.query);
+			if (id === void 0 || query === void 0) continue;
+			if (query.length > MAX_ACTIVITY_LABEL_CHARS) truncated = true;
+			activities.push({
+				id,
+				kind: "web-search",
+				label: query.slice(0, MAX_ACTIVITY_LABEL_CHARS),
+				status: "completed"
+			});
+		}
+	}
+	const isolation = optionalString$1(record(result?.isolation)?.effective);
+	const modelRole = result === void 0 || result.model_role === null ? result?.model_role : optionalString$1(result.model_role);
+	const provider = result === void 0 || result.provider === null ? result?.provider : optionalString$1(result.provider);
+	const threadId = optionalString$1(result?.thread_id);
+	const usage = usageOf(result);
+	return {
+		callId: call.callId,
+		runner: events.text === void 0 ? "unknown" : "codex-exec",
+		...threadId === void 0 ? {} : { threadId },
+		model: optionalString$1(result?.model) ?? null,
+		...modelRole === void 0 ? {} : { modelRole },
+		...provider === void 0 ? {} : { provider },
+		...isolation === void 0 ? {} : { isolation },
+		messages,
+		activities,
+		...usage === void 0 ? {} : { usage },
+		truncated
+	};
+}
+//#endregion
 //#region lib/types/fold.js
 /**
 * Pure fold of a KerSor `events.jsonl` stream into the viewer's run view
@@ -1125,14 +1486,37 @@ function workflowName(script) {
 	const parts = script.replaceAll("\\", "/").split("/").filter(Boolean);
 	return parts.length > 1 ? parts.at(-2) : parts.at(-1);
 }
-/** Copy one canonical result into the flat wire projection and its grouped view. */
+/**
+* Copy one canonical result into the flat wire projection and its grouped view.
+* @param view - Mutable folded run receiving the result.
+* @param result - Bounded candidate and Host verification projection.
+*/
 function applyWorkflowResult(view, result) {
 	view.result = result;
-	view.candidateStage = result.stage;
-	view.selectedCandidateId = result.selectedCandidateId;
-	view.expectedCycles = result.expectedCycles;
-	view.estimatedSpeedup = result.estimatedSpeedup;
-	view.measuredSpeedup = result.measuredSpeedup;
+	if (result.stage === void 0) delete view.candidateStage;
+	else view.candidateStage = result.stage;
+	if (result.verification === void 0) delete view.verification;
+	else view.verification = result.verification;
+	if (result.failureKind === void 0) delete view.failureKind;
+	else view.failureKind = result.failureKind;
+	if (result.selectedCandidateId === void 0) delete view.selectedCandidateId;
+	else view.selectedCandidateId = result.selectedCandidateId;
+	if (result.expectedCycles === void 0) delete view.expectedCycles;
+	else view.expectedCycles = result.expectedCycles;
+	if (result.measuredBaselineCycles === void 0) delete view.measuredBaselineCycles;
+	else view.measuredBaselineCycles = result.measuredBaselineCycles;
+	if (result.measuredCycles === void 0) delete view.measuredCycles;
+	else view.measuredCycles = result.measuredCycles;
+	if (result.estimatedSpeedup === void 0) delete view.estimatedSpeedup;
+	else view.estimatedSpeedup = result.estimatedSpeedup;
+	if (result.measuredSpeedup === void 0) delete view.measuredSpeedup;
+	else view.measuredSpeedup = result.measuredSpeedup;
+	if (result.incumbentCycles === void 0) delete view.incumbentCycles;
+	else view.incumbentCycles = result.incumbentCycles;
+	if (result.incumbentSpeedup === void 0) delete view.incumbentSpeedup;
+	else view.incumbentSpeedup = result.incumbentSpeedup;
+	if (result.bestImproved === void 0) delete view.bestImproved;
+	else view.bestImproved = result.bestImproved;
 	view.candidates = result.candidates;
 }
 function foldWorkflowLog(view, message) {
@@ -1184,7 +1568,11 @@ function callBucket(view, event, kind) {
 	view.totals.calls += 1;
 	return row;
 }
-/** Fold one parsed event into the view. Mutates `view` in place. */
+/**
+* Fold one parsed event into the view, mutating the view in place.
+* @param view - Mutable run projection receiving the event.
+* @param event - Validated Workflow runtime event.
+*/
 function foldEvent(view, event) {
 	switch (event.type) {
 		case "workflow.started":
@@ -1285,7 +1673,13 @@ function foldEvent(view, event) {
 		default: return;
 	}
 }
-/** Create an empty view for a discovered run directory. */
+/**
+* Create an empty view for a discovered run directory.
+* @param runId - Stable run identifier from discovery.
+* @param runDir - Absolute discovered run directory.
+* @param sessionDir - Absolute owning Session directory.
+* @returns Empty projection ready for event folding.
+*/
 function createRunView(runId, runDir, sessionDir) {
 	return {
 		runId,
@@ -1306,6 +1700,7 @@ function createRunView(runId, runDir, sessionDir) {
 //#region lib/types/result.js
 /** Bounded projection of a Workflow Host output for browser visualization. */
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
+const MAX_HOST_VERIFICATION_BYTES = 1024 * 1024;
 const MAX_CANDIDATES = 20;
 function optionalString(value) {
 	return typeof value === "string" && value.length > 0 ? value : void 0;
@@ -1313,20 +1708,33 @@ function optionalString(value) {
 function optionalNumber(value) {
 	return typeof value === "number" && Number.isFinite(value) ? value : void 0;
 }
+function failureKind(value) {
+	const reason = typeof value === "string" ? value.toLowerCase() : "";
+	if (reason.includes("correctness")) return "correctness";
+	if (reason.includes("benchmark")) return "benchmark";
+	return "infrastructure";
+}
+async function readObject(file, maxBytes) {
+	try {
+		const info = await stat(file);
+		if (!info.isFile() || info.size > maxBytes) return void 0;
+		const decoded = JSON.parse(await readFile(file, "utf8"));
+		return decoded !== null && typeof decoded === "object" && !Array.isArray(decoded) ? decoded : void 0;
+	} catch {
+		return;
+	}
+}
 /**
 * Read one canonical output without forwarding candidate source or arbitrary report text.
 * @param runDir - Exact discovered run directory.
 * @returns Bounded candidate-selection facts, or `undefined` when absent or invalid.
 */
 async function readWorkflowResult(runDir) {
-	const file = path.join(runDir, "output.json");
+	const [value, host] = await Promise.all([readObject(path.join(runDir, "output.json"), MAX_OUTPUT_BYTES), readObject(path.join(runDir, "host-verification.json"), MAX_HOST_VERIFICATION_BYTES)]);
 	try {
-		const info = await stat(file);
-		if (!info.isFile() || info.size > MAX_OUTPUT_BYTES) return void 0;
-		const decoded = JSON.parse(await readFile(file, "utf8"));
-		if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded)) return void 0;
-		const value = decoded;
-		const candidates = (Array.isArray(value.candidate_log) ? value.candidate_log : []).slice(0, MAX_CANDIDATES).flatMap((candidate) => {
+		if (value === void 0 && host === void 0) return void 0;
+		const output = value ?? {};
+		const candidates = (Array.isArray(output.candidate_log) ? output.candidate_log : []).slice(0, MAX_CANDIDATES).flatMap((candidate) => {
 			if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return [];
 			const row = candidate;
 			const id = optionalString(row.candidate_id);
@@ -1337,19 +1745,34 @@ async function readWorkflowResult(runDir) {
 				...expectedCycles === void 0 ? {} : { expectedCycles }
 			}];
 		});
-		const stage = optionalString(value.arch_stage);
-		const selectedCandidateId = optionalString(value.selected_candidate_id);
-		const expectedCycles = optionalNumber(value.expected_cycles_estimate);
-		const estimatedSpeedup = optionalNumber(value.estimated_speedup);
-		const measured = value.overall_speedup;
+		const hostMetric = host?.verdict === "pass" && host.metric !== null && typeof host.metric === "object" && !Array.isArray(host.metric) ? host.metric : void 0;
+		const verification = host?.verdict === "pass" ? "passed" : host?.verdict === "fail" ? "failed" : void 0;
+		const rejectedKind = verification === "failed" ? failureKind(host?.reason) : void 0;
+		const stage = verification === "passed" ? "host_verified" : verification === "failed" ? "host_rejected" : optionalString(output.arch_stage);
+		const selectedCandidateId = optionalString(output.selected_candidate_id);
+		const expectedCycles = optionalNumber(output.expected_cycles_estimate);
+		const measuredBaselineCycles = optionalNumber(hostMetric?.baseline_cycles);
+		const measuredCycles = optionalNumber(hostMetric?.candidate_cycles);
+		const estimatedSpeedup = optionalNumber(output.estimated_speedup);
+		const measured = hostMetric?.candidate_speedup ?? hostMetric?.speedup;
 		const measuredSpeedup = measured === null ? null : optionalNumber(measured);
-		if (stage === void 0 && selectedCandidateId === void 0 && expectedCycles === void 0 && estimatedSpeedup === void 0 && measuredSpeedup === void 0 && candidates.length === 0) return void 0;
+		const incumbentCycles = optionalNumber(hostMetric?.incumbent_cycles);
+		const incumbentSpeedup = optionalNumber(hostMetric?.incumbent_speedup);
+		const bestImproved = typeof hostMetric?.best_improved === "boolean" ? hostMetric.best_improved : void 0;
+		if (stage === void 0 && verification === void 0 && selectedCandidateId === void 0 && expectedCycles === void 0 && measuredBaselineCycles === void 0 && measuredCycles === void 0 && estimatedSpeedup === void 0 && measuredSpeedup === void 0 && candidates.length === 0) return void 0;
 		return {
 			...stage === void 0 ? {} : { stage },
+			...verification === void 0 ? {} : { verification },
+			...rejectedKind === void 0 ? {} : { failureKind: rejectedKind },
 			...selectedCandidateId === void 0 ? {} : { selectedCandidateId },
 			...expectedCycles === void 0 ? {} : { expectedCycles },
+			...measuredBaselineCycles === void 0 ? {} : { measuredBaselineCycles },
+			...measuredCycles === void 0 ? {} : { measuredCycles },
 			...estimatedSpeedup === void 0 ? {} : { estimatedSpeedup },
 			...measuredSpeedup === void 0 ? {} : { measuredSpeedup },
+			...incumbentCycles === void 0 ? {} : { incumbentCycles },
+			...incumbentSpeedup === void 0 ? {} : { incumbentSpeedup },
+			...bestImproved === void 0 ? {} : { bestImproved },
 			candidates
 		};
 	} catch {
@@ -1500,7 +1923,13 @@ async function scanSession(sessionDir, root) {
 		issues
 	};
 }
-/** Scan all roots and return discovered runs plus bounded observations. */
+/**
+* Scan all roots and return discovered runs plus bounded observations.
+* @param roots - Explicit KerSor Session roots.
+* @param includeDefaults - Whether built-in and installed-checkout roots participate.
+* @param workspaceRoots - Registered and persisted DSH Workspace roots.
+* @returns Complete committed inventory, run issues, and source observation.
+*/
 async function scanRoots(roots, includeDefaults, workspaceRoots = []) {
 	const startedAt = (/* @__PURE__ */ new Date()).toISOString();
 	const checkout = includeDefaults ? await configuredCheckout() : {};
@@ -1781,6 +2210,7 @@ let KersorViewerService = (() => {
 	let _snapshot_decorators;
 	let _runBacklog_decorators;
 	let _runResult_decorators;
+	let _runCallDetail_decorators;
 	let _classicSessionDetail_decorators;
 	return class KersorViewerService extends _classSuper {
 		static {
@@ -1788,6 +2218,7 @@ let KersorViewerService = (() => {
 			_snapshot_decorators = [Remote("snapshot")];
 			_runBacklog_decorators = [Remote("runBacklog")];
 			_runResult_decorators = [Remote("runResult")];
+			_runCallDetail_decorators = [Remote("runCallDetail")];
 			_classicSessionDetail_decorators = [Remote("classicSessionDetail")];
 			__esDecorate(this, null, _snapshot_decorators, {
 				kind: "method",
@@ -1822,6 +2253,17 @@ let KersorViewerService = (() => {
 				},
 				metadata: _metadata
 			}, null, _instanceExtraInitializers);
+			__esDecorate(this, null, _runCallDetail_decorators, {
+				kind: "method",
+				name: "runCallDetail",
+				static: false,
+				private: false,
+				access: {
+					has: (obj) => "runCallDetail" in obj,
+					get: (obj) => obj.runCallDetail
+				},
+				metadata: _metadata
+			}, null, _instanceExtraInitializers);
 			__esDecorate(this, null, _classicSessionDetail_decorators, {
 				kind: "method",
 				name: "classicSessionDetail",
@@ -1840,7 +2282,7 @@ let KersorViewerService = (() => {
 				value: _metadata
 			});
 		}
-		static inject = ["workspaceRegistry"];
+		static inject = ["workspaceRegistry", "sessionPersistence"];
 		static Config = Schema.object({
 			roots: Schema.array(Schema.string()).default([]),
 			noDefaultRoots: Schema.boolean().default(false),
@@ -1858,6 +2300,7 @@ let KersorViewerService = (() => {
 		group;
 		scanTimer;
 		scanInFlight;
+		persistedWorkspaceRoots = [];
 		scanObservation = {
 			state: "never",
 			roots: []
@@ -1866,6 +2309,7 @@ let KersorViewerService = (() => {
 			sessions: [],
 			source: { state: "not_installed" }
 		};
+		lastPublishedSnapshotFingerprint;
 		/** Create the service under the Host composition. */
 		constructor(ctx, config) {
 			super(ctx, "kersorViewer");
@@ -1905,7 +2349,10 @@ let KersorViewerService = (() => {
 			});
 			return this.group;
 		}
-		/** Complete inventory and source-health snapshot for panel refresh/reconnect. */
+		/**
+		* Read the complete inventory and source-health snapshot for refresh or reconnect.
+		* @returns Current atomic Host projection with a fresh observation timestamp.
+		*/
 		snapshot() {
 			return {
 				asOf: (/* @__PURE__ */ new Date()).toISOString(),
@@ -1917,7 +2364,11 @@ let KersorViewerService = (() => {
 				}
 			};
 		}
-		/** Full folded view of one run (panel open / reconnect backlog). */
+		/**
+		* Read the full folded view of one discovered run.
+		* @param runDir - Exact run directory from the current inventory.
+		* @returns Folded backlog with bounded result, or `undefined` for an unknown run.
+		*/
 		async runBacklog(runDir) {
 			const tracked = this.tracked.get(runDir);
 			if (tracked === void 0) return void 0;
@@ -1925,10 +2376,26 @@ let KersorViewerService = (() => {
 			if (result !== void 0) applyWorkflowResult(tracked.view, result);
 			return tracked.view;
 		}
-		/** Bounded candidate-selection result for one discovered run. */
+		/**
+		* Read the bounded candidate-selection result for one discovered run.
+		* @param runDir - Exact run directory from the current inventory.
+		* @returns Candidate and Host verification projection, or `undefined` when absent.
+		*/
 		async runResult(runDir) {
 			if (!this.tracked.has(runDir)) return void 0;
 			return readWorkflowResult(runDir);
+		}
+		/**
+		* Read bounded worker messages and activity names for one folded call.
+		* @param runDir - Exact discovered run directory.
+		* @param callId - Exact call identity present in that run's folded event stream.
+		* @returns Bounded detail, or `undefined` when the run, call, or artifacts are absent.
+		*/
+		async runCallDetail(runDir, callId) {
+			const tracked = this.tracked.get(runDir);
+			if (tracked === void 0) return void 0;
+			const call = tracked.view.phases.flatMap((phase) => phase.calls).find((candidate) => candidate.callId === callId);
+			return call === void 0 ? void 0 : readCallDetail(runDir, call);
 		}
 		/**
 		* Read sealed, bounded detail for one classic Session present in the snapshot.
@@ -1947,7 +2414,6 @@ let KersorViewerService = (() => {
 				state: "running",
 				startedAt: (/* @__PURE__ */ new Date()).toISOString()
 			};
-			this.publishSnapshot();
 			const current = this.performRescan().catch((error) => {
 				const now = (/* @__PURE__ */ new Date()).toISOString();
 				this.scanObservation = {
@@ -1966,7 +2432,8 @@ let KersorViewerService = (() => {
 			}
 		}
 		async performRescan() {
-			const workspaceRoots = [...new Set(this.rootCtx.workspaceRegistry.list().map((workspace) => workspace.path))];
+			const workspaceDiscovery = await this.discoverWorkspaceRoots();
+			const workspaceRoots = workspaceDiscovery.roots;
 			const [scanned, classic] = await Promise.all([scanRoots(this.configuredRoots, this.includeDefaults, workspaceRoots), this.classicSessionLimit === 0 ? Promise.resolve({
 				sessions: [],
 				source: { state: "disabled" }
@@ -1976,10 +2443,15 @@ let KersorViewerService = (() => {
 				workspaceRoots
 			})]);
 			const previousSuccess = this.scanObservation.lastSuccessfulAt;
-			this.scanObservation = scanned.observation.state === "failed" && previousSuccess !== void 0 ? {
+			const observation = workspaceDiscovery.issue === void 0 ? scanned.observation : {
 				...scanned.observation,
+				state: scanned.observation.state === "failed" ? "failed" : "degraded",
+				lastIssue: mergeIssue(this.scanObservation.lastIssue, workspaceDiscovery.issue)
+			};
+			this.scanObservation = observation.state === "failed" && previousSuccess !== void 0 ? {
+				...observation,
 				lastSuccessfulAt: previousSuccess
-			} : scanned.observation;
+			} : observation;
 			this.classicSnapshot = classic;
 			const byRunDir = new Map(scanned.runs.map((ref) => [ref.runDir, ref]));
 			const scanIssues = new Map(scanned.runIssues.map((entry) => [entry.runDir, entry.issue]));
@@ -2030,6 +2502,30 @@ let KersorViewerService = (() => {
 				else this.backfillTerminated(tracked);
 			}
 			this.publishSnapshot();
+		}
+		/** Merge managed Workspaces with durable Session cwd values, retaining the last good durable list on failure. */
+		async discoverWorkspaceRoots() {
+			const roots = /* @__PURE__ */ new Set();
+			for (const workspace of this.rootCtx.workspaceRegistry.list()) {
+				const normalized = normalizeAbsoluteCwd(workspace.path);
+				if (normalized !== void 0) roots.add(normalized);
+			}
+			let issue;
+			try {
+				const persisted = /* @__PURE__ */ new Set();
+				for (const header of await this.rootCtx.sessionPersistence.list()) {
+					const normalized = normalizeAbsoluteCwd(header.cwd);
+					if (normalized !== void 0) persisted.add(normalized);
+				}
+				this.persistedWorkspaceRoots = [...persisted].sort((left, right) => left.localeCompare(right));
+			} catch (error) {
+				issue = issueFromError("root_scan", error, "warning");
+			}
+			for (const persisted of this.persistedWorkspaceRoots) roots.add(persisted);
+			return {
+				roots: [...roots],
+				...issue === void 0 ? {} : { issue }
+			};
 		}
 		async backfillTerminated(tracked) {
 			const { ref, view } = tracked;
@@ -2165,9 +2661,13 @@ let KersorViewerService = (() => {
 			};
 		}
 		publishSnapshot() {
+			const snapshot = this.snapshot();
+			const fingerprint = snapshotFingerprint(snapshot);
+			if (fingerprint === this.lastPublishedSnapshotFingerprint) return;
+			this.lastPublishedSnapshotFingerprint = fingerprint;
 			this.rootCtx.emit("kersor/event", {
 				kind: "snapshot",
-				snapshot: this.snapshot()
+				snapshot
 			});
 		}
 		publishRun(run) {
@@ -2178,6 +2678,10 @@ let KersorViewerService = (() => {
 		}
 	};
 })();
+function normalizeAbsoluteCwd(value) {
+	if (typeof value !== "string" || value.length === 0 || value.includes("\0") || !path.isAbsolute(value)) return;
+	return path.normalize(value);
+}
 function rank(ref) {
 	if (ref.discovery === "active") return 2;
 	if (ref.discovery === "failed") return 1;
@@ -2189,6 +2693,48 @@ function terminalStatus(ref) {
 function observationFingerprint(observation) {
 	const issue = observation.lastIssue;
 	return `${observation.state}:${observation.byteOffset}:${observation.linesRead}:${issue?.stage ?? ""}:${issue?.code ?? ""}:${issue?.occurrences ?? 0}`;
+}
+function issueFingerprint(issue) {
+	return issue === void 0 ? void 0 : [
+		issue.stage,
+		issue.code,
+		issue.severity
+	];
+}
+/** Ignore scan clocks and repeated identical diagnostics when deciding whether browser state changed. */
+function snapshotFingerprint(snapshot) {
+	return JSON.stringify({
+		runs: snapshot.runs,
+		classic: {
+			sessions: snapshot.classic.sessions,
+			source: {
+				state: snapshot.classic.source.state,
+				issue: issueFingerprint(snapshot.classic.source.lastIssue)
+			}
+		},
+		scan: {
+			state: snapshot.diagnostics.scan.state,
+			roots: snapshot.diagnostics.scan.roots.map((root) => ({
+				root: root.root,
+				origin: root.origin,
+				state: root.state,
+				sessionsExamined: root.sessionsExamined,
+				sessionsAccepted: root.sessionsAccepted,
+				runsFound: root.runsFound,
+				issue: issueFingerprint(root.lastIssue)
+			})),
+			issue: issueFingerprint(snapshot.diagnostics.scan.lastIssue)
+		},
+		readers: snapshot.diagnostics.runs.map((run) => ({
+			runDir: run.runDir,
+			mode: run.mode,
+			state: run.state,
+			byteOffset: run.byteOffset,
+			linesRead: run.linesRead,
+			linesRejected: run.linesRejected,
+			issue: issueFingerprint(run.lastIssue)
+		}))
+	});
 }
 //#endregion
 export { KersorViewerService, KersorViewerService as default };

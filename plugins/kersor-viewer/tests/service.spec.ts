@@ -37,25 +37,163 @@ async function settleResult(service: KersorViewerService, runDir: string): Promi
   throw new Error('workflow result did not settle')
 }
 
+function sourceContext(
+  workspaceRoots: readonly string[] = [],
+  persistenceList: () => Promise<unknown[]> = () => Promise.resolve([]),
+): Context {
+  const ctx = new Context()
+  ctx.provide('workspaceRegistry', {
+    list: () => workspaceRoots.map(workspace => ({ path: workspace })),
+  } as never)
+  ctx.provide('sessionPersistence', { list: persistenceList } as never)
+  return ctx
+}
+
 afterEach(async () => {
   await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })))
 })
 
 describe('Host snapshot', () => {
   it('refuses detail reads outside the discovered classic Session inventory', async () => {
-    const ctx = new Context()
-    ctx.provide('workspaceRegistry', { list: () => [] } as never)
+    const ctx = sourceContext()
     const service = new KersorViewerService(ctx, {
       noDefaultRoots: true, classicSessionLimit: 0,
     })
 
     await expect(service.classicSessionDetail('/sessions/not-discovered')).resolves.toBeUndefined()
+    await expect(service.runCallDetail('/runs/not-discovered', 'Author/candidate/1')).resolves.toBeUndefined()
+  })
+
+  it('discovers persistence-only Session cwd roots while ignoring invalid and duplicate values', async () => {
+    const { workspace, runDir } = await fixture([
+      '{"type":"workflow.started"}',
+      '{"type":"workflow.completed"}',
+      '',
+    ].join('\n'))
+    const ctx = sourceContext([], () => Promise.resolve([
+      { cwd: workspace },
+      { cwd: `${workspace}${path.sep}` },
+      { cwd: 'relative/workspace' },
+      {},
+    ]))
+    const service = new KersorViewerService(ctx, {
+      noDefaultRoots: true, classicSessionLimit: 0,
+    })
+
+    await service.rescan()
+    await settleBackfill(service, runDir)
+    const snapshot = service.snapshot()
+    expect(snapshot.runs).toContainEqual(expect.objectContaining({ runDir }))
+    expect(snapshot.diagnostics.scan.roots).toEqual([
+      expect.objectContaining({
+        root: path.join(workspace, '.kersor'), origin: 'workspace', runsFound: 1,
+      }),
+    ])
+  })
+
+  it('does not republish a snapshot when only scan clocks changed', async () => {
+    const { workspace, runDir } = await fixture([
+      '{"type":"workflow.started"}',
+      '{"type":"workflow.completed"}',
+      '',
+    ].join('\n'))
+    const ctx = sourceContext([workspace])
+    const snapshots: string[] = []
+    ctx.on('kersor/event', (frame) => {
+      if (frame.kind === 'snapshot') snapshots.push(frame.snapshot.asOf)
+    })
+    const service = new KersorViewerService(ctx, {
+      noDefaultRoots: true, classicSessionLimit: 0,
+    })
+
+    await service.rescan()
+    await settleBackfill(service, runDir)
+    const afterFirstScan = snapshots.length
+    await service.rescan()
+
+    expect(snapshots).toHaveLength(afterFirstScan)
+  })
+
+  it('degrades a persistence listing failure without losing registry roots or publishing running state', async () => {
+    const { workspace, runDir } = await fixture([
+      '{"type":"workflow.started"}',
+      '{"type":"workflow.completed"}',
+      '',
+    ].join('\n'))
+    const failure = Object.assign(new Error('persistence unavailable'), { code: 'EIO' })
+    const ctx = sourceContext([workspace], () => Promise.reject(failure))
+    const published: string[] = []
+    ctx.on('kersor/event', (frame) => {
+      if (frame.kind === 'snapshot') published.push(frame.snapshot.diagnostics.scan.state)
+    })
+    const service = new KersorViewerService(ctx, {
+      noDefaultRoots: true, classicSessionLimit: 0,
+    })
+
+    await service.rescan()
+    await settleBackfill(service, runDir)
+    expect(service.snapshot()).toMatchObject({
+      runs: [{ runDir }],
+      diagnostics: {
+        scan: {
+          state: 'degraded',
+          roots: [{ root: path.join(workspace, '.kersor'), runsFound: 1 }],
+          lastIssue: { stage: 'root_scan', code: 'io_error', severity: 'warning' },
+        },
+      },
+    })
+    expect(published).not.toContain('running')
+  })
+
+  it('retains the last successful persistence roots across a later listing failure', async () => {
+    const registered = await fixture([
+      '{"type":"workflow.started"}',
+      '{"type":"workflow.completed"}',
+      '',
+    ].join('\n'))
+    const persisted = await fixture([
+      '{"type":"workflow.started"}',
+      '{"type":"workflow.completed"}',
+      '',
+    ].join('\n'))
+    let fail = false
+    const failure = Object.assign(new Error('persistence unavailable'), { code: 'EIO' })
+    const ctx = sourceContext([registered.workspace], () => fail
+      ? Promise.reject(failure)
+      : Promise.resolve([{ cwd: persisted.workspace }]))
+    const service = new KersorViewerService(ctx, {
+      noDefaultRoots: true, classicSessionLimit: 0,
+    })
+
+    await service.rescan()
+    await Promise.all([
+      settleBackfill(service, registered.runDir),
+      settleBackfill(service, persisted.runDir),
+    ])
+    fail = true
+    const published: string[] = []
+    ctx.on('kersor/event', (frame) => {
+      if (frame.kind === 'snapshot') published.push(frame.snapshot.diagnostics.scan.state)
+    })
+    await service.rescan()
+
+    const snapshot = service.snapshot()
+    expect(snapshot.runs.map(run => run.runDir).sort()).toEqual([
+      registered.runDir, persisted.runDir,
+    ].sort())
+    expect(snapshot.diagnostics.scan.roots.map(root => root.root).sort()).toEqual([
+      path.join(registered.workspace, '.kersor'),
+      path.join(persisted.workspace, '.kersor'),
+    ].sort())
+    expect(snapshot.diagnostics.scan).toMatchObject({
+      state: 'degraded', lastIssue: { stage: 'root_scan', code: 'io_error' },
+    })
+    expect(published).not.toContain('running')
   })
 
   it('keeps terminal lifecycle while exposing a missing backfill as structured failure', async () => {
     const { workspace, runDir } = await fixture(undefined)
-    const ctx = new Context()
-    ctx.provide('workspaceRegistry', { list: () => [{ path: workspace }] } as never)
+    const ctx = sourceContext([workspace])
     const service = new KersorViewerService(ctx, {
       noDefaultRoots: true, classicSessionLimit: 0,
     })
@@ -85,8 +223,7 @@ describe('Host snapshot', () => {
       '{"type":"workflow.completed"}',
       '',
     ].join('\n'))
-    const ctx = new Context()
-    ctx.provide('workspaceRegistry', { list: () => [{ path: workspace }] } as never)
+    const ctx = sourceContext([workspace])
     const service = new KersorViewerService(ctx, {
       noDefaultRoots: true, classicSessionLimit: 0,
     })
@@ -122,8 +259,12 @@ describe('Host snapshot', () => {
       ],
       ignored_secret: 'SECRET-OUTPUT-CONTENT',
     }))
-    const ctx = new Context()
-    ctx.provide('workspaceRegistry', { list: () => [{ path: workspace }] } as never)
+    await writeFile(path.join(runDir, 'host-verification.json'), JSON.stringify({
+      verdict: 'pass',
+      metric: { candidate_cycles: 2130, speedup: 69.35868544600939 },
+      ignored_secret: 'SECRET-HOST-CONTENT',
+    }))
+    const ctx = sourceContext([workspace])
     const service = new KersorViewerService(ctx, {
       noDefaultRoots: true, classicSessionLimit: 0,
     })
@@ -138,11 +279,12 @@ describe('Host snapshot', () => {
       workflow: 'vliw-pack',
       scriptHash: 'sha256:abc',
       result: {
-        stage: 'awaiting_host_verification',
+        stage: 'host_verified',
         selectedCandidateId: 'simd-batch-v1',
         expectedCycles: 2140,
+        measuredCycles: 2130,
         estimatedSpeedup: 69.03,
-        measuredSpeedup: null,
+        measuredSpeedup: 69.35868544600939,
         candidates: [
           { id: 'pack-scalar-v1', expectedCycles: 8700 },
           { id: 'simd-batch-v1', expectedCycles: 2140 },
@@ -150,6 +292,7 @@ describe('Host snapshot', () => {
       },
     })
     expect(JSON.stringify(view)).not.toContain('SECRET-OUTPUT-CONTENT')
+    expect(JSON.stringify(view)).not.toContain('SECRET-HOST-CONTENT')
     expect(result).toEqual(view?.result)
   })
 })

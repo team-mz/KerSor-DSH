@@ -4,14 +4,19 @@
  * @module @deepseek-ai/dsh-kersor-viewer
  */
 
+import path from 'node:path'
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { Fiber } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
+import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-workspace'
 import { readClassicSessionDetail, readClassicSessions } from './classic.ts'
 import type { KersorClassicSessionDetail, KersorClassicSnapshot } from './classic.ts'
 import { createIssue, issueFromError, mergeIssue } from './diagnostics.ts'
+import type { KersorDiagnosticIssue } from './diagnostics.ts'
+import { readCallDetail } from './detail.ts'
+import type { KersorCallDetailView } from './detail.ts'
 import { applyWorkflowResult, createRunView, foldEvent } from './fold.ts'
 import type { KersorEvent, KersorRunView } from './fold.ts'
 import { readWorkflowResult } from './result.ts'
@@ -23,6 +28,7 @@ import type { KersorRunObservation, KersorViewerFrame, KersorViewerSnapshot } fr
 
 export type { KersorEvent, KersorRunView } from './fold.ts'
 export type { KersorRunRef } from './scanner.ts'
+export type { KersorCallDetailView } from './detail.ts'
 export type {
   KersorBaselineAction, KersorClassicGate, KersorClassicHealth,
   KersorClassicLifecycle, KersorClassicSession,
@@ -55,9 +61,14 @@ interface TrackedRun {
   observation: KersorRunObservation
 }
 
+interface WorkspaceRootDiscovery {
+  readonly roots: readonly string[]
+  readonly issue?: KersorDiagnosticIssue
+}
+
 /** Host service owning the viewer's single snapshot and folded run views. */
 export class KersorViewerService extends TypertRemoteService {
-  static inject = ['workspaceRegistry']
+  static inject = ['workspaceRegistry', 'sessionPersistence']
 
   static Config: z<Config> = z.object({
     roots: z.array(z.string()).default([]),
@@ -77,11 +88,13 @@ export class KersorViewerService extends TypertRemoteService {
   private group: Fiber | undefined
   private scanTimer: NodeJS.Timeout | undefined
   private scanInFlight: Promise<void> | undefined
+  private persistedWorkspaceRoots: readonly string[] = []
   private scanObservation: KersorScanObservation = { state: 'never', roots: [] }
   private classicSnapshot: KersorClassicSnapshot = {
     sessions: [],
     source: { state: 'not_installed' },
   }
+  private lastPublishedSnapshotFingerprint: string | undefined
 
   /** Create the service under the Host composition. */
   constructor(ctx: Context, config: Config) {
@@ -121,7 +134,10 @@ export class KersorViewerService extends TypertRemoteService {
     return this.group
   }
 
-  /** Complete inventory and source-health snapshot for panel refresh/reconnect. */
+  /**
+   * Read the complete inventory and source-health snapshot for refresh or reconnect.
+   * @returns Current atomic Host projection with a fresh observation timestamp.
+   */
   @Remote('snapshot')
   snapshot(): KersorViewerSnapshot {
     return {
@@ -137,7 +153,11 @@ export class KersorViewerService extends TypertRemoteService {
     }
   }
 
-  /** Full folded view of one run (panel open / reconnect backlog). */
+  /**
+   * Read the full folded view of one discovered run.
+   * @param runDir - Exact run directory from the current inventory.
+   * @returns Folded backlog with bounded result, or `undefined` for an unknown run.
+   */
   @Remote('runBacklog')
   async runBacklog(runDir: string): Promise<KersorRunView | undefined> {
     const tracked = this.tracked.get(runDir)
@@ -147,11 +167,30 @@ export class KersorViewerService extends TypertRemoteService {
     return tracked.view
   }
 
-  /** Bounded candidate-selection result for one discovered run. */
+  /**
+   * Read the bounded candidate-selection result for one discovered run.
+   * @param runDir - Exact run directory from the current inventory.
+   * @returns Candidate and Host verification projection, or `undefined` when absent.
+   */
   @Remote('runResult')
   async runResult(runDir: string): Promise<KersorWorkflowResultView | undefined> {
     if (!this.tracked.has(runDir)) return undefined
     return readWorkflowResult(runDir)
+  }
+
+  /**
+   * Read bounded worker messages and activity names for one folded call.
+   * @param runDir - Exact discovered run directory.
+   * @param callId - Exact call identity present in that run's folded event stream.
+   * @returns Bounded detail, or `undefined` when the run, call, or artifacts are absent.
+   */
+  @Remote('runCallDetail')
+  async runCallDetail(runDir: string, callId: string): Promise<KersorCallDetailView | undefined> {
+    const tracked = this.tracked.get(runDir)
+    if (tracked === undefined) return undefined
+    const call = tracked.view.phases.flatMap(phase => phase.calls)
+      .find(candidate => candidate.callId === callId)
+    return call === undefined ? undefined : readCallDetail(runDir, call)
   }
 
   /**
@@ -173,7 +212,6 @@ export class KersorViewerService extends TypertRemoteService {
       state: 'running',
       startedAt: new Date().toISOString(),
     }
-    this.publishSnapshot()
     const current = this.performRescan().catch((error: unknown) => {
       const now = new Date().toISOString()
       this.scanObservation = {
@@ -193,9 +231,8 @@ export class KersorViewerService extends TypertRemoteService {
   }
 
   private async performRescan(): Promise<void> {
-    const workspaceRoots = [...new Set(
-      this.rootCtx.workspaceRegistry.list().map(workspace => workspace.path),
-    )]
+    const workspaceDiscovery = await this.discoverWorkspaceRoots()
+    const workspaceRoots = workspaceDiscovery.roots
     const [scanned, classic] = await Promise.all([
       scanRoots(this.configuredRoots, this.includeDefaults, workspaceRoots),
       this.classicSessionLimit === 0
@@ -207,9 +244,16 @@ export class KersorViewerService extends TypertRemoteService {
         }),
     ])
     const previousSuccess = this.scanObservation.lastSuccessfulAt
-    this.scanObservation = scanned.observation.state === 'failed' && previousSuccess !== undefined
-      ? { ...scanned.observation, lastSuccessfulAt: previousSuccess }
-      : scanned.observation
+    const observation = workspaceDiscovery.issue === undefined
+      ? scanned.observation
+      : {
+        ...scanned.observation,
+        state: scanned.observation.state === 'failed' ? 'failed' as const : 'degraded' as const,
+        lastIssue: mergeIssue(this.scanObservation.lastIssue, workspaceDiscovery.issue),
+      }
+    this.scanObservation = observation.state === 'failed' && previousSuccess !== undefined
+      ? { ...observation, lastSuccessfulAt: previousSuccess }
+      : observation
     this.classicSnapshot = classic
     const byRunDir = new Map(scanned.runs.map(ref => [ref.runDir, ref]))
     const scanIssues = new Map(scanned.runIssues.map(entry => [entry.runDir, entry.issue]))
@@ -263,6 +307,28 @@ export class KersorViewerService extends TypertRemoteService {
       else void this.backfillTerminated(tracked)
     }
     this.publishSnapshot()
+  }
+
+  /** Merge managed Workspaces with durable Session cwd values, retaining the last good durable list on failure. */
+  private async discoverWorkspaceRoots(): Promise<WorkspaceRootDiscovery> {
+    const roots = new Set<string>()
+    for (const workspace of this.rootCtx.workspaceRegistry.list()) {
+      const normalized = normalizeAbsoluteCwd(workspace.path)
+      if (normalized !== undefined) roots.add(normalized)
+    }
+    let issue: KersorDiagnosticIssue | undefined
+    try {
+      const persisted = new Set<string>()
+      for (const header of await this.rootCtx.sessionPersistence.list()) {
+        const normalized = normalizeAbsoluteCwd(header.cwd)
+        if (normalized !== undefined) persisted.add(normalized)
+      }
+      this.persistedWorkspaceRoots = [...persisted].sort((left, right) => left.localeCompare(right))
+    } catch (error) {
+      issue = issueFromError('root_scan', error, 'warning')
+    }
+    for (const persisted of this.persistedWorkspaceRoots) roots.add(persisted)
+    return { roots: [...roots], ...(issue === undefined ? {} : { issue }) }
   }
 
   private async backfillTerminated(tracked: TrackedRun): Promise<void> {
@@ -411,12 +477,23 @@ export class KersorViewerService extends TypertRemoteService {
   }
 
   private publishSnapshot(): void {
-    this.rootCtx.emit('kersor/event', { kind: 'snapshot', snapshot: this.snapshot() } satisfies KersorViewerFrame)
+    const snapshot = this.snapshot()
+    const fingerprint = snapshotFingerprint(snapshot)
+    if (fingerprint === this.lastPublishedSnapshotFingerprint) return
+    this.lastPublishedSnapshotFingerprint = fingerprint
+    this.rootCtx.emit('kersor/event', { kind: 'snapshot', snapshot } satisfies KersorViewerFrame)
   }
 
   private publishRun(run: KersorRunView): void {
     this.rootCtx.emit('kersor/event', { kind: 'run', run } satisfies KersorViewerFrame)
   }
+}
+
+function normalizeAbsoluteCwd(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length === 0 || value.includes('\0') || !path.isAbsolute(value)) {
+    return undefined
+  }
+  return path.normalize(value)
 }
 
 function rank(ref: KersorRunRef): number {
@@ -432,6 +509,46 @@ function terminalStatus(ref: KersorRunRef): 'completed' | 'failed' {
 function observationFingerprint(observation: KersorRunObservation): string {
   const issue = observation.lastIssue
   return `${observation.state}:${observation.byteOffset}:${observation.linesRead}:${issue?.stage ?? ''}:${issue?.code ?? ''}:${issue?.occurrences ?? 0}`
+}
+
+function issueFingerprint(issue: KersorDiagnosticIssue | undefined): readonly string[] | undefined {
+  return issue === undefined ? undefined : [issue.stage, issue.code, issue.severity]
+}
+
+/** Ignore scan clocks and repeated identical diagnostics when deciding whether browser state changed. */
+function snapshotFingerprint(snapshot: KersorViewerSnapshot): string {
+  return JSON.stringify({
+    runs: snapshot.runs,
+    classic: {
+      sessions: snapshot.classic.sessions,
+      source: {
+        state: snapshot.classic.source.state,
+        issue: issueFingerprint(snapshot.classic.source.lastIssue),
+      },
+    },
+    scan: {
+      state: snapshot.diagnostics.scan.state,
+      roots: snapshot.diagnostics.scan.roots.map(root => ({
+        root: root.root,
+        origin: root.origin,
+        state: root.state,
+        sessionsExamined: root.sessionsExamined,
+        sessionsAccepted: root.sessionsAccepted,
+        runsFound: root.runsFound,
+        issue: issueFingerprint(root.lastIssue),
+      })),
+      issue: issueFingerprint(snapshot.diagnostics.scan.lastIssue),
+    },
+    readers: snapshot.diagnostics.runs.map(run => ({
+      runDir: run.runDir,
+      mode: run.mode,
+      state: run.state,
+      byteOffset: run.byteOffset,
+      linesRead: run.linesRead,
+      linesRejected: run.linesRejected,
+      issue: issueFingerprint(run.lastIssue),
+    })),
+  })
 }
 
 /** Cordis plugin entry: the service class itself. */

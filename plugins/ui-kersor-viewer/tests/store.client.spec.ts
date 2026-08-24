@@ -25,6 +25,7 @@ const CLASSIC_DETAIL: KersorClassicSessionDetail = {
   authoring: { status: 'in_progress', files: [] },
   validation: { status: 'pending', checks: [] },
   dispatch: { status: 'pending' },
+  rounds: [],
 }
 
 function snapshot(overrides: Partial<KersorViewerSnapshot> = {}): KersorViewerSnapshot {
@@ -157,15 +158,59 @@ describe('folded run views', () => {
     store.setSnapshot(snapshot())
     store.setBacklog('/runs/r1', runView('completed'))
     store.setRunResult('/runs/r1', {
-      selectedCandidateId: 'candidate-a', candidates: [{ id: 'candidate-a' }],
+      verification: 'failed', failureKind: 'correctness',
+      selectedCandidateId: 'candidate-a', estimatedSpeedup: 1.2,
+      candidates: [{ id: 'candidate-a' }],
     })
     expect(store.activeView?.result).toEqual({
-      selectedCandidateId: 'candidate-a', candidates: [{ id: 'candidate-a' }],
+      verification: 'failed', failureKind: 'correctness',
+      selectedCandidateId: 'candidate-a', estimatedSpeedup: 1.2,
+      candidates: [{ id: 'candidate-a' }],
     })
+    expect(store.activeView).toMatchObject({
+      verification: 'failed', failureKind: 'correctness', estimatedSpeedup: 1.2,
+    })
+  })
+
+  it('stores bounded call detail independently from the run backlog', () => {
+    const store = new KersorViewerStore()
+    store.setSnapshot(snapshot())
+    store.setCallDetailLoading('/runs/r1', 'Author/candidate/1')
+    expect(store.getSnapshot().callDetailLoading).toBe('/runs/r1\u0000Author/candidate/1')
+    store.setCallDetail('/runs/r1', 'Author/candidate/1', {
+      callId: 'Author/candidate/1', runner: 'codex-exec', model: null,
+      messages: [], activities: [], truncated: false,
+    })
+    expect(store.callDetail('/runs/r1', 'Author/candidate/1')?.runner).toBe('codex-exec')
+    expect(store.getSnapshot().callDetailLoading).toBeUndefined()
   })
 })
 
 describe('classic Session details', () => {
+  it('selects one experiment and its newest discovered run together', () => {
+    const store = new KersorViewerStore()
+    store.setSnapshot(snapshot({
+      runs: [
+        { ...REF, round: 1, runDir: '/sessions/s1/run-1' },
+        { ...REF, round: 2, runDir: '/sessions/s1/run-2' },
+        { ...REF, sessionDir: '/sessions/s2', runDir: '/sessions/s2/run-1' },
+      ],
+      classic: {
+        source: { state: 'healthy' },
+        sessions: [{
+          session_id: 's1', session_dir: '/sessions/s1', storage_kind: 'v2',
+          lifecycle: 'active', status: 'in-progress', health: 'active', warningCount: 0,
+        }],
+      },
+    }))
+
+    expect(store.selectClassic('/sessions/s1')).toBe('/sessions/s1/run-2')
+    expect(store.selectedClassicSessionDir).toBe('/sessions/s1')
+    expect(store.selectedRunDir).toBe('/sessions/s1/run-2')
+    store.select('/sessions/s2/run-1')
+    expect(store.selectedClassicSessionDir).toBe('/sessions/s2')
+  })
+
   it('keeps a selected detail separate from the atomic summary snapshot', () => {
     const store = new KersorViewerStore()
     store.setSnapshot(snapshot({

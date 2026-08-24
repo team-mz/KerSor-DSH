@@ -4,7 +4,7 @@
  * @module @deepseek-ai/dsh-client-ui-kersor-viewer/client
  */
 
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ClientContext, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
@@ -13,6 +13,8 @@ import type {} from '@deepseek-ai/dsh-kersor-viewer/remote'
 import type { KersorViewerFrame } from '@deepseek-ai/dsh-kersor-viewer/types'
 import type { KersorActiveFrame, KersorTaskId } from '@deepseek-ai/dsh-kersor/types'
 import { KersorView } from './KersorView.tsx'
+import { KersorExperimentNode, type KersorExperimentInjected } from './KersorExperimentNode.tsx'
+import { kersorExperimentDefinition } from './experiment-definition.ts'
 import { KersorViewerStore } from './store.ts'
 import type { KersorViewFace } from './slots.ts'
 import { en, NS, zh } from './locales.ts'
@@ -36,13 +38,39 @@ export { NS }
 export type { KersorViewerKey } from './locales.ts'
 
 /** Required services: viewer UI seams, assembled Remotes, and Host inventory. */
-export const inject = ['slots', 'locale', 'remote', 'remote.pluginInventory']
+export const inject = [
+  'slots', 'locale', 'remote', 'remote.pluginInventory', 'sessions', 'conversationEvents',
+]
 
 /** Mount the KerSor viewer surfaces over the API assembly's Remote namespaces. */
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'kersor-viewer: dictionaries')
+  ctx.conversationEvents.register(kersorExperimentDefinition)
+  ctx.slots.inject('conversation.chat.node', () => ctx.slots.register({
+    name: 'conversation.chat.node',
+    key: 'kersor-experiment',
+    locale: NS,
+    inject: (): KersorExperimentInjected => ({
+      openController(childSessionId: SessionId) {
+        const parentSessionId = ctx.sessions.list.getSnapshot().current
+        if (parentSessionId === undefined) return
+        void ctx.sessions.refreshSubagents(parentSessionId).then(() => {
+          ctx.sessions.openSubagent({ parentSessionId, childSessionId, mode: 'continuable' })
+        })
+      },
+    }),
+  }, KersorExperimentNode))
 
   const store = new KersorViewerStore()
+  const classicDetailRevisions = new Map<string, string>()
+
+  const classicRevision = (sessionDir: string): string | undefined => {
+    const session = store.getSnapshot().snapshot?.classic.sessions
+      .find(candidate => candidate.session_dir === sessionDir)
+    return session === undefined
+      ? undefined
+      : `${session.last_activity_at ?? ''}:${session.phase ?? ''}:${session.current_round ?? ''}`
+  }
 
   const launcherRemote = (): ClientContext['remote']['kersor'] | undefined =>
     ctx.get('remote.kersor') as ClientContext['remote']['kersor'] | undefined
@@ -81,7 +109,7 @@ export function apply(ctx: ClientContext): void {
         store.setBacklog(selected, backlog.value)
       }
       const selectedClassic = store.selectedClassicSessionDir
-      if (selectedClassic !== undefined) await loadClassic(selectedClassic)
+      if (selectedClassic !== undefined) await loadClassicIfChanged(selectedClassic)
     } catch (error) {
       store.setTransportError(error instanceof Error ? error.message : String(error))
     }
@@ -140,8 +168,30 @@ export function apply(ctx: ClientContext): void {
         return
       }
       store.setClassicDetail(sessionDir, answered.value)
+      const revision = classicRevision(sessionDir)
+      if (revision !== undefined) classicDetailRevisions.set(sessionDir, revision)
     } catch (error) {
       store.setClassicDetailError(sessionDir, error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  const loadClassicIfChanged = async (sessionDir: string): Promise<void> => {
+    const revision = classicRevision(sessionDir)
+    if (revision !== undefined && classicDetailRevisions.get(sessionDir) === revision) return
+    await loadClassic(sessionDir)
+  }
+
+  const loadCallDetail = async (runDir: string, callId: string): Promise<void> => {
+    store.setCallDetailLoading(runDir, callId)
+    try {
+      const answered = await viewerRemote().runCallDetail(runDir, callId)
+      if (!answered.ok) {
+        store.setCallDetailError(runDir, callId, `${answered.error.code}: ${answered.error.message}`)
+        return
+      }
+      store.setCallDetail(runDir, callId, answered.value)
+    } catch (error) {
+      store.setCallDetailError(runDir, callId, error instanceof Error ? error.message : String(error))
     }
   }
 
@@ -189,12 +239,13 @@ export function apply(ctx: ClientContext): void {
 
   ctx.on('connection/reset', () => {
     store.reset()
+    classicDetailRevisions.clear()
     void refresh()
   })
   ctx.remote.$on('kersor/event', (frame: KersorViewerFrame) => {
     store.applyFrame(frame)
     if (frame.kind === 'snapshot' && store.selectedClassicSessionDir !== undefined) {
-      void loadClassic(store.selectedClassicSessionDir)
+      void loadClassicIfChanged(store.selectedClassicSessionDir)
     }
   })
   ctx.remote.$on('kersor/active', (frame: KersorActiveFrame) => {
@@ -202,7 +253,7 @@ export function apply(ctx: ClientContext): void {
   })
   void refresh()
 
-  const face: KersorViewFace = { store, refresh, loadRun, loadClassic, start, stop }
+  const face = { store, refresh, loadRun, loadCallDetail, loadClassic, start, stop }
   const t = ctx.locale.bind(NS)
   ctx.slots.inject('conversation.view', () => ctx.slots.register({
     name: 'conversation.view',
@@ -210,7 +261,10 @@ export function apply(ctx: ClientContext): void {
     order: 20,
     locale: NS,
     label: () => t('view.kersor'),
-    inject: () => face,
+    inject: (sessionId): KersorViewFace => {
+      const currentWorkspace = ctx.sessions.list.getSnapshot().byId[sessionId]?.cwd
+      return { ...face, ...(currentWorkspace === undefined ? {} : { currentWorkspace }) }
+    },
   }, KersorView))
 
 }

@@ -42,10 +42,18 @@ print(json.dumps({"sessions": [{
   "lifecycle": "active", "status": "in-progress", "health": "active",
   "kernel_language": "python_reference", "backend": "python",
   "integration_pattern": "custom_simulator",
-  "allow_workflow_authoring": True, "workflow_authoring_budget": 1,
+  "allow_workflow_authoring": True, "workflow_authoring_budget": 3,
+  "workflow_authoring_used": 1,
   "workflow": "vliw-schedule", "fit_confidence": "high",
   "profile_evidence": "pass", "profile_owner": "kernel-profiler · child-s1",
   "decision": "CONTINUE: measure the candidate",
+  "stop_reason": "execution_budget_exhausted",
+  "cycle_lineage": {
+    "session_baseline_cycles": 14415, "best_cycles": 13358,
+    "session_speedup": 1.0791286120676749,
+    "task_baseline_cycles": 147734, "overall_speedup": 11.05958975894595,
+    "extra": "SECRET-LINEAGE"
+  },
   "warnings": ["SECRET-SESSION-WARNING"], "extra": "SECRET-EXTRA-FIELD"
 }], "warnings": ["SECRET-BRIDGE-WARNING"]}))
 `)
@@ -58,12 +66,21 @@ print(json.dumps({"sessions": [{
         backend: 'python',
         integration_pattern: 'custom_simulator',
         allow_workflow_authoring: true,
-        workflow_authoring_budget: 1,
+        workflow_authoring_budget: 3,
+        workflow_authoring_used: 1,
         workflow: 'vliw-schedule',
         fit_confidence: 'high',
         profile_evidence: 'pass',
         profile_owner: 'kernel-profiler · child-s1',
         decision: 'CONTINUE: measure the candidate',
+        stop_reason: 'execution_budget_exhausted',
+        cycle_lineage: {
+          session_baseline_cycles: 14415,
+          best_cycles: 13358,
+          session_speedup: 1.0791286120676749,
+          task_baseline_cycles: 147734,
+          overall_speedup: 11.05958975894595,
+        },
         warningCount: 1,
       }],
       source: { state: 'degraded', lastIssue: { stage: 'classic_bridge', code: 'io_error' } },
@@ -131,7 +148,34 @@ print(json.dumps({
     }
   },
   "validation": {"status": "pending", "checks": []},
-  "dispatch": {"status": "pending"}
+  "dispatch": {"status": "pending"},
+  "rounds": [
+    {
+      "number": 1, "workflow": "vliw-author", "workflow_origin": "catalog",
+      "candidate_id": "vliw-r1", "host_verdict": "pass",
+      "estimate": {"cycles": 13415, "speedup": 1.0745, "extra": "SECRET-ESTIMATE"},
+      "measurement": {
+        "baseline_cycles": 14415, "candidate_cycles": 13358,
+        "candidate_speedup": 1.0791286120676749, "incumbent_cycles": 13358,
+        "incumbent_speedup": 1.0791286120676749, "best_improved": True,
+        "overall_speedup": 11.05958975894595, "extra": "SECRET-MEASUREMENT"
+      },
+      "decision": "CONTINUE: target not met", "extra": "SECRET-ROUND"
+    },
+    {
+      "number": 2, "workflow": "vliw-author", "workflow_origin": "authored",
+      "candidate_id": "vliw-r2", "host_verdict": "fail", "failure_kind": "correctness",
+      "estimate": {"cycles": 13392, "speedup": 1.0763}
+    }
+  ],
+  "workflow": {
+    "name": "vliw-author", "description": "Pack VLIW slots", "whenToUse": "custom simulator",
+    "technique": "instruction_scheduling", "methodCategory": "vliw_optimization",
+    "topology": "pipeline", "phases": [{"title": "Analyze", "detail": "Inspect bundles"}],
+    "requiredArgs": ["kernel_path"], "languages": ["python_reference"],
+    "backends": ["python"], "integrationPatterns": ["custom_simulator"],
+    "rationale": "verified dispatch rationale", "source": "const result = {}"
+  }
 }))
 `)
 
@@ -143,6 +187,86 @@ print(json.dumps({
         status: 'sealed',
         design: { name: 'vliw-author', rationale: 'sealed rationale' },
       },
+      workflow: {
+        name: 'vliw-author',
+        description: 'Pack VLIW slots',
+        phases: [{ title: 'Analyze', detail: 'Inspect bundles' }],
+      },
+      rounds: [
+        {
+          number: 1,
+          workflow: 'vliw-author',
+          workflow_origin: 'catalog',
+          candidate_id: 'vliw-r1',
+          host_verdict: 'pass',
+          estimate: { cycles: 13415, speedup: 1.0745 },
+          measurement: {
+            baseline_cycles: 14415,
+            candidate_cycles: 13358,
+            candidate_speedup: 1.0791286120676749,
+            incumbent_cycles: 13358,
+            incumbent_speedup: 1.0791286120676749,
+            best_improved: true,
+            overall_speedup: 11.05958975894595,
+          },
+          decision: 'CONTINUE: target not met',
+        },
+        {
+          number: 2,
+          workflow: 'vliw-author',
+          workflow_origin: 'authored',
+          candidate_id: 'vliw-r2',
+          host_verdict: 'fail',
+          failure_kind: 'correctness',
+          estimate: { cycles: 13392, speedup: 1.0763 },
+        },
+      ],
     })
+    expect(JSON.stringify(detail)).not.toContain('SECRET')
+  })
+
+  it('rejects measured values on a failed Host round', async () => {
+    process.env.DSH_HOME = await tempDshHome()
+    process.env.KERSOR_PYTHON = 'python3'
+    const bridge = installedBridge()
+    await mkdir(path.dirname(bridge), { recursive: true })
+    await writeFile(bridge, `
+import json
+print(json.dumps({
+  "session_id": "s1", "session_dir": "/sessions/s1", "current_round": 1,
+  "steps": [],
+  "selection": {"status": "selected", "workflow": "unsafe", "rejectedCount": 0},
+  "authoring": {"status": "not_started", "files": []},
+  "validation": {"status": "pending", "checks": []},
+  "dispatch": {"status": "failed"},
+  "rounds": [{
+    "number": 1, "host_verdict": "fail", "failure_kind": "correctness",
+    "measurement": {"candidate_cycles": 1}
+  }]
+}))
+`)
+
+    expect(await readClassicSessionDetail('/sessions/s1')).toBeUndefined()
+  })
+
+  it('rejects a Session chronology beyond the Host item bound', async () => {
+    process.env.DSH_HOME = await tempDshHome()
+    process.env.KERSOR_PYTHON = 'python3'
+    const bridge = installedBridge()
+    await mkdir(path.dirname(bridge), { recursive: true })
+    await writeFile(bridge, `
+import json
+print(json.dumps({
+  "session_id": "s1", "session_dir": "/sessions/s1", "current_round": 101,
+  "steps": [],
+  "selection": {"status": "pending", "rejectedCount": 0},
+  "authoring": {"status": "not_started", "files": []},
+  "validation": {"status": "pending", "checks": []},
+  "dispatch": {"status": "pending"},
+  "rounds": [{"number": number, "host_verdict": "pending"} for number in range(1, 102)]
+}))
+`)
+
+    expect(await readClassicSessionDetail('/sessions/s1')).toBeUndefined()
   })
 })

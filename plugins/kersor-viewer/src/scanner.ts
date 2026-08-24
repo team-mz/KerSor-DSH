@@ -223,7 +223,13 @@ async function scanSession(
   return { runs, issues }
 }
 
-/** Scan all roots and return discovered runs plus bounded observations. */
+/**
+ * Scan all roots and return discovered runs plus bounded observations.
+ * @param roots - Explicit KerSor Session roots.
+ * @param includeDefaults - Whether built-in and installed-checkout roots participate.
+ * @param workspaceRoots - Registered and persisted DSH Workspace roots.
+ * @returns Complete committed inventory, run issues, and source observation.
+ */
 export async function scanRoots(
   roots: readonly string[],
   includeDefaults: boolean,

@@ -14,6 +14,7 @@ export interface EventsTailerObservation {
     readonly lastReadAt?: string;
     readonly lastIssue?: KersorDiagnosticIssue;
 }
+/** Optional polling and observation callbacks for one position-tracking tailer. */
 export interface EventsTailerOptions {
     /** Poll fallback interval; also bounds watch-event latency. */
     readonly pollMs?: number;

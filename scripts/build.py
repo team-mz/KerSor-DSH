@@ -122,33 +122,13 @@ def normalize_generated_bundles(viewer: Path, ui: Path, zod_version: str) -> Non
         "//#region ../../../node_modules/zod/",
         f"//#region ../../../node_modules/.pnpm/zod@{zod_version}/node_modules/zod/",
     )
-    css_prefix = re.search(r"\.([A-Za-z0-9_-]+)_layer", client)
-    if css_prefix is None:
+    css_prefixes = list(dict.fromkeys(
+        re.findall(r"\.([A-Za-z0-9_-]+)_(?:view|card)", client)
+    ))
+    if not css_prefixes:
         raise BuildError("generated client bundle lacks the KerSor CSS module")
-    client = client.replace(f"{css_prefix.group(1)}_", "krsr01_")
-    class_maps = re.finditer(
-        r"(?ms)^(\s*var [A-Za-z0-9_$]+_default = \{\n)(.*?)(^\s*\};)$",
-        client,
-    )
-    class_map = next((match for match in class_maps if '"layer"' in match.group(2)), None)
-    if class_map is None:
-        raise BuildError("generated client bundle lacks the KerSor CSS class map")
-    entries = sorted(
-        (line.rstrip(",") for line in class_map.group(2).splitlines()),
-        key=str.strip,
-    )
-    entries = [
-        f"{line}{',' if index < len(entries) - 1 else ''}"
-        for index, line in enumerate(entries)
-    ]
-    client = (
-        client[: class_map.start()]
-        + class_map.group(1)
-        + "\n".join(entries)
-        + "\n"
-        + class_map.group(3)
-        + client[class_map.end() :]
-    )
+    for index, prefix in enumerate(css_prefixes, start=1):
+        client = client.replace(f"{prefix}_", f"krsr{index:02d}_")
     normalized = "\n".join(line.rstrip(" \t") for line in client.split("\n"))
     client_bundle.write_text(normalized, encoding="utf-8")
 
@@ -171,6 +151,9 @@ def build(dsh_root: Path) -> None:
         staging = Path(temporary)
         for config in ("tsconfig.base.json", "tsconfig.base.client.json"):
             shutil.copy2(dsh_root / config, staging / config)
+        scripts = staging / "scripts"
+        scripts.mkdir()
+        link(require(dsh_root / "scripts" / "types", "DSH compiler type roots"), scripts / "types")
         link(require(dsh_root / "vendor", "DSH vendor tree"), staging / "vendor")
 
         packages = staging / "packages"
@@ -248,8 +231,8 @@ def build(dsh_root: Path) -> None:
 
         for name in ("kersor-viewer", "ui-kersor-viewer"):
             built = require(
-                dsh_root / "packages" / "extensions" / name / "lib",
-                f"DSH-owned {name} artifacts",
+                extensions / name / "lib",
+                f"verified staged {name} artifacts",
             )
             destination = ROOT / "plugins" / name / "lib"
             shutil.copytree(

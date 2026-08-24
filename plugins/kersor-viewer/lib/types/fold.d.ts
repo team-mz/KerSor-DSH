@@ -39,10 +39,18 @@ export interface KersorCandidateResultView {
 /** Candidate-selection and verification state owned by one Workflow output. */
 export interface KersorWorkflowResultView {
     readonly stage?: string;
+    readonly verification?: 'passed' | 'failed';
+    readonly failureKind?: 'correctness' | 'benchmark' | 'infrastructure';
     readonly selectedCandidateId?: string;
     readonly expectedCycles?: number;
+    readonly measuredBaselineCycles?: number;
+    readonly measuredCycles?: number;
     readonly estimatedSpeedup?: number;
+    /** Host-measured speedup of this candidate, not the retained incumbent. */
     readonly measuredSpeedup?: number | null;
+    readonly incumbentCycles?: number;
+    readonly incumbentSpeedup?: number;
+    readonly bestImproved?: boolean;
     readonly candidates: readonly KersorCandidateResultView[];
 }
 /** Folded projection of one KerSor autonomous run. */
@@ -66,10 +74,17 @@ export interface KersorRunView {
     error?: string | undefined;
     result?: KersorWorkflowResultView | undefined;
     candidateStage?: string | undefined;
+    verification?: 'passed' | 'failed' | undefined;
+    failureKind?: 'correctness' | 'benchmark' | 'infrastructure' | undefined;
     selectedCandidateId?: string | undefined;
     expectedCycles?: number | undefined;
+    measuredBaselineCycles?: number | undefined;
+    measuredCycles?: number | undefined;
     estimatedSpeedup?: number | undefined;
     measuredSpeedup?: number | null | undefined;
+    incumbentCycles?: number | undefined;
+    incumbentSpeedup?: number | undefined;
+    bestImproved?: boolean | undefined;
     candidates?: readonly KersorCandidateResultView[] | undefined;
 }
 /** Shape of one parsed `events.jsonl` line (superset; unknown fields ignored). */
@@ -91,10 +106,24 @@ export interface KersorEvent {
     } | string;
     [key: string]: unknown;
 }
-/** Copy one canonical result into the flat wire projection and its grouped view. */
+/**
+ * Copy one canonical result into the flat wire projection and its grouped view.
+ * @param view - Mutable folded run receiving the result.
+ * @param result - Bounded candidate and Host verification projection.
+ */
 export declare function applyWorkflowResult(view: KersorRunView, result: KersorWorkflowResultView): void;
-/** Fold one parsed event into the view. Mutates `view` in place. */
+/**
+ * Fold one parsed event into the view, mutating the view in place.
+ * @param view - Mutable run projection receiving the event.
+ * @param event - Validated Workflow runtime event.
+ */
 export declare function foldEvent(view: KersorRunView, event: KersorEvent): void;
-/** Create an empty view for a discovered run directory. */
+/**
+ * Create an empty view for a discovered run directory.
+ * @param runId - Stable run identifier from discovery.
+ * @param runDir - Absolute discovered run directory.
+ * @param sessionDir - Absolute owning Session directory.
+ * @returns Empty projection ready for event folding.
+ */
 export declare function createRunView(runId: string, runDir: string, sessionDir: string): KersorRunView;
 //# sourceMappingURL=fold.d.ts.map

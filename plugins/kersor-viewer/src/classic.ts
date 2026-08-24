@@ -13,10 +13,23 @@ import type { KersorDiagnosticIssue } from './diagnostics.ts'
 
 const execFileAsync = promisify(execFile)
 
+/** Canonical lifecycle read from the KerSor Session store. */
 export type KersorClassicLifecycle = 'active' | 'completed' | 'stalled' | 'cancelled'
+/** Advisory artifact health, kept separate from canonical lifecycle. */
 export type KersorClassicHealth = 'active' | 'stale' | 'needs_resume' | 'terminal' | 'unknown'
+/** Four-state result of one deterministic protocol gate. */
 export type KersorClassicGate = 'pass' | 'fail' | 'pending' | 'not_required'
+/** Canonical next action for an incomplete Session baseline witness. */
 export type KersorBaselineAction = 'init' | 'record_verify' | 'new_session'
+/** Canonical terminal cause, distinct from resumability and health. */
+export type KersorClassicStopReason =
+  | 'target_met'
+  | 'execution_budget_exhausted'
+  | 'selection_stalled'
+  | 'authoring_budget_exhausted'
+  | 'cancelled'
+  | 'single_run_complete'
+/** User-facing combination of lifecycle and resumability. */
 export type KersorClassicStatus =
   | 'terminal-complete'
   | 'terminal-stalled'
@@ -46,6 +59,7 @@ export interface KersorClassicSession {
   readonly integration_pattern?: string | null
   readonly allow_workflow_authoring?: boolean | null
   readonly workflow_authoring_budget?: number | null
+  readonly workflow_authoring_used?: number | null
   readonly kernel_name?: string | null
   readonly workflow?: string | null
   /** Outcome of the deterministic selector, separate from a Workflow name. */
@@ -63,7 +77,49 @@ export interface KersorClassicSession {
   readonly candidate_ownership?: KersorClassicGate | null
   readonly fresh_session?: KersorClassicGate | null
   readonly best_speedup?: number | null
+  readonly stop_reason?: KersorClassicStopReason | null
+  /** Host-verified cycle lineage; Workflow estimates never contribute. */
+  readonly cycle_lineage?: KersorClassicCycleLineage | null
   readonly warningCount: number
+}
+
+/** Host-verified lineage from the task baseline through the Session incumbent. */
+export interface KersorClassicCycleLineage {
+  readonly session_baseline_cycles?: number
+  readonly best_cycles?: number
+  readonly session_speedup?: number
+  readonly task_baseline_cycles?: number
+  readonly overall_speedup?: number
+}
+
+/** Workflow-authored estimate, never presented as Host measurement. */
+export interface KersorClassicRoundEstimate {
+  readonly cycles?: number
+  readonly speedup?: number
+}
+
+/** Measurement accepted by the Host correctness and benchmark gates. */
+export interface KersorClassicRoundMeasurement {
+  readonly baseline_cycles?: number
+  readonly candidate_cycles?: number
+  readonly candidate_speedup?: number
+  readonly incumbent_cycles?: number
+  readonly incumbent_speedup?: number
+  readonly best_improved?: boolean
+  readonly overall_speedup?: number
+}
+
+/** One bounded round in the canonical Session chronology. */
+export interface KersorClassicRound {
+  readonly number: number
+  readonly workflow?: string
+  readonly workflow_origin?: 'catalog' | 'authored'
+  readonly candidate_id?: string
+  readonly host_verdict: 'pending' | 'pass' | 'fail'
+  readonly failure_kind?: 'correctness' | 'benchmark' | 'infrastructure'
+  readonly estimate?: KersorClassicRoundEstimate
+  readonly measurement?: KersorClassicRoundMeasurement
+  readonly decision?: string
 }
 
 /** Stable stage identifiers rendered by the classic Session inspector. */
@@ -102,12 +158,21 @@ export interface KersorClassicArtifact {
   readonly bytes: number
 }
 
+/** One declared phase in the selected Workflow's portable DSH envelope. */
+export interface KersorClassicWorkflowPhase {
+  readonly title: string
+  readonly detail: string
+}
+
 /** Curated routing metadata plus sealed, read-only design text. */
 export interface KersorClassicWorkflowDesign {
   readonly name?: string
+  readonly description?: string
+  readonly whenToUse?: string
   readonly technique?: string
   readonly methodCategory?: string
   readonly topology?: string
+  readonly phases?: readonly KersorClassicWorkflowPhase[]
   readonly requiredArgs: readonly string[]
   readonly languages: readonly string[]
   readonly backends: readonly string[]
@@ -153,6 +218,10 @@ export interface KersorClassicSessionDetail {
   readonly authoring: KersorClassicAuthoringDetail
   readonly validation: KersorClassicValidationDetail
   readonly dispatch: KersorClassicDispatchDetail
+  /** Complete bounded chronology supplied on demand, ordered by round number. */
+  readonly rounds: readonly KersorClassicRound[]
+  /** Hash-verified selected Workflow, whether released or Session-authored. */
+  readonly workflow?: KersorClassicWorkflowDesign
 }
 
 /** Health of the optional classic-Session bridge. */
@@ -178,6 +247,12 @@ interface RawClassicSession extends Omit<KersorClassicSession, 'warningCount'> {
   readonly warnings: readonly string[]
 }
 
+interface RawClassicSessionDetail extends Omit<KersorClassicSessionDetail, 'rounds'> {
+  readonly rounds?: readonly KersorClassicRound[]
+}
+
+const MAX_CLASSIC_ROUNDS = 100
+
 function dshHome(): string {
   const configured = process.env.DSH_HOME?.trim()
   if (!configured) return path.join(homedir(), '.dsh')
@@ -187,7 +262,10 @@ function dshHome(): string {
     : path.resolve(configured)
 }
 
-/** Path copied by the portable preset installer. */
+/**
+ * Resolve the bridge path copied by the portable preset installer.
+ * @returns Absolute bridge path under the configured DSH home.
+ */
 export function installedBridge(): string {
   return path.join(dshHome(), '.agent-presets', 'kersor', 'bin', 'kersor_bridge.py')
 }
@@ -210,6 +288,18 @@ function optionalBoolean(value: unknown): boolean {
 
 function optionalNumber(value: unknown): boolean {
   return value === undefined || value === null || typeof value === 'number'
+}
+
+function finiteNonNegative(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+}
+
+function optionalFiniteNonNegative(value: unknown): boolean {
+  return value === undefined || finiteNonNegative(value)
+}
+
+function optionalBoundedString(value: unknown, maximum: number): boolean {
+  return value === undefined || (typeof value === 'string' && Buffer.byteLength(value) <= maximum)
 }
 
 function optionalGate(value: unknown): boolean {
@@ -240,9 +330,92 @@ function isClassicValidationCheck(value: unknown): value is KersorClassicValidat
   return typeof check.name === 'string' && typeof check.passed === 'boolean'
 }
 
-function isClassicSessionDetail(value: unknown): value is KersorClassicSessionDetail {
+function isClassicCycleLineage(value: unknown): value is KersorClassicCycleLineage {
   if (value === null || typeof value !== 'object') return false
-  const detail = value as Partial<KersorClassicSessionDetail>
+  const lineage = value as Partial<KersorClassicCycleLineage>
+  const fields = [
+    lineage.session_baseline_cycles,
+    lineage.best_cycles,
+    lineage.session_speedup,
+    lineage.task_baseline_cycles,
+    lineage.overall_speedup,
+  ]
+  return fields.some(field => field !== undefined) && fields.every(optionalFiniteNonNegative)
+}
+
+function isClassicRoundEstimate(value: unknown): value is KersorClassicRoundEstimate {
+  if (value === null || typeof value !== 'object') return false
+  const estimate = value as Partial<KersorClassicRoundEstimate>
+  const fields = [estimate.cycles, estimate.speedup]
+  return fields.some(field => field !== undefined) && fields.every(optionalFiniteNonNegative)
+}
+
+function isClassicRoundMeasurement(value: unknown): value is KersorClassicRoundMeasurement {
+  if (value === null || typeof value !== 'object') return false
+  const measurement = value as Partial<KersorClassicRoundMeasurement>
+  const fields = [
+    measurement.baseline_cycles,
+    measurement.candidate_cycles,
+    measurement.candidate_speedup,
+    measurement.incumbent_cycles,
+    measurement.incumbent_speedup,
+    measurement.overall_speedup,
+  ]
+  return fields.some(field => field !== undefined) && fields.every(optionalFiniteNonNegative)
+    && (measurement.best_improved === undefined || typeof measurement.best_improved === 'boolean')
+}
+
+function isClassicRound(value: unknown): value is KersorClassicRound {
+  if (value === null || typeof value !== 'object') return false
+  const round = value as Partial<KersorClassicRound>
+  if (typeof round.number !== 'number' || !Number.isInteger(round.number) || round.number < 1
+    || !optionalBoundedString(round.workflow, 1024)
+    || !optionalBoundedString(round.candidate_id, 1024)
+    || !optionalBoundedString(round.decision, 8192)
+    || (round.workflow_origin !== undefined && !['catalog', 'authored'].includes(round.workflow_origin))
+    || !['pending', 'pass', 'fail'].includes(round.host_verdict ?? '')) return false
+  if (round.failure_kind !== undefined
+    && !['correctness', 'benchmark', 'infrastructure'].includes(round.failure_kind)) return false
+  if (round.estimate !== undefined && !isClassicRoundEstimate(round.estimate)) return false
+  if (round.measurement !== undefined && !isClassicRoundMeasurement(round.measurement)) return false
+  if (round.host_verdict !== 'pass' && round.measurement !== undefined) return false
+  if (round.host_verdict !== 'fail' && round.failure_kind !== undefined) return false
+  return true
+}
+
+function isClassicRounds(value: unknown): value is readonly KersorClassicRound[] {
+  if (!Array.isArray(value) || value.length > MAX_CLASSIC_ROUNDS || !value.every(isClassicRound)) return false
+  return value.every((round, index) => index === 0 || round.number > (value[index - 1]?.number ?? 0))
+}
+
+function isClassicWorkflowPhase(value: unknown): value is KersorClassicWorkflowPhase {
+  if (value === null || typeof value !== 'object') return false
+  const phase = value as Partial<KersorClassicWorkflowPhase>
+  return typeof phase.title === 'string' && typeof phase.detail === 'string'
+}
+
+function isClassicWorkflowDesign(value: unknown): value is KersorClassicWorkflowDesign {
+  if (value === null || typeof value !== 'object') return false
+  const design = value as Partial<KersorClassicWorkflowDesign>
+  return optionalDetailString(design.name)
+    && optionalDetailString(design.description)
+    && optionalDetailString(design.whenToUse)
+    && optionalDetailString(design.technique)
+    && optionalDetailString(design.methodCategory)
+    && optionalDetailString(design.topology)
+    && (design.phases === undefined
+      || (Array.isArray(design.phases) && design.phases.every(isClassicWorkflowPhase)))
+    && stringArray(design.requiredArgs)
+    && stringArray(design.languages)
+    && stringArray(design.backends)
+    && stringArray(design.integrationPatterns)
+    && typeof design.rationale === 'string'
+    && typeof design.source === 'string'
+}
+
+function isClassicSessionDetail(value: unknown): value is RawClassicSessionDetail {
+  if (value === null || typeof value !== 'object') return false
+  const detail = value as Partial<RawClassicSessionDetail>
   if (typeof detail.session_id !== 'string' || typeof detail.session_dir !== 'string'
     || typeof detail.current_round !== 'number' || !Number.isInteger(detail.current_round)
     || detail.current_round < 1 || !Array.isArray(detail.steps)) return false
@@ -267,22 +440,19 @@ function isClassicSessionDetail(value: unknown): value is KersorClassicSessionDe
   if (authoring.omittedReason !== undefined
     && !['too_large', 'invalid', 'hash_mismatch'].includes(authoring.omittedReason)) return false
   if (authoring.design !== undefined) {
-    const design = authoring.design
-    if (!optionalDetailString(design.name) || !optionalDetailString(design.technique)
-      || !optionalDetailString(design.methodCategory) || !optionalDetailString(design.topology)
-      || !stringArray(design.requiredArgs) || !stringArray(design.languages)
-      || !stringArray(design.backends) || !stringArray(design.integrationPatterns)
-      || typeof design.rationale !== 'string' || typeof design.source !== 'string') return false
+    if (!isClassicWorkflowDesign(authoring.design)) return false
   }
   const validation = detail.validation
   if (validation === undefined || !['pending', 'passed', 'failed'].includes(validation.status)
     || !Array.isArray(validation.checks)
     || !validation.checks.every(isClassicValidationCheck)) return false
+  if (detail.rounds !== undefined && !isClassicRounds(detail.rounds)) return false
   const dispatch = detail.dispatch
   return dispatch !== undefined
     && ['pending', 'preparing', 'running', 'completed', 'failed'].includes(dispatch.status)
     && optionalDetailString(dispatch.runDir)
     && optionalDetailString(dispatch.runtimeStatus)
+    && (detail.workflow === undefined || isClassicWorkflowDesign(detail.workflow))
 }
 
 function isClassicSession(value: unknown): value is RawClassicSession {
@@ -303,6 +473,12 @@ function isClassicSession(value: unknown): value is RawClassicSession {
     && optionalString(row.integration_pattern)
     && optionalBoolean(row.allow_workflow_authoring)
     && optionalNumber(row.workflow_authoring_budget)
+    && optionalNumber(row.workflow_authoring_used)
+    && (row.workflow_authoring_used === undefined || row.workflow_authoring_used === null
+      || (Number.isInteger(row.workflow_authoring_used) && row.workflow_authoring_used >= 0))
+    && (row.workflow_authoring_budget === undefined || row.workflow_authoring_budget === null
+      || row.workflow_authoring_used === undefined || row.workflow_authoring_used === null
+      || row.workflow_authoring_used <= row.workflow_authoring_budget)
     && (row.selection_status === undefined || row.selection_status === null
       || ['pending', 'stalled', 'selected'].includes(row.selection_status))
     && optionalString(row.decision)
@@ -316,8 +492,115 @@ function isClassicSession(value: unknown): value is RawClassicSession {
     && optionalGate(row.dsh_compatibility)
     && optionalGate(row.candidate_ownership)
     && optionalGate(row.fresh_session)
+    && (row.stop_reason === undefined || row.stop_reason === null
+      || ['target_met', 'execution_budget_exhausted', 'selection_stalled',
+        'authoring_budget_exhausted', 'cancelled', 'single_run_complete'].includes(row.stop_reason))
+    && (row.cycle_lineage === undefined || row.cycle_lineage === null
+      || isClassicCycleLineage(row.cycle_lineage))
     && Array.isArray(row.warnings)
     && row.warnings.every(item => typeof item === 'string')
+}
+
+function projectCycleLineage(value: KersorClassicCycleLineage): KersorClassicCycleLineage {
+  return {
+    ...(value.session_baseline_cycles === undefined
+      ? {} : { session_baseline_cycles: value.session_baseline_cycles }),
+    ...(value.best_cycles === undefined ? {} : { best_cycles: value.best_cycles }),
+    ...(value.session_speedup === undefined ? {} : { session_speedup: value.session_speedup }),
+    ...(value.task_baseline_cycles === undefined
+      ? {} : { task_baseline_cycles: value.task_baseline_cycles }),
+    ...(value.overall_speedup === undefined ? {} : { overall_speedup: value.overall_speedup }),
+  }
+}
+
+function projectClassicRound(row: KersorClassicRound): KersorClassicRound {
+  const estimate = row.estimate === undefined ? undefined : {
+    ...(row.estimate.cycles === undefined ? {} : { cycles: row.estimate.cycles }),
+    ...(row.estimate.speedup === undefined ? {} : { speedup: row.estimate.speedup }),
+  }
+  const measurement = row.measurement === undefined ? undefined : {
+    ...(row.measurement.baseline_cycles === undefined
+      ? {} : { baseline_cycles: row.measurement.baseline_cycles }),
+    ...(row.measurement.candidate_cycles === undefined
+      ? {} : { candidate_cycles: row.measurement.candidate_cycles }),
+    ...(row.measurement.candidate_speedup === undefined
+      ? {} : { candidate_speedup: row.measurement.candidate_speedup }),
+    ...(row.measurement.incumbent_cycles === undefined
+      ? {} : { incumbent_cycles: row.measurement.incumbent_cycles }),
+    ...(row.measurement.incumbent_speedup === undefined
+      ? {} : { incumbent_speedup: row.measurement.incumbent_speedup }),
+    ...(row.measurement.best_improved === undefined
+      ? {} : { best_improved: row.measurement.best_improved }),
+    ...(row.measurement.overall_speedup === undefined
+      ? {} : { overall_speedup: row.measurement.overall_speedup }),
+  }
+  return {
+    number: row.number,
+    ...(row.workflow === undefined ? {} : { workflow: row.workflow }),
+    ...(row.workflow_origin === undefined ? {} : { workflow_origin: row.workflow_origin }),
+    ...(row.candidate_id === undefined ? {} : { candidate_id: row.candidate_id }),
+    host_verdict: row.host_verdict,
+    ...(row.failure_kind === undefined ? {} : { failure_kind: row.failure_kind }),
+    ...(estimate === undefined ? {} : { estimate }),
+    ...(measurement === undefined ? {} : { measurement }),
+    ...(row.decision === undefined ? {} : { decision: row.decision }),
+  }
+}
+
+function projectWorkflowDesign(design: KersorClassicWorkflowDesign): KersorClassicWorkflowDesign {
+  return {
+    ...(design.name === undefined ? {} : { name: design.name }),
+    ...(design.description === undefined ? {} : { description: design.description }),
+    ...(design.whenToUse === undefined ? {} : { whenToUse: design.whenToUse }),
+    ...(design.technique === undefined ? {} : { technique: design.technique }),
+    ...(design.methodCategory === undefined ? {} : { methodCategory: design.methodCategory }),
+    ...(design.topology === undefined ? {} : { topology: design.topology }),
+    ...(design.phases === undefined
+      ? {} : { phases: design.phases.map(phase => ({ title: phase.title, detail: phase.detail })) }),
+    requiredArgs: [...design.requiredArgs],
+    languages: [...design.languages],
+    backends: [...design.backends],
+    integrationPatterns: [...design.integrationPatterns],
+    rationale: design.rationale,
+    source: design.source,
+  }
+}
+
+function projectSessionDetail(row: RawClassicSessionDetail): KersorClassicSessionDetail {
+  return {
+    session_id: row.session_id,
+    session_dir: row.session_dir,
+    current_round: row.current_round,
+    steps: row.steps.map(step => ({ id: step.id, status: step.status })),
+    selection: {
+      status: row.selection.status,
+      ...(row.selection.workflow === undefined ? {} : { workflow: row.selection.workflow }),
+      ...(row.selection.reason === undefined ? {} : { reason: row.selection.reason }),
+      rejectedCount: row.selection.rejectedCount,
+    },
+    authoring: {
+      status: row.authoring.status,
+      files: row.authoring.files.map(file => ({
+        name: file.name, sha256: file.sha256, bytes: file.bytes,
+      })),
+      ...(row.authoring.design === undefined
+        ? {} : { design: projectWorkflowDesign(row.authoring.design) }),
+      ...(row.authoring.omittedReason === undefined
+        ? {} : { omittedReason: row.authoring.omittedReason }),
+    },
+    validation: {
+      status: row.validation.status,
+      checks: row.validation.checks.map(check => ({ name: check.name, passed: check.passed })),
+    },
+    dispatch: {
+      status: row.dispatch.status,
+      ...(row.dispatch.runDir === undefined ? {} : { runDir: row.dispatch.runDir }),
+      ...(row.dispatch.runtimeStatus === undefined
+        ? {} : { runtimeStatus: row.dispatch.runtimeStatus }),
+    },
+    rounds: (row.rounds ?? []).map(projectClassicRound),
+    ...(row.workflow === undefined ? {} : { workflow: projectWorkflowDesign(row.workflow) }),
+  }
 }
 
 function projectSession(row: RawClassicSession): KersorClassicSession {
@@ -341,6 +624,7 @@ function projectSession(row: RawClassicSession): KersorClassicSession {
     integration_pattern: row.integration_pattern ?? null,
     allow_workflow_authoring: row.allow_workflow_authoring ?? null,
     workflow_authoring_budget: row.workflow_authoring_budget ?? null,
+    workflow_authoring_used: row.workflow_authoring_used ?? null,
     kernel_name: row.kernel_name ?? null,
     workflow: row.workflow ?? null,
     selection_status: row.selection_status ?? null,
@@ -356,6 +640,10 @@ function projectSession(row: RawClassicSession): KersorClassicSession {
     candidate_ownership: row.candidate_ownership ?? null,
     fresh_session: row.fresh_session ?? null,
     best_speedup: row.best_speedup ?? null,
+    stop_reason: row.stop_reason ?? null,
+    cycle_lineage: row.cycle_lineage === undefined || row.cycle_lineage === null
+      ? null
+      : projectCycleLineage(row.cycle_lineage),
     warningCount: row.warnings.length,
   }
 }
@@ -377,14 +665,20 @@ export async function readClassicSessionDetail(
       timeout: 10_000,
     })
     const decoded: unknown = JSON.parse(stdout)
-    return isClassicSessionDetail(decoded) ? decoded : undefined
+    return isClassicSessionDetail(decoded) ? projectSessionDetail(decoded) : undefined
   } catch {
     // A selectable Session remains usable as a summary when detail is unavailable.
     return undefined
   }
 }
 
-/** Invoke the installed bridge without a shell and return a bounded snapshot. */
+/**
+ * Invoke the installed bridge without a shell and return a bounded snapshot.
+ * @param limit - Maximum recent Sessions to retain.
+ * @param staleAfterSeconds - Advisory unfinished-Session inactivity threshold.
+ * @param roots - Configured, persisted, and Workspace roots supplied by the Host.
+ * @returns Valid Session summaries plus structured bridge health.
+ */
 export async function readClassicSessions(
   limit: number,
   staleAfterSeconds = 1800,

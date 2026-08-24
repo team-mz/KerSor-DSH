@@ -12,6 +12,7 @@
     "src/tailer.ts",
     "src/classic.ts",
     "src/diagnostics.ts",
+    "src/detail.ts",
     "src/fold.ts",
     "src/result.ts",
     "src/invariant.ts"
@@ -28,6 +29,9 @@
     },
     {
       "path": "../../runtime-diagnostics/invariants"
+    },
+    {
+      "path": "../../session/session-persistence"
     },
     {
       "path": "../../workspace/workspace"

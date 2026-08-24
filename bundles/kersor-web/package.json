@@ -1,7 +1,7 @@
 {
   "name": "@qhy991/dsh-kersor-web",
-  "description": "Read-only KerSor optimization Session and Workflow viewer for the DSH web profile",
-  "version": "0.1.18",
+  "description": "KerSor Experiment Chat nodes plus optimization Session and Workflow viewer for DSH web",
+  "version": "0.1.19",
   "private": true,
   "type": "module",
   "license": "MIT",

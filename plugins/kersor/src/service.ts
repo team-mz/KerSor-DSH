@@ -215,7 +215,7 @@ export class KersorService extends TypertRemoteService {
       startedTs: new Date().toISOString(),
       pid: handle.pid,
     }
-    const owned = { ref, handle, settled: Promise.resolve() } as OwnedLaunch
+    const owned: OwnedLaunch = { ref, handle, settled: Promise.resolve() }
     owned.settled = handle.done.then(
       (outcome) => { this.finish(owned, outcome.exitCode === 0 ? undefined : `exit ${String(outcome.exitCode)}`) },
       (error: unknown) => { this.finish(owned, error instanceof Error ? error.message : String(error)) },

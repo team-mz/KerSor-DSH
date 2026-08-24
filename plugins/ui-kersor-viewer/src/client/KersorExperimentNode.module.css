@@ -1,0 +1,127 @@
+.card {
+  margin: 8px 0 14px;
+  padding: 14px;
+  border: 1px solid var(--dsw-alias-border-normal, #d9dce3);
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-module-platform, #fff);
+}
+
+.header, .footer, .facts {
+  display: flex;
+  align-items: center;
+}
+
+.header {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.eyebrow {
+  color: var(--dsw-alias-fg-secondary, #667085);
+  font-size: 12px;
+}
+
+.title {
+  margin-top: 2px;
+  font-weight: 650;
+}
+
+.status {
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--dsw-alias-bg-base-hover, #f2f4f7);
+  font-size: 12px;
+}
+
+.objective, .next {
+  margin: 10px 0 0;
+  line-height: 1.45;
+}
+
+.facts {
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin-top: 10px;
+  color: var(--dsw-alias-fg-secondary, #667085);
+  font-size: 12px;
+}
+
+.progress {
+  margin-top: 12px;
+}
+
+.progressTrack {
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--dsw-alias-bg-base-hover, #eaecf0);
+}
+
+.progressTrack > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--dsw-alias-fg-business-primary, #4f46e5);
+  transition: width 160ms ease;
+}
+
+.steps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
+  gap: 8px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+
+.steps li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #98a2b3;
+}
+
+.steps li[data-step-status='active'] .dot { background: #f79009; }
+.steps li[data-step-status='completed'] .dot { background: #12b76a; }
+.steps li[data-step-status='failed'] .dot { background: #f04438; }
+
+.next {
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-base-hover, #f7f8fa);
+  font-size: 13px;
+}
+
+.footer {
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.open {
+  padding: 6px 10px;
+  border: 1px solid var(--dsw-alias-border-normal, #d0d5dd);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.open:disabled { cursor: default; opacity: .5; }
+
+.footer code {
+  overflow: hidden;
+  color: var(--dsw-alias-fg-secondary, #667085);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

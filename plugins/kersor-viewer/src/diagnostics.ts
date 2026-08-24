@@ -38,7 +38,13 @@ export interface KersorDiagnosticIssue {
   readonly lastSeenAt: string
 }
 
-/** Create a safe issue from a runtime failure without retaining its message. */
+/**
+ * Create a safe issue from a runtime failure without retaining its message.
+ * @param stage - Operation that failed.
+ * @param error - Untrusted runtime failure to classify without its text.
+ * @param severity - Stable user-facing impact category.
+ * @returns Content-free diagnostic safe for the Remote wire.
+ */
 export function issueFromError(
   stage: KersorDiagnosticStage,
   error: unknown,
@@ -47,7 +53,13 @@ export function issueFromError(
   return createIssue(stage, classifyError(stage, error), severity)
 }
 
-/** Create a safe issue for a validated failure code. */
+/**
+ * Create a safe issue for a validated failure code.
+ * @param stage - Operation that failed.
+ * @param code - Stable failure classification.
+ * @param severity - Stable user-facing impact category.
+ * @returns Content-free diagnostic safe for the Remote wire.
+ */
 export function createIssue(
   stage: KersorDiagnosticStage,
   code: KersorDiagnosticCode,
@@ -56,7 +68,12 @@ export function createIssue(
   return { stage, code, severity, occurrences: 1, lastSeenAt: new Date().toISOString() }
 }
 
-/** Merge repeated identical failures while bounding history to the latest kind. */
+/**
+ * Merge repeated identical failures while bounding history to the latest kind.
+ * @param previous - Previously retained issue, when one exists.
+ * @param current - Newly observed issue.
+ * @returns Current issue with an accumulated count only for the same kind.
+ */
 export function mergeIssue(
   previous: KersorDiagnosticIssue | undefined,
   current: KersorDiagnosticIssue,
@@ -65,7 +82,11 @@ export function mergeIssue(
   return { ...current, occurrences: previous.occurrences + 1 }
 }
 
-/** Return whether an unknown exception carries a Node-style error code. */
+/**
+ * Read a Node-style error code from an unknown exception.
+ * @param error - Unknown caught value.
+ * @returns Stringified code, or `undefined` when none is present.
+ */
 export function errorCode(error: unknown): string | undefined {
   return typeof error === 'object' && error !== null && 'code' in error
     ? String(error.code)

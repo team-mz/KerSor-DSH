@@ -1,9 +1,9 @@
 /**
- * Package-owned invariant companion for `@deepseek-ai/dsh-kersor`.
+ * Package-owned invariants for the KerSor launcher and conversation binding.
  * @module @deepseek-ai/dsh-kersor/invariant
  */
 import type { Context } from '@deepseek-ai/cordis';
-/** KerSor launcher companion plugin name. */
+/** KerSor invariant companion plugin name. */
 export declare const name = "kersor-invariant";
 /** Services required before the companion can reserve package ownership. */
 export declare const inject: string[];
