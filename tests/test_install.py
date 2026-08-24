@@ -1994,6 +1994,570 @@ class InstallTests(unittest.TestCase):
         )
         return project
 
+    def make_mission_status_project(
+        self,
+        *,
+        run_id: str = "20260824T002911Z-autonomous-mission",
+        status: str = "completed",
+        created_at: str = "2026-08-24T00:29:11+00:00",
+        project_name: str = "mission-project",
+    ) -> tuple[Path, Path, Path]:
+        """Create one bound generic Mission run for public bridge tests."""
+        project = self.root / project_name
+        session = project / ".kersor-autonomous" / "route-probe"
+        session.mkdir(parents=True)
+        config = {
+            "schema_version": 2,
+            "input_mode": "task_dir",
+            "task_dir": str(project.resolve()),
+            "max_workflows": 3,
+            "mode": "auto",
+            "allow_workflow_authoring": False,
+            "workflow_authoring_budget": 0,
+        }
+        state = {
+            "schema_version": 2,
+            "session_id": "dsh-autonomous-route-probe",
+            "phase": "optimizing",
+            "current_round": 1,
+            "target_speedup": None,
+            "seed_origin": "dsh_generic_mission",
+        }
+
+        def canonical(value: object) -> bytes:
+            return (
+                json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True)
+                + "\n"
+            ).encode("utf-8")
+
+        (session / "session-config.json").write_bytes(canonical(config))
+        (session / "state.json").write_bytes(canonical(state))
+        run = self.add_mission_status_run(
+            session,
+            run_id=run_id,
+            status=status,
+            created_at=created_at,
+        )
+        return project, session, run
+
+    def add_mission_status_run(
+        self,
+        session: Path,
+        *,
+        run_id: str,
+        status: str,
+        created_at: str,
+    ) -> Path:
+        """Append one realistic autonomous run to a Mission Session fixture."""
+        runtime = session / "autonomous-runs" / run_id / ".runtime"
+        runtime.mkdir(parents=True)
+        config = json.loads((session / "session-config.json").read_text())
+        state = json.loads((session / "state.json").read_text())
+
+        def canonical(value: object) -> bytes:
+            return (
+                json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True)
+                + "\n"
+            ).encode("utf-8")
+
+        run = runtime.parent
+        binding = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "created_at": created_at,
+            "session_dir": str(session.resolve()),
+            "session_id": state["session_id"],
+            "session_config_sha256": hashlib.sha256(canonical(config)).hexdigest(),
+            "session_state_sha256": hashlib.sha256(canonical(state)).hexdigest(),
+        }
+        (run / "binding.json").write_bytes(canonical(binding))
+        (run / "result.json").write_bytes(
+            canonical({"status": status, "binding": binding})
+        )
+        (runtime / "summary.json").write_bytes(
+            canonical(
+                {
+                    "contract_version": "akw-js-runtime-v1",
+                    "status": "completed",
+                    "workflow_status": status,
+                }
+            )
+        )
+        verifier = self.kersor / "scripts" / "verify-autonomous-run.py"
+        verifier.write_text(
+            "import argparse, hashlib, json\n"
+            "from pathlib import Path\n"
+            "parser = argparse.ArgumentParser()\n"
+            "parser.add_argument('--run-dir', type=Path, required=True)\n"
+            "args = parser.parse_args()\n"
+            "result = json.loads((args.run_dir / 'result.json').read_text())\n"
+            "binding = json.loads((args.run_dir / 'binding.json').read_text())\n"
+            "passed = result.get('binding') == binding\n"
+            "print(json.dumps({'schema_version': 1, 'run_dir': str(args.run_dir.resolve()), "
+            "'passed': passed, 'status': result.get('status'), 'result_sha256': "
+            "hashlib.sha256((args.run_dir / 'result.json').read_bytes()).hexdigest()}))\n"
+            "raise SystemExit(0 if passed else 1)\n",
+            encoding="utf-8",
+        )
+        return run
+
+    def rebind_mission_status_run(self, session: Path, run_name: str) -> Path:
+        """Keep a moved Mission fixture valid so path provenance is the only failure."""
+        run = session / "autonomous-runs" / run_name
+        binding_path = run / "binding.json"
+        binding = json.loads(binding_path.read_text())
+        binding["session_dir"] = str(session.resolve())
+        binding_path.write_text(json.dumps(binding), encoding="utf-8")
+        result_path = run / "result.json"
+        result = json.loads(result_path.read_text())
+        result["binding"] = binding
+        result_path.write_text(json.dumps(result), encoding="utf-8")
+        return run
+
+    def test_completed_generic_mission_projects_terminal_status_without_mutation(
+        self,
+    ) -> None:
+        project, session, run = self.make_mission_status_project()
+        state_path = session / "state.json"
+        frozen_state = state_path.read_bytes()
+        destination, _, _ = self.run_install()
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "status",
+                "--path",
+                str(project),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        value = json.loads(completed.stdout)
+        self.assertTrue(value["found"])
+        self.assertEqual(value["session_dir"], str(session.resolve()))
+        self.assertEqual(value["session_phase"], "optimizing")
+        self.assertEqual(value["phase"], "complete")
+        self.assertEqual(value["autonomous_run_id"], run.name)
+        self.assertEqual(value["autonomous_status"], "completed")
+        self.assertEqual(value["steps"], [])
+
+        listed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "sessions",
+                "--no-checkout-root",
+                "--workspace",
+                str(project),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        rows = json.loads(listed.stdout)["sessions"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["phase"], "complete")
+        self.assertEqual(rows[0]["session_phase"], "optimizing")
+        self.assertEqual(rows[0]["autonomous_run_id"], run.name)
+        self.assertEqual(rows[0]["autonomous_status"], "completed")
+        self.assertEqual(rows[0]["lifecycle"], "completed")
+        self.assertEqual(rows[0]["status"], "terminal-complete")
+        self.assertEqual(rows[0]["health"], "terminal")
+        self.assertEqual(state_path.read_bytes(), frozen_state)
+
+    def test_generic_mission_status_selects_the_newest_bound_run(self) -> None:
+        project, session, _ = self.make_mission_status_project()
+        latest = self.add_mission_status_run(
+            session,
+            run_id="20260824T003011Z-autonomous-mission",
+            status="failed",
+            created_at="2026-08-24T00:30:11+00:00",
+        )
+        destination, _, _ = self.run_install()
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "status",
+                "--path",
+                str(project),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        value = json.loads(completed.stdout)
+        self.assertTrue(value["found"])
+        self.assertEqual(value["autonomous_run_id"], latest.name)
+        self.assertEqual(value["autonomous_status"], "failed")
+        self.assertEqual(value["phase"], "stalled")
+
+    def test_generic_mission_status_excludes_a_malformed_latest_result(self) -> None:
+        project, session, _ = self.make_mission_status_project()
+        latest = self.add_mission_status_run(
+            session,
+            run_id="20260824T003111Z-autonomous-mission",
+            status="completed",
+            created_at="2026-08-24T00:31:11+00:00",
+        )
+        (latest / "result.json").write_text("{", encoding="utf-8")
+        destination, _, _ = self.run_install()
+
+        direct = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "status",
+                "--path",
+                str(project),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(direct.returncode, 0, direct.stderr)
+        direct_value = json.loads(direct.stdout)
+        self.assertFalse(direct_value["found"])
+        self.assertTrue(direct_value["warnings"])
+
+        listed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "sessions",
+                "--no-checkout-root",
+                "--workspace",
+                str(project),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        listed_value = json.loads(listed.stdout)
+        self.assertEqual(listed_value["sessions"], [])
+        self.assertEqual(
+            listed_value["warnings"],
+            ["Mission autonomous status unavailable"],
+        )
+
+    def test_generic_mission_status_rejects_symlinked_terminal_evidence(self) -> None:
+        project, _, run = self.make_mission_status_project()
+        result_path = run / "result.json"
+        external = self.root / "forged-result.json"
+        external.write_bytes(result_path.read_bytes())
+        result_path.unlink()
+        result_path.symlink_to(external)
+        destination, _, _ = self.run_install()
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "status",
+                "--path",
+                str(project),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        value = json.loads(completed.stdout)
+        self.assertFalse(value["found"])
+        self.assertEqual(value["phase"], None)
+        self.assertTrue(
+            any("Mission autonomous status unavailable" in item for item in value["warnings"])
+        )
+
+    def test_generic_mission_status_rejects_an_ambiguous_latest_run(self) -> None:
+        project, session, _ = self.make_mission_status_project()
+        self.add_mission_status_run(
+            session,
+            run_id="same-time-autonomous-mission",
+            status="completed",
+            created_at="2026-08-24T00:29:11+00:00",
+        )
+        destination, _, _ = self.run_install()
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "status",
+                "--path",
+                str(project),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        value = json.loads(completed.stdout)
+        self.assertFalse(value["found"])
+        self.assertTrue(any("ambiguous" in item for item in value["warnings"]))
+
+    def test_waiting_generic_mission_projects_a_resumable_invocation(self) -> None:
+        project, _, run = self.make_mission_status_project(status="waiting")
+        destination, _, _ = self.run_install()
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "sessions",
+                "--no-checkout-root",
+                "--workspace",
+                str(project),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        row = json.loads(completed.stdout)["sessions"][0]
+        self.assertEqual(row["session_phase"], "optimizing")
+        self.assertEqual(row["phase"], "optimizing")
+        self.assertEqual(row["autonomous_run_id"], run.name)
+        self.assertEqual(row["autonomous_status"], "waiting")
+        self.assertEqual(row["lifecycle"], "active")
+        self.assertEqual(row["status"], "resumable")
+        self.assertEqual(row["health"], "needs_resume")
+
+    def test_generic_mission_status_requires_a_canonical_runtime_summary(self) -> None:
+        mutations = {
+            "contract": {"contract_version": "forged-v1"},
+            "host_status": {"status": "error"},
+            "workflow_status": {"workflow_status": "failed"},
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label):
+                project, _, run = self.make_mission_status_project(
+                    project_name=f"mission-summary-{label}"
+                )
+                summary_path = run / ".runtime" / "summary.json"
+                summary = json.loads(summary_path.read_text())
+                summary.update(mutation)
+                summary_path.write_text(json.dumps(summary), encoding="utf-8")
+                destination, _, _ = self.run_install()
+
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(destination / "bin" / "kersor_bridge.py"),
+                        "status",
+                        "--path",
+                        str(project),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertFalse(json.loads(completed.stdout)["found"])
+
+    def test_generic_mission_status_rejects_duplicate_evidence_keys(self) -> None:
+        cases = {
+            "config": ("session-config.json", "mode", "auto"),
+            "state": ("state.json", "phase", "optimizing"),
+            "binding": ("binding.json", "run_id", None),
+            "result": ("result.json", "status", "completed"),
+            "summary": (".runtime/summary.json", "status", "completed"),
+        }
+        for label, (relative, field, configured_value) in cases.items():
+            with self.subTest(label=label):
+                project, session, run = self.make_mission_status_project(
+                    project_name=f"mission-duplicate-{label}"
+                )
+                base = session if label in {"config", "state"} else run
+                path = base / relative
+                value = run.name if configured_value is None else configured_value
+                source = path.read_text(encoding="utf-8").lstrip()
+                path.write_text(
+                    "{\n"
+                    + json.dumps(field)
+                    + ": "
+                    + json.dumps(value)
+                    + ","
+                    + source[1:],
+                    encoding="utf-8",
+                )
+                if label in {"config", "state"}:
+                    binding_path = run / "binding.json"
+                    binding = json.loads(binding_path.read_text())
+                    hash_field = (
+                        "session_config_sha256"
+                        if label == "config"
+                        else "session_state_sha256"
+                    )
+                    binding[hash_field] = hashlib.sha256(path.read_bytes()).hexdigest()
+                    binding_path.write_text(json.dumps(binding), encoding="utf-8")
+                    result_path = run / "result.json"
+                    result = json.loads(result_path.read_text())
+                    result["binding"] = binding
+                    result_path.write_text(json.dumps(result), encoding="utf-8")
+                destination, _, _ = self.run_install()
+
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(destination / "bin" / "kersor_bridge.py"),
+                        "status",
+                        "--path",
+                        str(project),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertFalse(json.loads(completed.stdout)["found"])
+
+    def test_generic_mission_status_rejects_a_symlinked_session_candidate(self) -> None:
+        project, session, run = self.make_mission_status_project()
+        physical = project / "session-target"
+        session.rename(physical)
+        session.symlink_to(physical, target_is_directory=True)
+        self.rebind_mission_status_run(session, run.name)
+        destination, _, _ = self.run_install()
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "status",
+                "--path",
+                str(project),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertFalse(json.loads(completed.stdout)["found"])
+
+    def test_generic_mission_direct_status_rejects_a_symlinked_session(self) -> None:
+        project, session, run = self.make_mission_status_project()
+        physical = project / "direct-session-target"
+        session.rename(physical)
+        session.symlink_to(physical, target_is_directory=True)
+        self.rebind_mission_status_run(session, run.name)
+        destination, _, _ = self.run_install()
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "status",
+                "--path",
+                str(session),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertFalse(json.loads(completed.stdout)["found"])
+
+    def test_generic_mission_sessions_preserves_symlink_provenance(self) -> None:
+        fixtures: list[Path] = []
+        project, session, run = self.make_mission_status_project(
+            project_name="mission-sessions-candidate-link"
+        )
+        physical_session = project / "session-target"
+        session.rename(physical_session)
+        session.symlink_to(physical_session, target_is_directory=True)
+        self.rebind_mission_status_run(session, run.name)
+        fixtures.append(project)
+
+        project, session, run = self.make_mission_status_project(
+            project_name="mission-sessions-root-link"
+        )
+        sessions_root = project / ".kersor-autonomous"
+        physical_root = project / "sessions-root-target"
+        sessions_root.rename(physical_root)
+        sessions_root.symlink_to(physical_root, target_is_directory=True)
+        self.rebind_mission_status_run(session, run.name)
+        fixtures.append(project)
+        destination, _, _ = self.run_install()
+
+        for project in fixtures:
+            with self.subTest(project=project.name):
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(destination / "bin" / "kersor_bridge.py"),
+                        "sessions",
+                        "--no-checkout-root",
+                        "--workspace",
+                        str(project),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                value = json.loads(completed.stdout)
+                self.assertEqual(value["sessions"], [])
+                self.assertEqual(
+                    value["warnings"], ["Mission autonomous status unavailable"]
+                )
+
+    def test_generic_mission_status_rejects_a_symlinked_runtime_directory(self) -> None:
+        project, _, run = self.make_mission_status_project()
+        runtime = run / ".runtime"
+        physical = project / "runtime-target"
+        runtime.rename(physical)
+        runtime.symlink_to(physical, target_is_directory=True)
+        destination, _, _ = self.run_install()
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "status",
+                "--path",
+                str(project),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertFalse(json.loads(completed.stdout)["found"])
+
+    def test_classic_status_still_accepts_a_symlinked_session_candidate(self) -> None:
+        project = self.make_status_project()
+        session = project / ".kersor" / "20260817-120000"
+        physical = project / "classic-session-target"
+        session.rename(physical)
+        session.symlink_to(physical, target_is_directory=True)
+        destination, _, _ = self.run_install()
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "status",
+                "--path",
+                str(project),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        value = json.loads(completed.stdout)
+        self.assertTrue(value["found"])
+        self.assertEqual(value["session_dir"], str(physical.resolve()))
+        self.assertEqual(value["phase"], "optimizing")
+
     def make_dispatch_design(self, project: Path) -> dict[str, object]:
         """Create one internally hash-bound prepared DSH Workflow projection."""
         session = project / ".kersor" / "20260817-120000"

@@ -42,8 +42,16 @@ DSH_PROVIDER = "deepseek-official"
 DSH_MODEL = "deepseek-v4-flash"
 MAX_RUNTIME_CONFIG_BYTES = 1 * 1024 * 1024
 MAX_MODEL_ID_LENGTH = 128
+MAX_AUTONOMOUS_BINDING_BYTES = 256 * 1024
+MAX_AUTONOMOUS_RESULT_BYTES = 4 * 1024 * 1024
+MAX_AUTONOMOUS_SUMMARY_BYTES = 1 * 1024 * 1024
+MAX_AUTONOMOUS_SESSION_BYTES = 1 * 1024 * 1024
+MAX_AUTONOMOUS_RUNS = 100
 MINIMUM_PYTHON = (3, 10)
 TERMINAL_PHASES = frozenset({"complete", "stalled", "cancelled", "single_run"})
+AUTONOMOUS_TERMINAL_STATUSES = frozenset(
+    {"completed", "blocked", "waiting", "failed"}
+)
 UNATTRIBUTABLE_SESSION_IDS = frozenset({"none", "null", "unknown"})
 NUMBER_TOKEN = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 CYCLES_PATTERN = re.compile(rf"\bCYCLES\s*:\s*({NUMBER_TOKEN})\b")
@@ -1475,7 +1483,265 @@ def candidate_rounds(session_dir: Path) -> list[int]:
     return sorted(rounds)
 
 
-def load_session(root: Path, requested: Path) -> tuple[Path | None, Any, dict[str, Any] | None, list[str]]:
+def autonomous_file(path: Path, maximum: int, label: str) -> bytes:
+    """Read one stable, bounded, single-link autonomous evidence file."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise RuntimeError(f"cannot read {label}: {type(error).__name__}") from error
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat_module.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size > maximum
+        ):
+            raise RuntimeError(f"{label} is not one bounded regular file")
+        chunks: list[bytes] = []
+        size = 0
+        while chunk := os.read(descriptor, min(65_536, maximum + 1 - size)):
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > maximum:
+                raise RuntimeError(f"{label} exceeds its size limit")
+        after = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+        ):
+            raise RuntimeError(f"{label} changed while it was being read")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def autonomous_json(payload: bytes, label: str) -> dict[str, Any]:
+    """Decode one finite autonomous evidence object."""
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate key: {key}")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(
+            payload.decode("utf-8"),
+            parse_constant=lambda token: (_ for _ in ()).throw(ValueError(token)),
+            object_pairs_hook=unique_object,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise RuntimeError(f"{label} is malformed") from error
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{label} must contain a JSON object")
+    return value
+
+
+def parse_utc_epoch(value: object, label: str) -> float:
+    """Parse one timezone-aware ISO timestamp for unambiguous run ordering."""
+    if not isinstance(value, str) or not value:
+        raise RuntimeError(f"{label} is missing created_at")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise RuntimeError(f"{label} has invalid created_at") from error
+    if parsed.tzinfo is None:
+        raise RuntimeError(f"{label} created_at must include a timezone")
+    return parsed.timestamp()
+
+
+def verify_autonomous_terminal(
+    root: Path,
+    run_dir: Path,
+    expected_status: str,
+) -> dict[str, Any]:
+    """Require the Core independent verifier to accept one terminal run."""
+    verifier = root / "scripts" / "verify-autonomous-run.py"
+    if not verifier.is_file() or verifier.is_symlink():
+        raise RuntimeError("Core autonomous verifier is unavailable")
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(verifier), "--run-dir", str(run_dir)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("Core autonomous verifier timed out") from error
+    if len(completed.stdout.encode("utf-8")) > MAX_AUTONOMOUS_SUMMARY_BYTES:
+        raise RuntimeError("Core autonomous verifier output exceeds its size limit")
+    try:
+        receipt = autonomous_json(
+            completed.stdout.encode("utf-8"),
+            "Core autonomous verifier receipt",
+        )
+    except RuntimeError as error:
+        raise RuntimeError("Core autonomous verifier returned invalid evidence") from error
+    if (
+        completed.returncode != 0
+        or receipt.get("passed") is not True
+        or receipt.get("status") != expected_status
+        or receipt.get("run_dir") != str(run_dir.resolve())
+    ):
+        raise RuntimeError("Core autonomous verifier rejected the latest run")
+    return receipt
+
+
+def require_physical_mission_session_path(path: Path) -> None:
+    """Reject links at the Mission Session leaf and below its store root."""
+    store_root = next(
+        (
+            parent
+            for parent in (path, *path.parents)
+            if parent.name in {".kersor", ".kersor-autonomous"}
+        ),
+        None,
+    )
+    guarded = [path]
+    while store_root is not None and guarded[-1] != store_root:
+        guarded.append(guarded[-1].parent)
+    for component in reversed(guarded):
+        try:
+            metadata = component.lstat()
+        except OSError as error:
+            raise RuntimeError("Mission Session path is unavailable") from error
+        if not stat_module.S_ISDIR(metadata.st_mode):
+            raise RuntimeError("Mission Session path is not physical")
+
+
+def autonomous_terminal_projection(
+    root: Path,
+    session_dir: Path,
+    lexical_session_dir: Path,
+    snapshot: dict[str, Any],
+) -> tuple[dict[str, str] | None, str | None]:
+    """Project only the newest independently verified generic Mission terminal."""
+    if snapshot.get("seed_origin") != "dsh_generic_mission":
+        return None, None
+    try:
+        session = session_dir.resolve(strict=True)
+        require_physical_mission_session_path(lexical_session_dir)
+        if session != session_dir:
+            raise RuntimeError("Mission Session path is not physical")
+        config_bytes = autonomous_file(
+            session / "session-config.json", MAX_AUTONOMOUS_SESSION_BYTES,
+            "Mission Session config",
+        )
+        state_bytes = autonomous_file(
+            session / "state.json", MAX_AUTONOMOUS_SESSION_BYTES,
+            "Mission Session state",
+        )
+        autonomous_json(config_bytes, "Mission Session config")
+        autonomous_json(state_bytes, "Mission Session state")
+        runs_root = session / "autonomous-runs"
+        if not runs_root.exists():
+            return None, None
+        root_metadata = runs_root.lstat()
+        if (
+            not stat_module.S_ISDIR(root_metadata.st_mode)
+            or runs_root.resolve(strict=True) != runs_root
+        ):
+            raise RuntimeError("Mission autonomous-runs is not one physical directory")
+        entries = sorted(runs_root.iterdir(), key=lambda path: path.name)
+        if len(entries) > MAX_AUTONOMOUS_RUNS:
+            raise RuntimeError("Mission autonomous run inventory exceeds its limit")
+        candidates: list[tuple[float, Path, dict[str, Any]]] = []
+        for run_dir in entries:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_dir.name):
+                raise RuntimeError("Mission autonomous run id is invalid")
+            metadata = run_dir.lstat()
+            if (
+                not stat_module.S_ISDIR(metadata.st_mode)
+                or run_dir.resolve(strict=True) != run_dir
+            ):
+                raise RuntimeError("Mission autonomous run is not one physical directory")
+            binding = autonomous_json(
+                autonomous_file(
+                    run_dir / "binding.json",
+                    MAX_AUTONOMOUS_BINDING_BYTES,
+                    "Mission run binding",
+                ),
+                "Mission run binding",
+            )
+            if (
+                binding.get("schema_version") != 1
+                or binding.get("run_id") != run_dir.name
+                or binding.get("session_dir") != str(session)
+                or binding.get("session_id") != snapshot.get("session_id")
+                or binding.get("session_config_sha256")
+                != hashlib.sha256(config_bytes).hexdigest()
+                or binding.get("session_state_sha256")
+                != hashlib.sha256(state_bytes).hexdigest()
+            ):
+                raise RuntimeError("Mission run binding does not match its Session")
+            candidates.append(
+                (
+                    parse_utc_epoch(binding.get("created_at"), "Mission run binding"),
+                    run_dir,
+                    binding,
+                )
+            )
+        if not candidates:
+            return None, None
+        candidates.sort(key=lambda item: item[0])
+        if len(candidates) > 1 and candidates[-2][0] == candidates[-1][0]:
+            raise RuntimeError("Mission latest autonomous run is ambiguous")
+        _, run_dir, binding = candidates[-1]
+        result_path = run_dir / "result.json"
+        if not result_path.exists():
+            return None, None
+        runtime_dir = run_dir / ".runtime"
+        runtime_metadata = runtime_dir.lstat()
+        if (
+            not stat_module.S_ISDIR(runtime_metadata.st_mode)
+            or runtime_dir.resolve(strict=True) != runtime_dir
+        ):
+            raise RuntimeError("Mission .runtime is not one physical directory")
+        result_bytes = autonomous_file(
+            result_path, MAX_AUTONOMOUS_RESULT_BYTES, "Mission run result",
+        )
+        result = autonomous_json(result_bytes, "Mission run result")
+        summary = autonomous_json(
+            autonomous_file(
+                runtime_dir / "summary.json",
+                MAX_AUTONOMOUS_SUMMARY_BYTES,
+                "Mission runtime summary",
+            ),
+            "Mission runtime summary",
+        )
+        terminal_status = result.get("status")
+        if (
+            terminal_status not in AUTONOMOUS_TERMINAL_STATUSES
+            or result.get("binding") != binding
+            or summary.get("contract_version") != "akw-js-runtime-v1"
+            or summary.get("status") != "completed"
+            or summary.get("workflow_status") != terminal_status
+        ):
+            raise RuntimeError("Mission terminal result and runtime summary disagree")
+        receipt = verify_autonomous_terminal(root, run_dir, str(terminal_status))
+        if receipt.get("result_sha256") != hashlib.sha256(result_bytes).hexdigest():
+            raise RuntimeError("Mission result changed after Core verification")
+        phase = {
+            "completed": "complete",
+            "blocked": "stalled",
+            "failed": "stalled",
+            "waiting": "optimizing",
+        }[str(terminal_status)]
+        return {
+            "run_id": run_dir.name,
+            "status": str(terminal_status),
+            "phase": phase,
+        }, None
+    except (OSError, RuntimeError) as error:
+        return None, str(error)
+
+
+def load_session(
+    root: Path,
+    requested: Path,
+) -> tuple[Path | None, Path | None, Any, dict[str, Any] | None, list[str]]:
     """Find the newest readable KerSor session under a project or session path."""
     sys.path.insert(0, str(root))
     from kersor_core import SessionStore  # type: ignore[import-not-found]
@@ -1486,15 +1752,20 @@ def load_session(root: Path, requested: Path) -> tuple[Path | None, Any, dict[st
     if direct.storage_kind in {"v2", "legacy"}:
         candidates = [requested]
     else:
-        sessions_root = requested if requested.name == ".kersor" else requested / ".kersor"
-        try:
-            candidates = sorted(
-                (path for path in sessions_root.iterdir() if path.is_dir()),
-                key=lambda path: path.stat().st_mtime,
-                reverse=True,
-            )
-        except OSError:
-            candidates = []
+        session_roots = (
+            [requested]
+            if requested.name in {".kersor", ".kersor-autonomous"}
+            else [requested / ".kersor", requested / ".kersor-autonomous"]
+        )
+        candidates = []
+        for sessions_root in session_roots:
+            try:
+                candidates.extend(
+                    path for path in sessions_root.iterdir() if path.is_dir()
+                )
+            except OSError:
+                continue
+        candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
 
     for candidate in candidates:
         store = SessionStore(candidate)
@@ -1505,8 +1776,9 @@ def load_session(root: Path, requested: Path) -> tuple[Path | None, Any, dict[st
         except Exception as error:
             warnings.append(f"unreadable session {candidate.name}: {error}")
             continue
-        return candidate.resolve(), store, snapshot, warnings
-    return None, None, None, warnings
+        lexical = Path(os.path.abspath(os.fspath(candidate)))
+        return candidate.resolve(), lexical, store, snapshot, warnings
+    return None, None, None, None, warnings
 
 
 def status(root: Path, requested: Path) -> dict[str, Any]:
@@ -1514,9 +1786,10 @@ def status(root: Path, requested: Path) -> dict[str, Any]:
     sys.path.insert(0, str(root))
     from kersor_core import AttemptResultError, AttemptResultStore  # type: ignore[import-not-found]
 
-    project_path = requested.expanduser().resolve()
-    session_dir, session_store, snapshot, warnings = load_session(
-        root, project_path
+    lexical_requested = Path(os.path.abspath(os.fspath(requested.expanduser())))
+    project_path = lexical_requested.resolve()
+    session_dir, lexical_session_dir, session_store, snapshot, warnings = load_session(
+        root, lexical_requested
     )
     if session_dir is None or snapshot is None:
         return {
@@ -1525,6 +1798,9 @@ def status(root: Path, requested: Path) -> dict[str, Any]:
             "session_dir": None,
             "storage_kind": None,
             "phase": None,
+            "session_phase": None,
+            "autonomous_run_id": None,
+            "autonomous_status": None,
             "current_round": None,
             "max_workflows": None,
             "target_speedup": None,
@@ -1553,6 +1829,57 @@ def status(root: Path, requested: Path) -> dict[str, Any]:
             "rounds": [],
             "warnings": warnings,
         }
+
+    session_phase = snapshot.get("phase")
+    autonomous, autonomous_error = autonomous_terminal_projection(
+        root,
+        session_dir,
+        lexical_session_dir or session_dir,
+        snapshot,
+    )
+    if autonomous_error is not None:
+        warnings.append(f"Mission autonomous status unavailable: {autonomous_error}")
+        return {
+            "found": False,
+            "project_path": str(project_path),
+            "session_dir": None,
+            "storage_kind": None,
+            "phase": None,
+            "session_phase": None,
+            "autonomous_run_id": None,
+            "autonomous_status": None,
+            "current_round": None,
+            "max_workflows": None,
+            "target_speedup": None,
+            "target_met": None,
+            "mode": None,
+            "backend": None,
+            "kernel_language": None,
+            "integration_pattern": None,
+            "allow_workflow_authoring": None,
+            "workflow_authoring_budget": None,
+            "kernel_path": None,
+            "started_at": None,
+            "workflow": None,
+            "fit_confidence": None,
+            "baseline_witness": None,
+            "baseline_next_action": None,
+            "baseline_reason": None,
+            "profile_evidence": None,
+            "profile_reason": None,
+            "profile_owner": None,
+            "dsh_compatibility": None,
+            "candidate_ownership": None,
+            "fresh_session": None,
+            "best_speedup": None,
+            "steps": [],
+            "rounds": [],
+            "warnings": warnings,
+        }
+    projected_snapshot = dict(snapshot)
+    if autonomous is not None:
+        projected_snapshot["phase"] = autonomous["phase"]
+    snapshot = projected_snapshot
 
     current_round = snapshot.get("current_round")
     round_number = current_round if isinstance(current_round, int) else 1
@@ -1627,6 +1954,11 @@ def status(root: Path, requested: Path) -> dict[str, Any]:
         "session_dir": str(session_dir),
         "storage_kind": session_store.storage_kind,
         "phase": optional_string("phase"),
+        "session_phase": (
+            session_phase if isinstance(session_phase, str) and session_phase else None
+        ),
+        "autonomous_run_id": autonomous["run_id"] if autonomous is not None else None,
+        "autonomous_status": autonomous["status"] if autonomous is not None else None,
         "current_round": round_number,
         "max_workflows": max_workflows if isinstance(max_workflows, int) else None,
         "target_speedup": target_speedup,
@@ -1660,12 +1992,16 @@ def status(root: Path, requested: Path) -> dict[str, Any]:
         "candidate_ownership": candidate_ownership_gate(session_dir, round_number),
         "fresh_session": fresh_session,
         "best_speedup": best_speedup,
-        "steps": session_detail(
-            root,
-            session_dir,
-            phase=snapshot.get("phase"),
-            profile_status=profile_evidence,
-        )["steps"],
+        "steps": (
+            []
+            if autonomous is not None
+            else session_detail(
+                root,
+                session_dir,
+                phase=snapshot.get("phase"),
+                profile_status=profile_evidence,
+            )["steps"]
+        ),
         "rounds": rounds,
         "warnings": warnings,
     }
@@ -1708,6 +2044,8 @@ def session_health(
     value: dict[str, Any], activity_epoch: float | None, stale_after: int
 ) -> tuple[str, str]:
     """Mirror KerSor TUI/doctor advisory health without changing canonical phase."""
+    if value.get("autonomous_status") == "waiting":
+        return "resumable", "needs_resume"
     phase = value.get("phase")
     if phase == "complete" or phase == "single_run":
         return "terminal-complete", "terminal"
@@ -1910,6 +2248,9 @@ def session_summary(value: dict[str, Any], stale_after: int) -> dict[str, Any]:
         "session_dir": str(session_dir),
         "storage_kind": value.get("storage_kind"),
         "phase": value.get("phase"),
+        "session_phase": value.get("session_phase"),
+        "autonomous_run_id": value.get("autonomous_run_id"),
+        "autonomous_status": value.get("autonomous_status"),
         "lifecycle": lifecycle(value.get("phase")),
         "status": status,
         "health": health,
@@ -1964,8 +2305,12 @@ def sessions(
 ) -> dict[str, Any]:
     """List recent readable sessions from checkout, configured, and workspace roots."""
     roots = [root / ".kersor"] if include_checkout else []
-    roots.extend(path.expanduser().resolve() for path in session_roots)
-    roots.extend(path.expanduser().resolve() / ".kersor" for path in workspaces)
+    roots.extend(
+        Path(os.path.abspath(os.fspath(path.expanduser()))) for path in session_roots
+    )
+    for path in workspaces:
+        workspace = Path(os.path.abspath(os.fspath(path.expanduser())))
+        roots.extend((workspace / ".kersor", workspace / ".kersor-autonomous"))
 
     candidates: list[Path] = []
     warnings: list[str] = []
@@ -1976,13 +2321,13 @@ def sessions(
         if resolved_root in seen_roots:
             continue
         seen_roots.add(resolved_root)
-        if (resolved_root / "session-config.json").is_file() or (
-            resolved_root / "state.md"
+        if (sessions_root / "session-config.json").is_file() or (
+            sessions_root / "state.md"
         ).is_file():
-            children = [resolved_root]
+            children = [sessions_root]
         else:
             try:
-                children = [path for path in resolved_root.iterdir() if path.is_dir()]
+                children = [path for path in sessions_root.iterdir() if path.is_dir()]
             except FileNotFoundError:
                 continue
             except OSError as error:
@@ -1995,7 +2340,7 @@ def sessions(
             if resolved in seen_sessions:
                 continue
             seen_sessions.add(resolved)
-            candidates.append(resolved)
+            candidates.append(candidate)
 
     candidates.sort(key=lambda path: path.name, reverse=True)
 
@@ -2011,6 +2356,12 @@ def sessions(
             )
             continue
         if not value["found"]:
+            if any(
+                isinstance(warning, str)
+                and warning.startswith("Mission autonomous status unavailable:")
+                for warning in value.get("warnings", [])
+            ) and "Mission autonomous status unavailable" not in warnings:
+                warnings.append("Mission autonomous status unavailable")
             continue
         result.append(session_summary(value, stale_after))
     return {"sessions": result, "warnings": warnings}

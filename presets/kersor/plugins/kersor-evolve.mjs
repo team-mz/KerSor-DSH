@@ -303,6 +303,21 @@ function childUsage(agent) {
   return usage
 }
 
+function activationModelRole(value) {
+  if (Object.hasOwn(value, 'model_role') || Object.hasOwn(value, 'modelRole')) {
+    throw new Error('DSH RPC activation model_role is Host-derived from phase and must not be supplied')
+  }
+  if (typeof value.phase !== 'string') {
+    throw new Error('DSH RPC activation phase must be a string')
+  }
+  if (/^Plan revision [1-9]\d*$/u.test(value.phase)) return 'planner'
+  if (/^Execute revision [1-9]\d*$/u.test(value.phase)) return 'worker'
+  throw new Error(
+    'DSH RPC activation phase must match "Plan revision <positive integer>" '
+    + 'or "Execute revision <positive integer>"',
+  )
+}
+
 async function readOnlyActivation(value, workspace) {
   if (!isRecord(value)) throw new Error('DSH RPC activation must be an object')
   if (value.contract_version !== 'akw-js-runtime-v1') {
@@ -345,6 +360,7 @@ async function readOnlyActivation(value, workspace) {
     prompt: [{type: 'text', text: value.prompt}],
     outputSchema: value.schema === undefined ? undefined : jsonClone(value.schema, 'DSH output schema'),
     timeoutSeconds,
+    modelRole: activationModelRole(value),
   }
 }
 
@@ -458,7 +474,7 @@ async function executeDshActivation(ctx, parent, workspace, lexicalWorkspace, ac
       thread_id: threadId,
       provider: DSH_PROVIDER,
       model: DSH_MODEL,
-      model_role: 'worker',
+      model_role: activation.modelRole,
       isolation: 'fresh-dsh-subagent',
       artifacts: [],
     }

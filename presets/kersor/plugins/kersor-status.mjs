@@ -27,6 +27,9 @@ const STATUS_SCHEMA = {
     session_dir: nullable({ type: 'string' }),
     storage_kind: nullable({ type: 'string' }),
     phase: nullable({ type: 'string' }),
+    session_phase: nullable({ type: 'string' }),
+    autonomous_run_id: nullable({ type: 'string' }),
+    autonomous_status: nullable({ type: 'string' }),
     current_round: nullable({ type: 'integer' }),
     max_workflows: nullable({ type: 'integer' }),
     target_speedup: nullable({ type: 'number' }),
@@ -81,6 +84,7 @@ const STATUS_SCHEMA = {
   },
   required: [
     'found', 'project_path', 'session_dir', 'storage_kind', 'phase',
+    'session_phase', 'autonomous_run_id', 'autonomous_status',
     'current_round', 'max_workflows', 'target_speedup', 'target_met', 'mode',
     'backend', 'kernel_language', 'integration_pattern',
     'allow_workflow_authoring', 'workflow_authoring_budget',
@@ -136,6 +140,12 @@ export function renderStatus(value) {
   }
 
   const lines = [`**KerSor** · ${display(value.phase)} · round ${display(value.current_round)}/${display(value.max_workflows)}`]
+  if (value.autonomous_status !== null) {
+    lines.push(
+      `Autonomous run: ${value.autonomous_status} · ${display(value.autonomous_run_id)}`,
+      `Canonical Session phase: ${display(value.session_phase)}`,
+    )
+  }
   const bar = progress(value.current_round, value.max_workflows)
   if (bar !== null) lines.push(`\`${bar}\``)
   lines.push(
@@ -216,6 +226,9 @@ export function createTool() {
         kind: 'kersor-status',
         found: value.found,
         phase: value.phase,
+        session_phase: value.session_phase,
+        autonomous_run_id: value.autonomous_run_id,
+        autonomous_status: value.autonomous_status,
         current_round: value.current_round,
         max_workflows: value.max_workflows,
         best_speedup: value.best_speedup,

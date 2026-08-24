@@ -457,13 +457,16 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             "  'activation': {\n"
             "    'contract_version': 'akw-js-runtime-v1',\n"
             "    'call_id': 'route-probe/inspect/1',\n"
-            "    'label': 'read-only route probe',\n"
+            "    'phase': contract_value.get('activation_phase', 'Plan revision 1'),\n"
+            "    'label': contract_value.get('activation_label', 'plan-revision-1-attempt-1'),\n"
             "    'prompt': 'Inspect the workspace without mutation.',\n"
             "    'schema': {'type': 'object', 'properties': {'observed': {'type': 'boolean'}}, 'required': ['observed']},\n"
             "    'options': {},\n"
             f"    'project_root': {str(self.workspace)!r},\n"
             "  },\n"
             "}\n"
+            "if 'activation_model_role' in contract_value:\n"
+            "  request['activation']['model_role'] = contract_value['activation_model_role']\n"
             "if contract_value.get('probe_mode') == 'sequential-65':\n"
             "  last = None\n"
             "  for index in range(65):\n"
@@ -628,6 +631,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         receipt = terminal["dsh_result"]
         self.assertEqual(receipt["provider"], "deepseek-official")
         self.assertEqual(receipt["model"], "deepseek-v4-flash")
+        self.assertEqual(receipt["model_role"], "planner")
         self.assertTrue(receipt["usage_observed"])
         self.assertTrue(receipt["usage_complete"])
         self.assertEqual(receipt["usage"], {
@@ -636,6 +640,144 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             "output_tokens": 7,
             "total_tokens": 23,
         })
+
+    def test_public_host_projects_execute_phase_as_worker_role(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "worker-role"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="route_probe_1",
+            mission={
+                "mission_id": "worker-role",
+                "goal": "inspect safely",
+                "authority": ["read workspace"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{"name": "inspect", "side_effect": "read"}],
+        )
+
+        result = self.invoke_dsh_native(contract)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        receipt = result["value"]["dsh_result"]
+        self.assertEqual(receipt["model_role"], "worker")
+        self.assertEqual(receipt["provider"], "deepseek-official")
+        self.assertEqual(receipt["model"], "deepseek-v4-flash")
+
+    def test_public_host_rejects_unknown_activation_phase_before_child_start(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "unknown-phase"),
+            runtime="dsh",
+            activation_phase="Review revision 1",
+            activation_label="review_1",
+            mission={
+                "mission_id": "unknown-phase",
+                "goal": "inspect safely",
+                "authority": ["read workspace"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{"name": "inspect", "side_effect": "read"}],
+        )
+
+        result = self.invoke_dsh_native(contract)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("activation phase", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+
+    def test_public_host_rejects_caller_supplied_model_role(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "forged-role"),
+            runtime="dsh",
+            activation_phase="Execute revision 1",
+            activation_label="route_probe_1",
+            activation_model_role="planner",
+            mission={
+                "mission_id": "forged-role",
+                "goal": "inspect safely",
+                "authority": ["read workspace"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{"name": "inspect", "side_effect": "read"}],
+        )
+
+        result = self.invoke_dsh_native(contract)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("model_role is Host-derived", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+
+    def test_public_host_rejects_non_string_activation_phase(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "malformed-phase"),
+            runtime="dsh",
+            activation_phase=["Plan revision 1"],
+            activation_label="plan-revision-1-attempt-1",
+            mission={
+                "mission_id": "malformed-phase",
+                "goal": "inspect safely",
+                "authority": ["read workspace"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{"name": "inspect", "side_effect": "read"}],
+        )
+
+        result = self.invoke_dsh_native(contract)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn("activation phase", result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+
+    def test_public_host_keeps_planner_role_on_later_planner_attempt(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "planner-retry"),
+            runtime="dsh",
+            activation_phase="Plan revision 3",
+            activation_label="plan-revision-3-attempt-2",
+            mission={
+                "mission_id": "planner-retry",
+                "goal": "inspect safely",
+                "authority": ["read workspace"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 3,
+            },
+            capabilities=[{"name": "inspect", "side_effect": "read"}],
+        )
+
+        result = self.invoke_dsh_native(contract)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        receipt = result["value"]["dsh_result"]
+        self.assertEqual(receipt["model_role"], "planner")
+        self.assertEqual(receipt["provider"], "deepseek-official")
+        self.assertEqual(receipt["model"], "deepseek-v4-flash")
 
     def test_cancellation_aborts_and_disposes_the_dsh_child(self) -> None:
         self.prepare_dsh_native_core()
