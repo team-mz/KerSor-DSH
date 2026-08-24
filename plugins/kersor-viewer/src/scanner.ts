@@ -3,7 +3,8 @@
  * @module @deepseek-ai/dsh-kersor-viewer
  */
 
-import { access, readFile, readdir } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { access, readFile, readdir, stat } from 'node:fs/promises'
 import type { Dirent } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
@@ -18,8 +19,8 @@ export const DEFAULT_KERSOR_ROOTS = [
   path.join(homedir(), 'Agent4Kernel', 'KerSor', '.kersor'),
 ]
 
-/** Lifecycle classification of one discovered run directory. */
-export type KersorRunDiscovery = 'active' | 'completed' | 'failed'
+/** Summary-derived lifecycle; `workflow_status` takes precedence over legacy `status`. */
+export type KersorRunDiscovery = 'active' | 'completed' | 'waiting' | 'failed'
 
 /** Storage family of one executable Workflow run. */
 export type KersorRunKind = 'autonomous' | 'classic-round'
@@ -34,6 +35,18 @@ export interface KersorRunRef {
   readonly round?: number
   readonly result?: KersorWorkflowResultView
   readonly discovery: KersorRunDiscovery
+}
+
+const summaryRevisions = new WeakMap<KersorRunRef, string>()
+
+/**
+ * Read the scan-local generation of a run's atomically written summary.
+ * This internal signal is intentionally absent from the Remote inventory.
+ * @param ref - Exact run reference returned by the scanner.
+ * @returns Opaque summary generation, or `undefined` before a summary exists.
+ */
+export function scannedRunSummaryRevision(ref: KersorRunRef): string | undefined {
+  return summaryRevisions.get(ref)
 }
 
 /** How a root entered the scanner. */
@@ -134,7 +147,11 @@ async function isSessionV2(dir: string): Promise<{ accepted: boolean; issue?: Ke
   }
 }
 
-async function readSummary(file: string): Promise<{ value?: Record<string, unknown>; issue?: KersorDiagnosticIssue }> {
+async function readSummary(file: string): Promise<{
+  value?: Record<string, unknown>
+  issue?: KersorDiagnosticIssue
+  revision?: string
+}> {
   let text: string
   try {
     text = await readFile(file, 'utf8')
@@ -142,16 +159,24 @@ async function readSummary(file: string): Promise<{ value?: Record<string, unkno
     if (errorCode(error) === 'ENOENT') return {}
     return { issue: issueFromError('summary_read', error, 'warning') }
   }
+  const contentHash = createHash('sha256').update(text).digest('hex')
+  let revision = contentHash
+  try {
+    const info = await stat(file)
+    revision = `${contentHash}:${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}`
+  } catch {
+    // The content hash remains a stable generation if metadata races a rename.
+  }
   let decoded: unknown
   try {
     decoded = JSON.parse(text)
   } catch (error) {
-    return { issue: issueFromError('summary_read', error, 'warning') }
+    return { issue: issueFromError('summary_read', error, 'warning'), revision }
   }
   if (decoded === null || typeof decoded !== 'object' || Array.isArray(decoded)) {
-    return { issue: createIssue('summary_read', 'invalid_payload', 'warning') }
+    return { issue: createIssue('summary_read', 'invalid_payload', 'warning'), revision }
   }
-  return { value: decoded as Record<string, unknown> }
+  return { value: decoded as Record<string, unknown>, revision }
 }
 
 async function scanSession(
@@ -188,20 +213,24 @@ async function scanSession(
     let discovery: KersorRunDiscovery = 'active'
     if (summary.value !== undefined) {
       const status = summary.value.workflow_status ?? summary.value.status
-      if (status === 'completed' || status === 'waiting') discovery = 'completed'
-      else if (status === 'error' || status === 'failed') discovery = 'failed'
+      if (status === 'completed' || status === 'succeeded') discovery = 'completed'
+      else if (status === 'waiting') discovery = 'waiting'
+      else if (status === 'error' || status === 'failed' || status === 'blocked'
+        || status === 'stagnated' || status === 'exhausted') discovery = 'failed'
       else if (status !== undefined) {
         issues.push({ runDir, issue: createIssue('summary_read', 'invalid_payload', 'warning') })
       }
     }
     if (summary.issue !== undefined) issues.push({ runDir, issue: summary.issue })
     const result = await readWorkflowResult(runDir)
-    runs.push({
+    const ref: KersorRunRef = {
       runId, runDir, sessionDir, root, kind,
       ...(round === undefined ? {} : { round }),
       ...(result === undefined ? {} : { result }),
       discovery,
-    })
+    }
+    runs.push(ref)
+    if (summary.revision !== undefined) summaryRevisions.set(ref, summary.revision)
   }
   for (const child of autonomousChildren) {
     if (!child.isDirectory() && !child.isSymbolicLink()) continue

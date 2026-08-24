@@ -35,6 +35,7 @@ export type KersorViewProps =
 const RUN_STATUS_KEYS = {
   running: 'run.active',
   completed: 'run.completed',
+  waiting: 'run.waiting',
   failed: 'run.failed',
   unknown: 'run.unknown',
 } as const satisfies Record<KersorRunStatus, KersorViewerKey>
@@ -50,6 +51,7 @@ function runDotState(status: KersorRunStatus): StateDotState {
   switch (status) {
     case 'running': return 'ongoing'
     case 'completed': return 'done'
+    case 'waiting': return 'warning'
     case 'failed': return 'error'
     /* v8 ignore next -- KersorRunStatus is closed and every variant is handled above. */
     default: return 'warning'
@@ -1256,7 +1258,13 @@ export function KersorView({
                           }
                         }}
                       >
-                        <StateDot state={row.discovery === 'active' ? 'ongoing' : row.discovery === 'failed' ? 'error' : 'done'} />
+                        <StateDot state={
+                          row.discovery === 'active'
+                            ? 'ongoing'
+                            : row.discovery === 'failed'
+                              ? 'error'
+                              : row.discovery === 'waiting' ? 'warning' : 'done'
+                        } />
                         <span className={css.rowLabel}>{runDisplayLabel(row, session)}</span>
                         <span className={css.runId}>{row.runId}</span>
                         {crossWorkspace ? <span className={css.workspaceBadge}>{t('session.otherWorkspace')}</span> : null}

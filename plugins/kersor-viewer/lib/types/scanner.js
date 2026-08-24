@@ -2,7 +2,8 @@
  * Root-directory discovery of KerSor autonomous runs and bounded source observations.
  * @module @deepseek-ai/dsh-kersor-viewer
  */
-import { access, readFile, readdir } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { access, readFile, readdir, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { createIssue, errorCode, issueFromError, mergeIssue } from "./diagnostics.js";
@@ -12,6 +13,16 @@ export const DEFAULT_KERSOR_ROOTS = [
     path.join(homedir(), '.local', 'share', 'kersor'),
     path.join(homedir(), 'Agent4Kernel', 'KerSor', '.kersor'),
 ];
+const summaryRevisions = new WeakMap();
+/**
+ * Read the scan-local generation of a run's atomically written summary.
+ * This internal signal is intentionally absent from the Remote inventory.
+ * @param ref - Exact run reference returned by the scanner.
+ * @returns Opaque summary generation, or `undefined` before a summary exists.
+ */
+export function scannedRunSummaryRevision(ref) {
+    return summaryRevisions.get(ref);
+}
 function expandHome(value) {
     if (value === '~')
         return homedir();
@@ -67,17 +78,26 @@ async function readSummary(file) {
             return {};
         return { issue: issueFromError('summary_read', error, 'warning') };
     }
+    const contentHash = createHash('sha256').update(text).digest('hex');
+    let revision = contentHash;
+    try {
+        const info = await stat(file);
+        revision = `${contentHash}:${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}`;
+    }
+    catch {
+        // The content hash remains a stable generation if metadata races a rename.
+    }
     let decoded;
     try {
         decoded = JSON.parse(text);
     }
     catch (error) {
-        return { issue: issueFromError('summary_read', error, 'warning') };
+        return { issue: issueFromError('summary_read', error, 'warning'), revision };
     }
     if (decoded === null || typeof decoded !== 'object' || Array.isArray(decoded)) {
-        return { issue: createIssue('summary_read', 'invalid_payload', 'warning') };
+        return { issue: createIssue('summary_read', 'invalid_payload', 'warning'), revision };
     }
-    return { value: decoded };
+    return { value: decoded, revision };
 }
 async function scanSession(sessionDir, root) {
     const autonomousDir = path.join(sessionDir, 'autonomous-runs');
@@ -108,9 +128,12 @@ async function scanSession(sessionDir, root) {
         let discovery = 'active';
         if (summary.value !== undefined) {
             const status = summary.value.workflow_status ?? summary.value.status;
-            if (status === 'completed' || status === 'waiting')
+            if (status === 'completed' || status === 'succeeded')
                 discovery = 'completed';
-            else if (status === 'error' || status === 'failed')
+            else if (status === 'waiting')
+                discovery = 'waiting';
+            else if (status === 'error' || status === 'failed' || status === 'blocked'
+                || status === 'stagnated' || status === 'exhausted')
                 discovery = 'failed';
             else if (status !== undefined) {
                 issues.push({ runDir, issue: createIssue('summary_read', 'invalid_payload', 'warning') });
@@ -119,12 +142,15 @@ async function scanSession(sessionDir, root) {
         if (summary.issue !== undefined)
             issues.push({ runDir, issue: summary.issue });
         const result = await readWorkflowResult(runDir);
-        runs.push({
+        const ref = {
             runId, runDir, sessionDir, root, kind,
             ...(round === undefined ? {} : { round }),
             ...(result === undefined ? {} : { result }),
             discovery,
-        });
+        };
+        runs.push(ref);
+        if (summary.revision !== undefined)
+            summaryRevisions.set(ref, summary.revision);
     };
     for (const child of autonomousChildren) {
         if (!child.isDirectory() && !child.isSymbolicLink())

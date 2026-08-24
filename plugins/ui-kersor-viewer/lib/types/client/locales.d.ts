@@ -147,6 +147,7 @@ export declare const zh: {
     readonly 'launcher.error': "任务控制失败：{message}";
     readonly 'run.active': "运行中";
     readonly 'run.completed': "已完成";
+    readonly 'run.waiting': "等待恢复";
     readonly 'run.failed': "已失败";
     readonly 'run.unknown': "未知";
     readonly 'run.currentPhase': "当前阶段：{phase}";
@@ -345,6 +346,7 @@ export declare const en: {
     readonly 'launcher.error': "Task control failed: {message}";
     readonly 'run.active': "Running";
     readonly 'run.completed': "Completed";
+    readonly 'run.waiting': "Waiting to resume";
     readonly 'run.failed': "Failed";
     readonly 'run.unknown': "Unknown";
     readonly 'run.currentPhase': "Current phase: {phase}";

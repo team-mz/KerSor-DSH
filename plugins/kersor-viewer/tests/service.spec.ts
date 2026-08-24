@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -35,6 +35,19 @@ async function settleResult(service: KersorViewerService, runDir: string): Promi
     await new Promise((resolve) => { setTimeout(resolve, 10) })
   }
   throw new Error('workflow result did not settle')
+}
+
+async function settleBacklog(
+  service: KersorViewerService,
+  runDir: string,
+  predicate: (view: NonNullable<Awaited<ReturnType<KersorViewerService['runBacklog']>>>) => boolean,
+): Promise<void> {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const view = await service.runBacklog(runDir)
+    if (view !== undefined && predicate(view)) return
+    await new Promise((resolve) => { setTimeout(resolve, 10) })
+  }
+  throw new Error('backlog did not settle')
 }
 
 function sourceContext(
@@ -213,6 +226,210 @@ describe('Host snapshot', () => {
         }],
       },
     })
+  })
+
+  it('keeps a failed Mission failed when the Host event stream ends completed', async () => {
+    const { workspace, runDir } = await fixture([
+      '{"type":"workflow.started"}',
+      '{"type":"workflow.completed"}',
+      '',
+    ].join('\n'))
+    await writeFile(
+      path.join(runDir, '.runtime', 'summary.json'),
+      JSON.stringify({ status: 'completed', workflow_status: 'failed' }),
+    )
+    const service = new KersorViewerService(sourceContext([workspace]), {
+      noDefaultRoots: true, classicSessionLimit: 0,
+    })
+
+    await service.rescan()
+    await settleBackfill(service, runDir)
+
+    expect(service.snapshot().runs).toContainEqual(expect.objectContaining({
+      runDir, discovery: 'failed',
+    }))
+    expect((await service.runBacklog(runDir))?.status).toBe('failed')
+  })
+
+  it('projects a blocked Mission as unsuccessful after Host completion', async () => {
+    const { workspace, runDir } = await fixture([
+      '{"type":"workflow.started"}',
+      '{"type":"workflow.completed"}',
+      '',
+    ].join('\n'))
+    await writeFile(
+      path.join(runDir, '.runtime', 'summary.json'),
+      JSON.stringify({ status: 'completed', workflow_status: 'blocked' }),
+    )
+    const service = new KersorViewerService(sourceContext([workspace]), {
+      noDefaultRoots: true, classicSessionLimit: 0,
+    })
+
+    await service.rescan()
+    await settleBackfill(service, runDir)
+
+    expect(service.snapshot().runs).toContainEqual(expect.objectContaining({
+      runDir, discovery: 'failed',
+    }))
+    expect((await service.runBacklog(runDir))?.status).toBe('failed')
+  })
+
+  it('projects a stagnated task-v1 Workflow as unsuccessful after Host completion', async () => {
+    const { workspace, runDir } = await fixture([
+      '{"type":"workflow.started"}',
+      '{"type":"workflow.completed"}',
+      '',
+    ].join('\n'))
+    await writeFile(
+      path.join(runDir, '.runtime', 'summary.json'),
+      JSON.stringify({ status: 'completed', workflow_status: 'stagnated' }),
+    )
+    const service = new KersorViewerService(sourceContext([workspace]), {
+      noDefaultRoots: true, classicSessionLimit: 0,
+    })
+
+    await service.rescan()
+    await settleBackfill(service, runDir)
+
+    expect(service.snapshot().runs).toContainEqual(expect.objectContaining({
+      runDir, discovery: 'failed',
+    }))
+    expect((await service.runBacklog(runDir))?.status).toBe('failed')
+  })
+
+  it('keeps a waiting Mission resumable when the Host event stream ends completed', async () => {
+    const { workspace, runDir } = await fixture([
+      '{"type":"workflow.started"}',
+      '{"type":"workflow.completed"}',
+      '',
+    ].join('\n'))
+    await writeFile(
+      path.join(runDir, '.runtime', 'summary.json'),
+      JSON.stringify({ status: 'completed', workflow_status: 'waiting', calls: 1 }),
+    )
+    const service = new KersorViewerService(sourceContext([workspace]), {
+      noDefaultRoots: true, classicSessionLimit: 0,
+    })
+
+    await service.rescan()
+    await settleBackfill(service, runDir)
+
+    expect(service.snapshot().runs).toContainEqual(expect.objectContaining({
+      runDir, discovery: 'waiting',
+    }))
+    expect((await service.runBacklog(runDir))?.status).toBe('waiting')
+  })
+
+  it('rebuilds a waiting run from the full ledger after resume completes', async () => {
+    const first = [
+      '{"type":"workflow.started"}',
+      '{"type":"phase.changed","phase":"First"}',
+      '{"type":"agent.queued","phase":"First","seq":0,"call_id":"first"}',
+      '{"type":"agent.completed","phase":"First","seq":0,"call_id":"first","usage":{"total_tokens":3}}',
+      '{"type":"workflow.completed","usage":{"total_tokens":3}}',
+      '',
+    ].join('\n')
+    const second = [
+      '{"type":"workflow.started"}',
+      '{"type":"phase.changed","phase":"Resumed"}',
+      '{"type":"agent.queued","phase":"Resumed","seq":1,"call_id":"second"}',
+      '{"type":"agent.completed","phase":"Resumed","seq":1,"call_id":"second","usage":{"total_tokens":5}}',
+      '{"type":"workflow.completed","usage":{"total_tokens":8}}',
+      '',
+    ].join('\n')
+    const { workspace, runDir } = await fixture(first)
+    await writeFile(
+      path.join(runDir, '.runtime', 'summary.json'),
+      JSON.stringify({ status: 'completed', workflow_status: 'waiting', calls: 1 }),
+    )
+    const service = new KersorViewerService(sourceContext([workspace]), {
+      noDefaultRoots: true, classicSessionLimit: 0,
+    })
+    await service.rescan()
+    await settleBackfill(service, runDir)
+
+    await appendFile(path.join(runDir, '.runtime', 'events.jsonl'), second)
+    await writeFile(
+      path.join(runDir, '.runtime', 'summary.json'),
+      JSON.stringify({ status: 'completed', workflow_status: 'completed' }),
+    )
+    await service.rescan()
+    await settleBacklog(service, runDir, view => view.phases.length === 2)
+
+    const view = await service.runBacklog(runDir)
+    expect(view).toMatchObject({
+      status: 'completed',
+      phases: [{ title: 'First' }, { title: 'Resumed' }],
+      totals: { calls: 2, completed: 2, failed: 0, tokens: 8 },
+    })
+    expect(service.snapshot().diagnostics.runs).toContainEqual(expect.objectContaining({
+      runDir,
+      byteOffset: Buffer.byteLength(first + second),
+      linesRead: 10,
+    }))
+  })
+
+  it('refreshes events and bounded output when a resumed run waits again', async () => {
+    const first = [
+      '{"type":"workflow.started"}',
+      '{"type":"phase.changed","phase":"First"}',
+      '{"type":"workflow.completed"}',
+      '',
+    ].join('\n')
+    const second = [
+      '{"type":"workflow.started"}',
+      '{"type":"phase.changed","phase":"Resumed"}',
+      '{"type":"workflow.completed"}',
+      '',
+    ].join('\n')
+    const { workspace, runDir } = await fixture(first)
+    await writeFile(
+      path.join(runDir, '.runtime', 'summary.json'),
+      JSON.stringify({ status: 'completed', workflow_status: 'waiting', calls: 1 }),
+    )
+    await writeFile(path.join(runDir, 'output.json'), JSON.stringify({ arch_stage: 'first_wait' }))
+    const service = new KersorViewerService(sourceContext([workspace]), {
+      noDefaultRoots: true, classicSessionLimit: 0,
+    })
+    await service.rescan()
+    await settleBackfill(service, runDir)
+    await settleResult(service, runDir)
+
+    await appendFile(path.join(runDir, '.runtime', 'events.jsonl'), second)
+    await writeFile(path.join(runDir, 'output.json'), JSON.stringify({ arch_stage: 'second_wait' }))
+    await service.rescan()
+    expect(await service.runBacklog(runDir)).toMatchObject({
+      status: 'waiting',
+      phases: [{ title: 'First' }],
+      result: { stage: 'first_wait' },
+    })
+    expect(service.snapshot().diagnostics.runs).toContainEqual(expect.objectContaining({
+      runDir,
+      byteOffset: Buffer.byteLength(first),
+      linesRead: 3,
+    }))
+
+    await writeFile(
+      path.join(runDir, '.runtime', 'summary.json'),
+      JSON.stringify({ status: 'completed', workflow_status: 'waiting', calls: 2 }),
+    )
+    await service.rescan()
+    await settleBacklog(service, runDir, view => view.phases.length === 2)
+
+    const view = await service.runBacklog(runDir)
+    expect(view).toMatchObject({
+      status: 'waiting',
+      phases: [{ title: 'First' }, { title: 'Resumed' }],
+      result: { stage: 'second_wait' },
+    })
+    expect(service.snapshot().runs).toContainEqual(expect.objectContaining({
+      runDir, discovery: 'waiting', result: expect.objectContaining({ stage: 'second_wait' }),
+    }))
+    expect(service.snapshot().diagnostics.runs).toContainEqual(expect.objectContaining({
+      runDir,
+      byteOffset: Buffer.byteLength(first + second),
+      linesRead: 6,
+    }))
   })
 
   it('rejects an invalid event without losing later valid events or exposing content', async () => {

@@ -6,8 +6,8 @@
  * @module @deepseek-ai/dsh-kersor-viewer
  */
 
-/** Terminal lifecycle of a whole workflow run. */
-export type KersorRunStatus = 'running' | 'completed' | 'failed' | 'unknown'
+/** Displayed lifecycle of a Workflow; `waiting` is ingestion-terminal but resumable. */
+export type KersorRunStatus = 'running' | 'completed' | 'waiting' | 'failed' | 'unknown'
 
 /** Lifecycle of one agent or evaluation call row. */
 export type KersorCallStatus = 'queued' | 'running' | 'completed' | 'failed'
