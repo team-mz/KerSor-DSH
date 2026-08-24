@@ -282,7 +282,7 @@ python3 scripts/build.py --dsh-root /absolute/path/to/deepseek-harness
 python3 scripts/check.py
 ```
 
-`build.py` 在临时目录中复原 DSH monorepo 布局，借用指定 checkout 的固定 TypeScript 依赖重建 host reflection 与 browser bundle，但不修改 DSH 工作树。`check.py` 覆盖 metadata、preset-local skill 发现配置、安装器渲染与幂等性、强制更新备份、built plugin 合同，以及仓库中意外出现的机器绝对路径。
+`build.py` 在临时目录中复原 DSH monorepo 布局，借用指定 checkout 的固定 TypeScript 依赖重建 host reflection 与 browser bundle，但不修改任一工作树。它会在构建前后核对 schema-v2 mirror、Authority commit、中央 build receipt 与 74 个派生产物；更新镜像必须显式运行 `scripts/sync_plugins.py sync --harness <checkout> --write`，临时构建本身不会回写 receipt-owned `lib`。`check.py` 覆盖 metadata、preset-local skill 发现配置、安装器渲染与幂等性、强制更新备份、built plugin 合同，以及仓库中意外出现的机器绝对路径。
 
 ## 目录
 
