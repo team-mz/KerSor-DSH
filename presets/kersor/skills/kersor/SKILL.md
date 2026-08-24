@@ -165,9 +165,27 @@ evaluator whose full request, rollback policy, and candidate gate match the
 frozen Mission; Core runs it while the snapshot is live and commits only an
 accepted candidate. Every activation still uses the owner-only AF_UNIX endpoint
 and a fresh DSH `spawn` child pinned to `deepseek-official/deepseek-v4-flash`.
-Missing usage, route drift, disconnect, cancellation, or an unsafe transaction
-fails closed and disposes the child. Use an external runtime for multi-file or
-otherwise unsupported mutation contracts.
+The Host folds durable usage chunks and assistant messages by `(turn, step)`,
+with the later sample replacing an earlier sample for that step, and processes
+the durable terminal before requiring structured output. Completeness requires
+the full child log to have contiguous `seq` values starting at zero. Only an
+empty-output failure with exactly one fresh `turn=1, step=1`, ordered
+`turn/start -> step/start -> finish -> step/end -> turn/end` lifecycle, no
+retry, `tool/*`, or other assistant content/message/usage, and canonically identical
+`finish` plus `turn/end` failures whose raw machine code is exactly `QUOTA`
+(without whitespace trimming or case folding) and status is HTTP 429 may produce the known
+pre-usage receipt (`usage_observed=false`, `usage_complete=true`, all token
+counts zero). Inbox, user-message, title, and request-metadata events between
+those boundaries are permitted, but `turn/end` must be the final event. Any
+duplicate, gap, malformed sequence, missing/reordered boundary, post-terminal
+event, mismatched failure, or other unprovable usage record remains incomplete
+and fails closed. General usage is complete only when that fresh lifecycle is
+valid, steps start at 1 and close consecutively, and every step has an
+authoritative token-meter sample. Durable `blocked`, `aborted`, and
+`interrupted` terminals map to `refusal`, `aborted`, and `error`; route drift,
+disconnect, cancellation, and unsafe transactions also fail closed and dispose
+the child. Use an external runtime for multi-file or otherwise unsupported
+mutation contracts.
 
 For `runtime=claude`, the bridge removes ambient `CLAUDE*`, `ANTHROPIC*`, and
 KerSor routing controls and publishes only the Claude-compatible executable and

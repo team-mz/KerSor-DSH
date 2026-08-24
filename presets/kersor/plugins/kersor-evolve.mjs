@@ -29,10 +29,34 @@ const DSH_RPC_NONCE_ENV = 'KERSOR_DSH_RPC_NONCE'
 const DSH_READ_TOOLS = Object.freeze(['read', 'glob', 'grep'])
 const DSH_WRITE_TOOLS = Object.freeze(['edit', 'write'])
 const DSH_STRUCTURED_OUTPUT_TOOL = 'structured_output'
+const DSH_RETRY_EVENT_TYPES = new Set(['llm/retry', 'llm/retry-started'])
+const DSH_STEP_SCOPED_EVENT_TYPES = new Set([
+  'assistant/chunk',
+  'assistant/message',
+  'tool/call',
+  'tool/result',
+  ...DSH_RETRY_EVENT_TYPES,
+])
+const DSH_PRE_USAGE_QUOTA_EVENT_TYPES = new Set([
+  'sandbox/mode',
+  'approval/policy',
+  'agent/inbox/spliced',
+  'subagent/descriptor',
+  'turn/start',
+  'step/start',
+  'user/message',
+  'session/title',
+  'request/header',
+  'request/context',
+  'assistant/chunk',
+  'step/end',
+  'turn/end',
+])
 const DSH_MAX_ACTIVATION_TIMEOUT_SECONDS = 900
 const MAX_RPC_CONNECTIONS = 64
 const MAX_RPC_ERROR_BYTES = 4_096
 const TERMINAL_STATUSES = new Set(['completed', 'blocked', 'waiting', 'failed'])
+const DSH_RPC_ERROR = Symbol('kersor-dsh-rpc-error')
 const CLAIMED_SESSIONS = new WeakSet()
 const CLAIMED_TURNS = new WeakMap()
 const CHILD_POLICY = new AsyncLocalStorage()
@@ -269,39 +293,319 @@ function safeTokenCount(value, label) {
   return value
 }
 
-function childUsage(agent) {
+function childUsageBuckets(value) {
+  if (!isRecord(value)) throw new Error('DSH child published malformed token usage')
+  const input = safeTokenCount(value.inputTokens, 'inputTokens')
+  const output = safeTokenCount(value.outputTokens, 'outputTokens')
+  const cacheRead = value.cacheReadTokens === undefined
+    ? 0
+    : safeTokenCount(value.cacheReadTokens, 'cacheReadTokens')
+  const cacheWrite = value.cacheWriteTokens === undefined
+    ? 0
+    : safeTokenCount(value.cacheWriteTokens, 'cacheWriteTokens')
+  return {
+    input_tokens: input,
+    cached_input_tokens: safeTokenCount(cacheRead + cacheWrite, 'cached input'),
+    output_tokens: output,
+    total_tokens: safeTokenCount(input + cacheRead + cacheWrite + output, 'totalTokens'),
+  }
+}
+
+function childStepOrNull(value) {
+  if (
+    !isRecord(value)
+    || !Number.isSafeInteger(value.turn)
+    || value.turn < 1
+    || !Number.isSafeInteger(value.step)
+    || value.step < 1
+  ) return null
+  return {turn: value.turn, step: value.step, key: `${value.turn}/${value.step}`}
+}
+
+function childStep(value, label) {
+  const step = childStepOrNull(value)
+  if (step === null) throw new Error(`DSH child published malformed ${label} coordinates`)
+  return step
+}
+
+function terminalStopReason(reason) {
+  switch (reason?.kind) {
+    case 'completed':
+      return 'completed'
+    case 'max-tokens':
+      return 'max-tokens'
+    case 'aborted':
+      return 'aborted'
+    case 'blocked':
+      return 'refusal'
+    case 'error':
+    case 'interrupted':
+    case 'disposed':
+      return 'error'
+    default:
+      return null
+  }
+}
+
+function providerFailureFrom(reason) {
+  if (reason?.kind !== 'error' || !isRecord(reason.error)) return null
+  const message = typeof reason.error.message === 'string' ? reason.error.message.trim() : ''
+  const code = typeof reason.error.code === 'string' ? reason.error.code : ''
+  if (!message || code.length === 0) return null
+  const status = reason.error.status
+  if (status !== undefined && (!Number.isSafeInteger(status) || status < 100 || status > 599)) {
+    return null
+  }
+  return {message, code, ...(status === undefined ? {} : {status})}
+}
+
+function childLifecycle(events) {
+  const turnStarts = []
+  const stepStarts = []
+  const stepEnds = []
+  const turnEnds = []
+  const assistantEvents = []
+  const retryEvents = []
+  const startedSteps = []
+  let valid = true
+  let openTurn = null
+  let openStep = null
+  let nextStep = 1
+  let terminal = null
+
+  for (const [ordinal, event] of events.entries()) {
+    if (!Number.isSafeInteger(event?.seq) || event.seq !== ordinal) valid = false
+    const type = event?.type
+    if (type === 'assistant/chunk' || type === 'assistant/message') assistantEvents.push(event)
+    if (DSH_RETRY_EVENT_TYPES.has(type)) retryEvents.push(event)
+
+    if (DSH_STEP_SCOPED_EVENT_TYPES.has(type)) {
+      const position = childStepOrNull(event.data)
+      if (
+        position === null
+        || openStep === null
+        || position.turn !== openStep.turn
+        || position.step !== openStep.step
+      ) {
+        valid = false
+      }
+    }
+
+    if (type === 'turn/start') {
+      turnStarts.push(event)
+      const turn = Number.isSafeInteger(event?.data?.turn) && event.data.turn > 0
+        ? event.data.turn
+        : null
+      if (
+        turn !== 1
+        || turnStarts.length !== 1
+        || openTurn !== null
+        || openStep !== null
+        || turnEnds.length !== 0
+      ) {
+        valid = false
+      }
+      if (openTurn === null && turn !== null) openTurn = turn
+      continue
+    }
+
+    if (type === 'step/start') {
+      stepStarts.push(event)
+      const position = childStepOrNull(event.data)
+      if (
+        position === null
+        || openTurn === null
+        || position.turn !== openTurn
+        || position.step !== nextStep
+        || openStep !== null
+      ) {
+        valid = false
+      }
+      if (position !== null) {
+        startedSteps.push(position.key)
+        if (openStep === null) openStep = position
+      }
+      continue
+    }
+
+    if (type === 'step/end') {
+      stepEnds.push(event)
+      const position = childStepOrNull(event.data)
+      if (
+        position === null
+        || openStep === null
+        || position.turn !== openStep.turn
+        || position.step !== openStep.step
+      ) {
+        valid = false
+      } else {
+        openStep = null
+        nextStep += 1
+      }
+      continue
+    }
+
+    if (type === 'turn/end') {
+      turnEnds.push(event)
+      terminal = event
+      const turn = Number.isSafeInteger(event?.data?.turn) && event.data.turn > 0
+        ? event.data.turn
+        : null
+      if (
+        turn === null
+        || !isRecord(event?.data?.reason)
+        || turnEnds.length !== 1
+        || openTurn === null
+        || turn !== openTurn
+        || openStep !== null
+        || ordinal !== events.length - 1
+      ) {
+        valid = false
+      }
+      if (openStep === null && openTurn === turn) openTurn = null
+    }
+  }
+
+  if (
+    turnStarts.length !== 1
+    || turnEnds.length !== 1
+    || stepStarts.length !== stepEnds.length
+    || openTurn !== null
+    || openStep !== null
+  ) {
+    valid = false
+  }
+  return {
+    valid,
+    terminal,
+    turnStarts,
+    stepStarts,
+    stepEnds,
+    turnEnds,
+    assistantEvents,
+    retryEvents,
+    startedSteps,
+  }
+}
+
+function childEvidence(agent, result) {
   const events = agent?.session?.events
   if (!Array.isArray(events)) throw new Error('DSH child did not expose a durable Session event log')
+  const lifecycle = childLifecycle(events)
+  const usageByStep = new Map()
+  for (const [ordinal, event] of events.entries()) {
+    const seq = event?.seq
+    const seqUsable = Number.isSafeInteger(seq) && seq >= 0
+    let rawUsage
+    if (event?.type === 'assistant/chunk' && event?.data?.chunk?.type === 'usage') {
+      rawUsage = event.data.chunk.usage
+    } else if (event?.type === 'assistant/message' && event?.data?.usage !== undefined) {
+      rawUsage = event.data.usage
+    } else {
+      continue
+    }
+    const step = childStep(event.data, event.type)
+    const sample = {
+      seq: seqUsable ? seq : null,
+      ordinal,
+      buckets: childUsageBuckets(rawUsage),
+    }
+    const previous = usageByStep.get(step.key)
+    if (
+      previous === undefined
+      || (sample.seq !== null && previous.seq !== null && sample.seq > previous.seq)
+      || ((sample.seq === null || previous.seq === null) && sample.ordinal > previous.ordinal)
+    ) {
+      usageByStep.set(step.key, sample)
+    }
+  }
+
   const usage = {
     input_tokens: 0,
     cached_input_tokens: 0,
     output_tokens: 0,
     total_tokens: 0,
   }
-  let observed = false
-  for (const event of events) {
-    if (event?.type !== 'assistant/message' || event?.data?.usage === undefined) continue
-    if (!isRecord(event.data.usage)) throw new Error('DSH child published malformed token usage')
-    const input = safeTokenCount(event.data.usage.inputTokens, 'inputTokens')
-    const output = safeTokenCount(event.data.usage.outputTokens, 'outputTokens')
-    const cacheRead = event.data.usage.cacheReadTokens === undefined
-      ? 0
-      : safeTokenCount(event.data.usage.cacheReadTokens, 'cacheReadTokens')
-    const cacheWrite = event.data.usage.cacheWriteTokens === undefined
-      ? 0
-      : safeTokenCount(event.data.usage.cacheWriteTokens, 'cacheWriteTokens')
-    for (const [key, increment] of [
-      ['input_tokens', input],
-      ['cached_input_tokens', cacheRead + cacheWrite],
-      ['output_tokens', output],
-      ['total_tokens', input + cacheRead + cacheWrite + output],
-    ]) {
+  for (const {buckets} of usageByStep.values()) {
+    for (const [key, increment] of Object.entries(buckets)) {
       usage[key] = safeTokenCount(usage[key] + increment, `aggregate ${key}`)
     }
-    observed = true
   }
-  if (!observed) throw new Error('DSH child did not publish observed token usage')
-  return usage
+
+  const terminalReason = lifecycle.terminal?.data?.reason
+  const terminalMatches = lifecycle.terminal !== null
+    && terminalStopReason(terminalReason) === result.stopReason
+  const providerFailure = providerFailureFrom(terminalReason)
+  let knownPreUsageQuota = false
+  if (
+    lifecycle.valid
+    && terminalMatches
+    && result.stopReason === 'error'
+    && providerFailure?.code === 'QUOTA'
+    && providerFailure.status === 429
+    && Array.isArray(result.output)
+    && result.output.length === 0
+    && result.structured === undefined
+    && usageByStep.size === 0
+    && lifecycle.turnStarts.length === 1
+    && lifecycle.stepStarts.length === 1
+    && lifecycle.stepEnds.length === 1
+    && lifecycle.turnEnds.length === 1
+    && lifecycle.assistantEvents.length === 1
+    && lifecycle.retryEvents.length === 0
+    && events.every(event => DSH_PRE_USAGE_QUOTA_EVENT_TYPES.has(event?.type))
+  ) {
+    const turnStart = lifecycle.turnStarts[0]
+    const stepStart = lifecycle.stepStarts[0]
+    const finish = lifecycle.assistantEvents[0]
+    const stepEnd = lifecycle.stepEnds[0]
+    const turnEnd = lifecycle.turnEnds[0]
+    const startStep = childStep(stepStart.data, 'quota step/start')
+    const endStep = childStep(stepEnd.data, 'quota step/end')
+    knownPreUsageQuota = turnStart.data?.turn === startStep.turn
+      && turnStart.data?.trigger?.kind !== 'retry'
+      && startStep.turn === endStep.turn
+      && startStep.step === endStep.step
+      && turnEnd.data.turn === startStep.turn
+      && lifecycle.terminal === turnEnd
+      && turnEnd.seq === events.length - 1
+      && finish.type === 'assistant/chunk'
+      && finish.data?.turn === startStep.turn
+      && finish.data?.step === startStep.step
+      && finish.data.chunk?.type === 'finish'
+      && finish.data.chunk.reason?.kind === 'error'
+      && sameJson(finish.data.chunk.reason.failure, terminalReason.error)
+      && turnStart.seq < stepStart.seq
+      && stepStart.seq < finish.seq
+      && finish.seq < stepEnd.seq
+      && stepEnd.seq < turnEnd.seq
+  }
+
+  const everyStartedStepMetered = lifecycle.startedSteps.length > 0
+    && lifecycle.startedSteps.every(key => usageByStep.has(key))
+  return {
+    usage,
+    usageObserved: usageByStep.size > 0,
+    usageComplete: lifecycle.valid
+      && terminalMatches
+      && (everyStartedStepMetered || knownPreUsageQuota),
+    terminalMatches,
+    providerFailure,
+    knownPreUsageQuota,
+  }
+}
+
+function dshActivationError(code, message, result, providerFailure = null) {
+  const error = new Error(message)
+  error[DSH_RPC_ERROR] = {
+    code,
+    result,
+    ...(providerFailure === null ? {} : {
+      providerCode: providerFailure.code,
+      ...(providerFailure.status === undefined ? {} : {providerStatus: providerFailure.status}),
+    }),
+  }
+  return error
 }
 
 function activationModelRole(value) {
@@ -660,21 +964,18 @@ async function executeDshActivation(ctx, parent, workspace, lexicalWorkspace, mi
     if (!isRecord(result) || typeof result.stopReason !== 'string') {
       throw new Error('DSH spawn returned an invalid terminal result')
     }
-    if (activation.outputSchema !== undefined && result.structured === undefined) {
-      throw new Error('DSH child did not publish the requested structured output')
-    }
-    const usage = childUsage(run.localAgent)
     const threadId = String(run.id ?? run.localAgent.id ?? '')
     if (!threadId) throw new Error('DSH spawn did not publish a child thread id')
-    return {
+    const evidence = childEvidence(run.localAgent, result)
+    const receipt = {
       output: jsonClone(result.output ?? [], 'DSH child output'),
       structured: result.structured === undefined
         ? null
         : jsonClone(result.structured, 'DSH child structured output'),
       stop_reason: result.stopReason,
-      usage,
-      usage_observed: true,
-      usage_complete: true,
+      usage: evidence.usage,
+      usage_observed: evidence.usageObserved,
+      usage_complete: evidence.usageComplete,
       thread_id: threadId,
       provider: DSH_PROVIDER,
       model: DSH_MODEL,
@@ -682,6 +983,37 @@ async function executeDshActivation(ctx, parent, workspace, lexicalWorkspace, mi
       isolation: 'fresh-dsh-subagent',
       artifacts: [],
     }
+    if (!evidence.terminalMatches) {
+      throw dshActivationError(
+        'DSH_CHILD_EVIDENCE_INVALID',
+        'DSH child result did not match its durable terminal',
+        receipt,
+      )
+    }
+    if (result.stopReason !== 'completed') {
+      const providerFailure = evidence.providerFailure
+      throw dshActivationError(
+        evidence.knownPreUsageQuota ? 'DSH_CHILD_QUOTA' : 'DSH_CHILD_TERMINAL_ERROR',
+        providerFailure?.message ?? `DSH child stopped with ${result.stopReason}`,
+        receipt,
+        providerFailure,
+      )
+    }
+    if (activation.outputSchema !== undefined && result.structured === undefined) {
+      throw dshActivationError(
+        'DSH_CHILD_RESULT_INVALID',
+        'DSH child did not publish the requested structured output',
+        receipt,
+      )
+    }
+    if (!evidence.usageComplete) {
+      throw dshActivationError(
+        'DSH_CHILD_USAGE_INCOMPLETE',
+        'DSH child did not publish complete observed token usage',
+        receipt,
+      )
+    }
+    return receipt
   } finally {
     try {
       if (run !== undefined) await run.dispose()
@@ -1077,12 +1409,26 @@ async function createDshRpcHost({ctx, parent, workspace, lexicalWorkspace, runti
       } catch (error) {
         if (!socket.destroyed) {
           try {
+            const activationFailure = error?.[DSH_RPC_ERROR]
+            const rpcError = isRecord(activationFailure)
+              ? {
+                  code: activationFailure.code,
+                  message: boundedErrorMessage(error),
+                  ...(activationFailure.providerCode === undefined
+                    ? {}
+                    : {provider_code: activationFailure.providerCode}),
+                  ...(activationFailure.providerStatus === undefined
+                    ? {}
+                    : {provider_status: activationFailure.providerStatus}),
+                }
+              : {code: 'DSH_ACTIVATION_REJECTED', message: boundedErrorMessage(error)}
             await writeRpcFrame(socket, {
               protocol: DSH_RPC_PROTOCOL,
               type: 'result',
               request_id: requestId,
               ok: false,
-              error: {code: 'DSH_ACTIVATION_REJECTED', message: boundedErrorMessage(error)},
+              error: rpcError,
+              ...(isRecord(activationFailure?.result) ? {result: activationFailure.result} : {}),
             })
           } catch {
             socket.destroy()

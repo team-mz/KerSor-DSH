@@ -147,21 +147,403 @@ const telemetry = {
 }
 const topLevelGuards = []
 let registeredTool
+const quotaFailure = {
+  message: '[Service quota exceeded.]',
+  code: 'QUOTA',
+  status: 429,
+}
+const serverFailure = {
+  message: 'provider request failed after metering',
+  code: 'SERVER',
+  status: 503,
+}
+const unknownFailure = {
+  message: 'provider request failed before usage was observed',
+  code: 'UNKNOWN',
+}
+const withSeq = events => events.map((event, index) => ({...event, seq: index}))
+const completedEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/message',
+    data: {
+      turn: 1,
+      step: 1,
+      usage: {
+        inputTokens: 11,
+        cacheReadTokens: 3,
+        cacheWriteTokens: 2,
+        outputTokens: 7,
+      },
+    },
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'completed'}}},
+])
+const quotaLifecycle = failure => withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: failure}}},
+])
+const quotaEvents = quotaLifecycle(quotaFailure)
+const quotaCodeVariantEvents = new Map([
+  ['quota-code-leading-space', quotaLifecycle({...quotaFailure, code: ' QUOTA '})],
+  ['quota-code-trailing-newline', quotaLifecycle({...quotaFailure, code: 'QUOTA\n'})],
+  ['quota-code-lowercase', quotaLifecycle({...quotaFailure, code: 'quota'})],
+])
+const quotaAfterContentEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'text-delta', text: 'partial output'}},
+  },
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const usageChunkFailureEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 1,
+      chunk: {type: 'usage', usage: {inputTokens: 9, outputTokens: 1}},
+    },
+  },
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: serverFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: serverFailure}}},
+])
+const unknownFailureEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: unknownFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: unknownFailure}}},
+])
+const multiStepFailureEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 1,
+      chunk: {type: 'usage', usage: {inputTokens: 4, outputTokens: 1}},
+    },
+  },
+  {
+    type: 'assistant/message',
+    data: {
+      turn: 1,
+      step: 1,
+      usage: {inputTokens: 6, cacheReadTokens: 2, outputTokens: 2},
+    },
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'step/start', data: {turn: 1, step: 2}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 2,
+      chunk: {type: 'usage', usage: {inputTokens: 3, outputTokens: 4}},
+    },
+  },
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 2, chunk: {type: 'finish', reason: {kind: 'error', failure: serverFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 2}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: serverFailure}}},
+])
+const quotaDuplicateTurnStartEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'turn/start', data: {turn: 1, trigger: {kind: 'retry'}}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const quotaDuplicateStepStartEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const quotaDuplicateTurnEndEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const quotaMissingStepEndEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const quotaTerminalBeforeFinishEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+])
+const quotaOtherCoordinateContentEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 9, step: 9, chunk: {type: 'text-delta', text: 'ambiguous content'}},
+  },
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const quotaMismatchedFailureEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 1,
+      chunk: {
+        type: 'finish',
+        reason: {kind: 'error', failure: {...quotaFailure, requestId: 'finish-request'}},
+      },
+    },
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {
+    type: 'turn/end',
+    data: {
+      turn: 1,
+      reason: {kind: 'error', error: {...quotaFailure, requestId: 'terminal-request'}},
+    },
+  },
+])
+const quotaRetryMarkerEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {type: 'llm/retry-started', data: {turn: 1, step: 1, retryId: 'retry-1', retry: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const quotaNonFreshCoordinatesEvents = withSeq([
+  {type: 'turn/start', data: {turn: 9}},
+  {type: 'step/start', data: {turn: 9, step: 9}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 9, step: 9, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 9, step: 9}},
+  {type: 'turn/end', data: {turn: 9, reason: {kind: 'error', error: quotaFailure}}},
+])
+const quotaToolResultEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'tool/result',
+    data: {
+      turn: 1,
+      step: 1,
+      message: {role: 'tool', toolCallId: 'call-1', content: [{type: 'text', text: 'content'}]},
+    },
+  },
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const quotaPostTerminalExecutionEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+  {type: 'request/context', data: {turn: 1, step: 1}},
+])
+const usageMissingStepEndEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 1,
+      chunk: {type: 'usage', usage: {inputTokens: 9, outputTokens: 1}},
+    },
+  },
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: serverFailure}}},
+  },
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: serverFailure}}},
+])
+const duplicateStepUsageEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 1,
+      chunk: {type: 'usage', usage: {inputTokens: 100, outputTokens: 0}},
+    },
+  },
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 1,
+      chunk: {type: 'usage', usage: {inputTokens: 1, outputTokens: 0}},
+    },
+  },
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: serverFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: serverFailure}}},
+])
+// Public replay of the existing child 2aac0987-e73d-4033-b19c-fde5fe240623,
+// retaining its event types, coordinates, ordering, and contiguous seq values.
+const exportedQuotaEvents = withSeq([
+  {type: 'sandbox/mode', data: {mode: 'workspace-write', source: 'delegation'}},
+  {type: 'approval/policy', data: {policy: 'never', source: 'delegation'}},
+  {type: 'agent/inbox/spliced', data: {}},
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'agent/inbox/spliced', data: {}},
+  {type: 'subagent/descriptor', data: {}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {type: 'user/message', data: {}},
+  {type: 'user/message', data: {}},
+  {type: 'user/message', data: {}},
+  {type: 'session/title', data: {}},
+  {type: 'request/header', data: {}},
+  {type: 'request/context', data: {}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'error', failure: quotaFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: quotaFailure}}},
+])
+const blockedEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'blocked'}}},
+])
+const abortedEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'aborted', reason: {kind: 'user'}}}},
+])
+const interruptedEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'interrupted'}}},
+])
+const malformedSeqEvents = completedEvents.map((event, index) => (
+  index === 2 ? {...event, seq: 'not-an-integer'} : event
+))
+const nonmonotonicSeqEvents = completedEvents.map((event, index) => (
+  index === 1 ? {...event, seq: 12} : index === 2 ? {...event, seq: 11} : event
+))
+const duplicateSeqEvents = completedEvents.map((event, index) => (
+  index === 3 ? {...event, seq: completedEvents[2].seq} : event
+))
+const gapSeqEvents = completedEvents.map((event, index) => (
+  index < 2 ? event : {...event, seq: event.seq + 1}
+))
+const eventsByMode = new Map([
+  ['quota', quotaEvents],
+  ...quotaCodeVariantEvents,
+  ['quota-after-content', quotaAfterContentEvents],
+  ['quota-duplicate-turn-start', quotaDuplicateTurnStartEvents],
+  ['quota-duplicate-step-start', quotaDuplicateStepStartEvents],
+  ['quota-duplicate-turn-end', quotaDuplicateTurnEndEvents],
+  ['quota-missing-step-end', quotaMissingStepEndEvents],
+  ['quota-terminal-before-finish', quotaTerminalBeforeFinishEvents],
+  ['quota-other-coordinate-content', quotaOtherCoordinateContentEvents],
+  ['quota-mismatched-failure', quotaMismatchedFailureEvents],
+  ['quota-retry-marker', quotaRetryMarkerEvents],
+  ['quota-nonfresh-coordinates', quotaNonFreshCoordinatesEvents],
+  ['quota-tool-result', quotaToolResultEvents],
+  ['quota-post-terminal-execution', quotaPostTerminalExecutionEvents],
+  ['quota-exported-replay', exportedQuotaEvents],
+  ['usage-chunk-failure', usageChunkFailureEvents],
+  ['unknown-failure', unknownFailureEvents],
+  ['multi-step-failure', multiStepFailureEvents],
+  ['usage-missing-step-end', usageMissingStepEndEvents],
+  ['duplicate-step-usage', duplicateStepUsageEvents],
+  ['blocked', blockedEvents],
+  ['aborted', abortedEvents],
+  ['interrupted', interruptedEvents],
+  ['malformed-seq', malformedSeqEvents],
+  ['nonmonotonic-seq', nonmonotonicSeqEvents],
+  ['duplicate-seq', duplicateSeqEvents],
+  ['gap-seq', gapSeqEvents],
+])
+const childEvents = eventsByMode.get(request.child_mode) ?? completedEvents
 const child = {
   id: 'dsh-child-route-probe',
   options: {provider: plugin.DSH_PROVIDER, model: plugin.DSH_MODEL},
   session: {
-    events: [{
-      type: 'assistant/message',
-      data: {
-        usage: {
-          inputTokens: 11,
-          cacheReadTokens: 3,
-          cacheWriteTokens: 2,
-          outputTokens: 7,
-        },
-      },
-    }],
+    events: childEvents,
   },
   ctx: {
     tools: {
@@ -261,6 +643,36 @@ const ctx = {
           if (value.signal.aborted) settle()
           else value.signal.addEventListener('abort', settle, {once: true})
         })
+      } else if ([
+        'quota',
+        'quota-code-leading-space',
+        'quota-code-trailing-newline',
+        'quota-code-lowercase',
+        'quota-after-content',
+        'quota-duplicate-turn-start',
+        'quota-duplicate-step-start',
+        'quota-duplicate-turn-end',
+        'quota-missing-step-end',
+        'quota-terminal-before-finish',
+        'quota-other-coordinate-content',
+        'quota-mismatched-failure',
+        'quota-retry-marker',
+        'quota-nonfresh-coordinates',
+        'quota-tool-result',
+        'quota-post-terminal-execution',
+        'quota-exported-replay',
+        'usage-chunk-failure',
+        'unknown-failure',
+        'multi-step-failure',
+        'usage-missing-step-end',
+        'duplicate-step-usage',
+        'interrupted',
+      ].includes(request.child_mode)) {
+        result = Promise.resolve({output: [], stopReason: 'error'})
+      } else if (request.child_mode === 'blocked') {
+        result = Promise.resolve({output: [], stopReason: 'refusal'})
+      } else if (request.child_mode === 'aborted') {
+        result = Promise.resolve({output: [], stopReason: 'aborted'})
       } else {
         result = Promise.resolve({
           output: [{type: 'text', text: 'DSH route probe completed'}],
@@ -523,6 +935,9 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             "  chunks.extend(sock.recv(size - len(chunks)))\n"
             "response = json.loads(chunks)\n"
             "if response.get('ok') is not True:\n"
+            "  if contract_value.get('probe_mode') == 'capture-error':\n"
+            "    print(json.dumps({'status': 'failed', 'error': response['error']['message'], 'dsh_response': response}))\n"
+            "    raise SystemExit(2)\n"
             "  raise RuntimeError(response)\n"
             "socket_path = Path(os.environ['KERSOR_DSH_RPC_SOCKET'])\n"
             "terminal = {\n"
@@ -601,6 +1016,46 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         return json.loads(completed.stdout)
+
+    def write_dsh_failure_contract(self, mission_id: str) -> Path:
+        return self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / mission_id),
+            runtime="dsh",
+            probe_mode="capture-error",
+            mission={
+                "mission_id": mission_id,
+                "goal": "surface one child terminal failure safely",
+                "authority": ["read workspace"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{"name": "inspect", "side_effect": "read"}],
+        )
+
+    def assert_unproven_quota_receipt(
+        self,
+        mode: str,
+        provider_code: str = "QUOTA",
+    ) -> None:
+        contract = self.write_dsh_failure_contract(mode)
+        result = self.invoke_dsh_native(contract, child_mode=mode)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_CHILD_TERMINAL_ERROR")
+        self.assertEqual(response["error"]["provider_code"], provider_code)
+        self.assertEqual(response["error"]["provider_status"], 429)
+        self.assertEqual(response["result"]["usage"], {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        })
+        self.assertFalse(response["result"]["usage_observed"])
+        self.assertFalse(response["result"]["usage_complete"])
 
     def test_public_tool_routes_read_only_dsh_mission_to_pinned_spawn_child(self) -> None:
         self.prepare_dsh_native_core()
@@ -702,6 +1157,249 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self.assertEqual(receipt["model_role"], "worker")
         self.assertEqual(receipt["provider"], "deepseek-official")
         self.assertEqual(receipt["model"], "deepseek-v4-flash")
+
+    def test_public_host_reports_exact_pre_usage_quota_as_complete_zero_receipt(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("quota-before-usage")
+
+        result = self.invoke_dsh_native(contract, child_mode="quota")
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        response = result["value"]["dsh_response"]
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error"], {
+            "code": "DSH_CHILD_QUOTA",
+            "message": "[Service quota exceeded.]",
+            "provider_code": "QUOTA",
+            "provider_status": 429,
+        })
+        self.assertEqual(response["result"], {
+            "output": [],
+            "structured": None,
+            "stop_reason": "error",
+            "usage": {
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+            "usage_observed": False,
+            "usage_complete": True,
+            "thread_id": "dsh-child-route-probe",
+            "provider": "deepseek-official",
+            "model": "deepseek-v4-flash",
+            "model_role": "planner",
+            "isolation": "fresh-dsh-subagent",
+            "artifacts": [],
+        })
+
+    def test_public_host_requires_exact_raw_quota_machine_code_for_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        for mode, raw_code in (
+            ("quota-code-leading-space", " QUOTA "),
+            ("quota-code-trailing-newline", "QUOTA\n"),
+            ("quota-code-lowercase", "quota"),
+        ):
+            with self.subTest(raw_code=raw_code):
+                self.assert_unproven_quota_receipt(mode, provider_code=raw_code)
+
+    def test_public_host_rejects_duplicate_quota_turn_start_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-duplicate-turn-start")
+
+    def test_public_host_rejects_duplicate_quota_step_start_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-duplicate-step-start")
+
+    def test_public_host_rejects_duplicate_quota_turn_end_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-duplicate-turn-end")
+
+    def test_public_host_rejects_quota_without_step_end_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-missing-step-end")
+
+    def test_public_host_rejects_quota_terminal_before_finish_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-terminal-before-finish")
+
+    def test_public_host_rejects_quota_with_other_coordinate_content_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-other-coordinate-content")
+
+    def test_public_host_rejects_mismatched_quota_failure_facts_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-mismatched-failure")
+
+    def test_public_host_rejects_quota_retry_marker_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-retry-marker")
+
+    def test_public_host_rejects_nonfresh_quota_coordinates_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-nonfresh-coordinates")
+
+    def test_public_host_rejects_quota_tool_result_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-tool-result")
+
+    def test_public_host_rejects_post_terminal_execution_as_known_zero(self) -> None:
+        self.prepare_dsh_native_core()
+        self.assert_unproven_quota_receipt("quota-post-terminal-execution")
+
+    def test_public_host_accepts_the_exported_real_quota_lifecycle_replay(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("quota-exported-replay")
+
+        result = self.invoke_dsh_native(contract, child_mode="quota-exported-replay")
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_CHILD_QUOTA")
+        self.assertFalse(response["result"]["usage_observed"])
+        self.assertTrue(response["result"]["usage_complete"])
+
+    def test_public_host_keeps_usage_chunk_when_child_fails_after_metering(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("failure-after-usage")
+
+        result = self.invoke_dsh_native(contract, child_mode="usage-chunk-failure")
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_CHILD_TERMINAL_ERROR")
+        self.assertEqual(response["error"]["provider_code"], "SERVER")
+        self.assertEqual(response["error"]["provider_status"], 503)
+        self.assertEqual(response["result"]["usage"], {
+            "input_tokens": 9,
+            "cached_input_tokens": 0,
+            "output_tokens": 1,
+            "total_tokens": 10,
+        })
+        self.assertTrue(response["result"]["usage_observed"])
+        self.assertTrue(response["result"]["usage_complete"])
+
+    def test_public_host_does_not_claim_known_zero_quota_after_content(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("quota-after-content")
+
+        result = self.invoke_dsh_native(contract, child_mode="quota-after-content")
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_CHILD_TERMINAL_ERROR")
+        self.assertEqual(response["error"]["provider_code"], "QUOTA")
+        self.assertEqual(response["error"]["provider_status"], 429)
+        self.assertFalse(response["result"]["usage_observed"])
+        self.assertFalse(response["result"]["usage_complete"])
+
+    def test_public_host_marks_unknown_unmetered_failure_usage_incomplete(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("unknown-before-usage")
+
+        result = self.invoke_dsh_native(contract, child_mode="unknown-failure")
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_CHILD_TERMINAL_ERROR")
+        self.assertEqual(response["error"]["provider_code"], "UNKNOWN")
+        self.assertEqual(response["result"]["usage"], {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        })
+        self.assertFalse(response["result"]["usage_observed"])
+        self.assertFalse(response["result"]["usage_complete"])
+
+    def test_public_host_folds_chunk_and_message_usage_last_wins_per_step(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("multi-step-metering")
+
+        result = self.invoke_dsh_native(contract, child_mode="multi-step-failure")
+
+        self.assertTrue(result["ok"], result.get("error"))
+        receipt = result["value"]["dsh_response"]["result"]
+        self.assertEqual(receipt["usage"], {
+            "input_tokens": 9,
+            "cached_input_tokens": 2,
+            "output_tokens": 6,
+            "total_tokens": 17,
+        })
+        self.assertTrue(receipt["usage_observed"])
+        self.assertTrue(receipt["usage_complete"])
+
+    def test_public_host_marks_metered_failure_with_missing_step_end_incomplete(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("usage-missing-step-end")
+
+        result = self.invoke_dsh_native(contract, child_mode="usage-missing-step-end")
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_CHILD_TERMINAL_ERROR")
+        self.assertEqual(response["result"]["usage"], {
+            "input_tokens": 9,
+            "cached_input_tokens": 0,
+            "output_tokens": 1,
+            "total_tokens": 10,
+        })
+        self.assertTrue(response["result"]["usage_observed"])
+        self.assertFalse(response["result"]["usage_complete"])
+
+    def test_public_host_marks_duplicate_same_coordinate_step_usage_incomplete(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("duplicate-step-usage")
+
+        result = self.invoke_dsh_native(contract, child_mode="duplicate-step-usage")
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_CHILD_TERMINAL_ERROR")
+        self.assertEqual(response["result"]["usage"], {
+            "input_tokens": 1,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 1,
+        })
+        self.assertTrue(response["result"]["usage_observed"])
+        self.assertFalse(response["result"]["usage_complete"])
+
+    def test_public_host_requires_strict_unique_monotonic_event_sequences(self) -> None:
+        self.prepare_dsh_native_core()
+        for mode in (
+            "malformed-seq",
+            "nonmonotonic-seq",
+            "duplicate-seq",
+            "gap-seq",
+        ):
+            with self.subTest(mode=mode):
+                contract = self.write_dsh_failure_contract(mode)
+                result = self.invoke_dsh_native(contract, child_mode=mode)
+
+                self.assertTrue(result["ok"], result.get("error"))
+                response = result["value"]["dsh_response"]
+                self.assertEqual(response["error"]["code"], "DSH_CHILD_USAGE_INCOMPLETE")
+                self.assertTrue(response["result"]["usage_observed"])
+                self.assertFalse(response["result"]["usage_complete"])
+
+    def test_public_host_maps_durable_terminal_stop_reasons(self) -> None:
+        self.prepare_dsh_native_core()
+        for mode, stop_reason in (
+            ("blocked", "refusal"),
+            ("aborted", "aborted"),
+            ("interrupted", "error"),
+        ):
+            with self.subTest(mode=mode):
+                contract = self.write_dsh_failure_contract(f"terminal-{mode}")
+                result = self.invoke_dsh_native(contract, child_mode=mode)
+
+                self.assertTrue(result["ok"], result.get("error"))
+                response = result["value"]["dsh_response"]
+                self.assertEqual(response["error"]["code"], "DSH_CHILD_TERMINAL_ERROR")
+                self.assertEqual(response["result"]["stop_reason"], stop_reason)
+                self.assertFalse(response["result"]["usage_complete"])
 
     def test_public_host_rejects_unknown_activation_phase_before_child_start(self) -> None:
         self.prepare_dsh_native_core()
