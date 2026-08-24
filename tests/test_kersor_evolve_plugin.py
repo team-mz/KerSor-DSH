@@ -31,6 +31,8 @@ from pathlib import Path
 
 contract = Path(sys.argv[sys.argv.index("--contract") + 1])
 request = json.loads(contract.read_text(encoding="utf-8"))
+if request.get("launch_marker"):
+    Path(request["launch_marker"]).write_text("launched", encoding="utf-8")
 if request.get("mode") == "descendant":
     marker = request["marker"]
     subprocess.Popen([
@@ -76,7 +78,13 @@ const exec = {
   callId: 'call-test-evolve',
   agent: {session: {
     header: {cwd: request.cwd, origin: request.origin ?? 'user'},
-    events: [{type: 'tool/call', data: {turn: 1, step: 1, callId: 'call-test-evolve', name: 'kersor_evolve'}}],
+    events: request.historical_call === true
+      ? [
+          {type: 'tool/call', data: {turn: 1, step: 1, callId: 'call-previous-evolve', name: 'kersor_evolve'}},
+          {type: 'turn/end', data: {turn: 1}},
+          {type: 'tool/call', data: {turn: 2, step: 1, callId: 'call-test-evolve', name: 'kersor_evolve'}},
+        ]
+      : [{type: 'tool/call', data: {turn: 1, step: 1, callId: 'call-test-evolve', name: 'kersor_evolve'}}],
   }},
   signal: controller.signal,
   concludeTurn() { concludeCount += 1 },
@@ -801,6 +809,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         abort_after_ms: int | None = None,
         timeout_ms: int = 5_000,
         second_call: bool = False,
+        historical_call: bool = False,
     ) -> tuple[dict[str, object], float]:
         request: dict[str, object] = {
             "module": str(self.module),
@@ -809,6 +818,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             "args": args,
             "timeout_ms": timeout_ms,
             "second_call": second_call,
+            "historical_call": historical_call,
         }
         if abort_after_ms is not None:
             request["abort_after_ms"] = abort_after_ms
@@ -2473,6 +2483,49 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["conclude_count"], 1)
         self.assertIn("only one call per top-level DSH session", result["second_error"])
+
+    def test_durable_history_rejects_a_second_call_after_process_reconstruction(self) -> None:
+        marker = self.workspace / "bridge-launched"
+        contract = self.write_contract(status="completed", launch_marker=str(marker))
+
+        result, _ = self.invoke(
+            {"contract": str(contract)},
+            historical_call=True,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["conclude_count"], 0)
+        self.assertIn("only one call per top-level DSH session", result["error"])
+        self.assertFalse(marker.exists(), "second durable call reached the bridge")
+
+    def test_fresh_top_level_session_can_resume_one_exact_run_directory(self) -> None:
+        contract = self.write_contract(status="completed")
+        run_dir = self.workspace / ".kersor" / "session" / "autonomous-runs" / "run-1"
+        run_dir.mkdir(parents=True)
+        physical_run_dir = run_dir.resolve()
+
+        result, _ = self.invoke({
+            "contract": str(contract),
+            "run_dir": str(physical_run_dir),
+            "resume": True,
+        })
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["conclude_count"], 1)
+        self.assertEqual(
+            result["value"]["argv"],
+            [
+                "evolve",
+                "--host-execution",
+                "--contract",
+                str(contract.resolve()),
+                "--expected-contract-sha256",
+                hashlib.sha256(contract.read_bytes()).hexdigest(),
+                "--run-dir",
+                str(physical_run_dir),
+                "--resume",
+            ],
+        )
 
     def test_failed_call_also_consumes_the_top_level_session(self) -> None:
         contract = self.write_contract(status="cancelled", exit=2)

@@ -1525,9 +1525,26 @@ function executionTurn(session, exec) {
   return toolCallTurn(session, exec.rootCallId)
 }
 
+function hasPriorEvolveCall(session, exec) {
+  const events = Array.isArray(session?.events) ? session.events : []
+  const currentCallIds = new Set([exec.callId, exec.rootCallId].filter(value => value !== undefined))
+  let currentIndex = -1
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event?.type === 'tool/call' && currentCallIds.has(event.data?.callId)) {
+      currentIndex = index
+      break
+    }
+  }
+  if (currentIndex < 0) return false
+  return events.slice(0, currentIndex).some(event => (
+    event?.type === 'tool/call' && event.data?.name === 'kersor_evolve'
+  ))
+}
+
 function claimSession(session, exec) {
   if (!isRecord(session)) throw new Error('kersor_evolve requires a stable DSH session')
-  if (CLAIMED_SESSIONS.has(session)) {
+  if (CLAIMED_SESSIONS.has(session) || hasPriorEvolveCall(session, exec)) {
     throw new Error('kersor_evolve permits only one call per top-level DSH session; retry in a new session')
   }
   const turn = executionTurn(session, exec)
