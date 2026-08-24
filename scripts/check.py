@@ -121,8 +121,8 @@ def main() -> int:
     if completed.returncode != 0:
         return completed.returncode
     print(
-        "check: metadata, mirror integrity, portability, bridge, and "
-        "installer contracts passed"
+        "check: metadata, mirror integrity, portability, bridge, installer, "
+        "and detached-release contracts passed"
     )
     return 0
 

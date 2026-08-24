@@ -53,6 +53,12 @@ export interface KersorScanResult {
     readonly runIssues: readonly KersorScannedRunIssue[];
     readonly observation: KersorScanObservation;
 }
-/** Scan all roots and return discovered runs plus bounded observations. */
+/**
+ * Scan all roots and return discovered runs plus bounded observations.
+ * @param roots - Explicit KerSor Session roots.
+ * @param includeDefaults - Whether built-in and installed-checkout roots participate.
+ * @param workspaceRoots - Registered and persisted DSH Workspace roots.
+ * @returns Complete committed inventory, run issues, and source observation.
+ */
 export declare function scanRoots(roots: readonly string[], includeDefaults: boolean, workspaceRoots?: readonly string[]): Promise<KersorScanResult>;
 //# sourceMappingURL=scanner.d.ts.map

@@ -3,7 +3,7 @@
 // transaction rollback marks, and terminal totals.
 
 import { describe, expect, it } from 'vitest'
-import { createRunView, foldEvent, type KersorEvent, type KersorRunView } from '../src/fold.ts'
+import { applyWorkflowResult, createRunView, foldEvent, type KersorEvent, type KersorRunView } from '../src/fold.ts'
 
 function events(...list: Array<Record<string, unknown>>): KersorEvent[] {
   return list.map((record, index) => ({ ts: `2026-08-14T10:00:${String(index).padStart(2, '0')}Z`, ...record }) as KersorEvent)
@@ -15,6 +15,30 @@ function foldAll(view: KersorRunView, list: KersorEvent[]): KersorRunView {
 }
 
 describe('run lifecycle', () => {
+  it('omits absent optional result fields at the JSON RPC boundary', () => {
+    const view = createRunView('run', '/runs/run', '/sessions/session')
+    applyWorkflowResult(view, {
+      stage: 'estimated', verification: 'passed', failureKind: 'infrastructure',
+      selectedCandidateId: 'old', expectedCycles: 10, measuredBaselineCycles: 12,
+      measuredCycles: 9, estimatedSpeedup: 2, incumbentCycles: 8,
+      incumbentSpeedup: 3, bestImproved: false, candidates: [],
+    })
+    applyWorkflowResult(view, { measuredSpeedup: 2.5, candidates: [] })
+
+    expect(view).toMatchObject({ measuredSpeedup: 2.5, candidates: [] })
+    expect(Object.hasOwn(view, 'candidateStage')).toBe(false)
+    expect(Object.hasOwn(view, 'verification')).toBe(false)
+    expect(Object.hasOwn(view, 'failureKind')).toBe(false)
+    expect(Object.hasOwn(view, 'selectedCandidateId')).toBe(false)
+    expect(Object.hasOwn(view, 'expectedCycles')).toBe(false)
+    expect(Object.hasOwn(view, 'measuredBaselineCycles')).toBe(false)
+    expect(Object.hasOwn(view, 'measuredCycles')).toBe(false)
+    expect(Object.hasOwn(view, 'estimatedSpeedup')).toBe(false)
+    expect(Object.hasOwn(view, 'incumbentCycles')).toBe(false)
+    expect(Object.hasOwn(view, 'incumbentSpeedup')).toBe(false)
+    expect(Object.hasOwn(view, 'bestImproved')).toBe(false)
+  })
+
   it('starts unknown, then running on workflow.started, terminal on workflow.completed', () => {
     const view = createRunView('r1', '/runs/r1', '/sessions/s1')
     expect(view.status).toBe('unknown')

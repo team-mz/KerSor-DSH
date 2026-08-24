@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-kersor-viewer",
   "description": "KerSor host viewer: classic optimization Session summaries plus autonomous-workflow live progress",
-  "version": "0.1.0-rc.17",
+  "version": "0.1.0-rc.18",
   "publishConfig": {
     "access": "public"
   },
@@ -48,12 +48,14 @@
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-invariants": ">=0.1.0-rc.5 <0.2.0",
+    "@deepseek-ai/dsh-session-persistence": ">=0.1.0-rc.8 <0.2.0",
     "@deepseek-ai/dsh-typert-protocol": ">=0.1.0-rc.5 <0.2.0",
     "@deepseek-ai/dsh-workspace": ">=0.1.0-rc.5 <0.2.0"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "workspace:^",
     "@deepseek-ai/dsh-invariants": "workspace:^",
+    "@deepseek-ai/dsh-session-persistence": "workspace:^",
     "@deepseek-ai/dsh-typert-protocol": "workspace:^",
     "@deepseek-ai/dsh-workspace": "workspace:^"
   },

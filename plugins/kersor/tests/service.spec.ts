@@ -147,8 +147,8 @@ describe('registered Mission launch', () => {
     expect(harness.service.listActive()).toEqual([launch])
 
     const [spec] = harness.subprocess.specs
+    expect(typeof spec?.cwd).toBe('string')
     expect(spec).toMatchObject({
-      cwd: expect.any(String),
       env: { INFINI_API_KEY: 'secret', NO_PROXY: '127.0.0.1,localhost' },
       graceMs: 17,
       stdio: {

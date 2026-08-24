@@ -31,14 +31,61 @@ function workflowName(script) {
     const parts = script.replaceAll('\\', '/').split('/').filter(Boolean);
     return parts.length > 1 ? parts.at(-2) : parts.at(-1);
 }
-/** Copy one canonical result into the flat wire projection and its grouped view. */
+/**
+ * Copy one canonical result into the flat wire projection and its grouped view.
+ * @param view - Mutable folded run receiving the result.
+ * @param result - Bounded candidate and Host verification projection.
+ */
 export function applyWorkflowResult(view, result) {
     view.result = result;
-    view.candidateStage = result.stage;
-    view.selectedCandidateId = result.selectedCandidateId;
-    view.expectedCycles = result.expectedCycles;
-    view.estimatedSpeedup = result.estimatedSpeedup;
-    view.measuredSpeedup = result.measuredSpeedup;
+    if (result.stage === undefined)
+        delete view.candidateStage;
+    else
+        view.candidateStage = result.stage;
+    if (result.verification === undefined)
+        delete view.verification;
+    else
+        view.verification = result.verification;
+    if (result.failureKind === undefined)
+        delete view.failureKind;
+    else
+        view.failureKind = result.failureKind;
+    if (result.selectedCandidateId === undefined)
+        delete view.selectedCandidateId;
+    else
+        view.selectedCandidateId = result.selectedCandidateId;
+    if (result.expectedCycles === undefined)
+        delete view.expectedCycles;
+    else
+        view.expectedCycles = result.expectedCycles;
+    if (result.measuredBaselineCycles === undefined)
+        delete view.measuredBaselineCycles;
+    else
+        view.measuredBaselineCycles = result.measuredBaselineCycles;
+    if (result.measuredCycles === undefined)
+        delete view.measuredCycles;
+    else
+        view.measuredCycles = result.measuredCycles;
+    if (result.estimatedSpeedup === undefined)
+        delete view.estimatedSpeedup;
+    else
+        view.estimatedSpeedup = result.estimatedSpeedup;
+    if (result.measuredSpeedup === undefined)
+        delete view.measuredSpeedup;
+    else
+        view.measuredSpeedup = result.measuredSpeedup;
+    if (result.incumbentCycles === undefined)
+        delete view.incumbentCycles;
+    else
+        view.incumbentCycles = result.incumbentCycles;
+    if (result.incumbentSpeedup === undefined)
+        delete view.incumbentSpeedup;
+    else
+        view.incumbentSpeedup = result.incumbentSpeedup;
+    if (result.bestImproved === undefined)
+        delete view.bestImproved;
+    else
+        view.bestImproved = result.bestImproved;
     view.candidates = result.candidates;
 }
 function foldWorkflowLog(view, message) {
@@ -90,7 +137,11 @@ function callBucket(view, event, kind) {
     view.totals.calls += 1;
     return row;
 }
-/** Fold one parsed event into the view. Mutates `view` in place. */
+/**
+ * Fold one parsed event into the view, mutating the view in place.
+ * @param view - Mutable run projection receiving the event.
+ * @param event - Validated Workflow runtime event.
+ */
 export function foldEvent(view, event) {
     switch (event.type) {
         case 'workflow.started': {
@@ -210,7 +261,13 @@ export function foldEvent(view, event) {
             return;
     }
 }
-/** Create an empty view for a discovered run directory. */
+/**
+ * Create an empty view for a discovered run directory.
+ * @param runId - Stable run identifier from discovery.
+ * @param runDir - Absolute discovered run directory.
+ * @param sessionDir - Absolute owning Session directory.
+ * @returns Empty projection ready for event folding.
+ */
 export function createRunView(runId, runDir, sessionDir) {
     return {
         runId, runDir, sessionDir,

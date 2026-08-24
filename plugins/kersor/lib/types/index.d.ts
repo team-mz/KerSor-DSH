@@ -6,5 +6,6 @@
  */
 export { KersorService, default } from './service.ts';
 export type { Config, KersorTaskConfig } from './service.ts';
-export type { KersorActiveFrame, KersorActiveLaunch, KersorRunId, KersorTaskId, KersorTaskRef, } from './types.ts';
+export type { KersorActiveFrame, KersorActiveLaunch, KersorExperimentCheckpointEventData, KersorExperimentId, KersorExperimentStartEventData, KersorExperimentStatus, KersorExperimentStep, KersorLaunchContract, KersorRunId, KersorTaskId, KersorTaskRef, } from './types.ts';
+export { parseKersorLaunchContract } from './types.ts';
 //# sourceMappingURL=index.d.ts.map

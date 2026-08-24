@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
 import unittest
@@ -38,9 +39,53 @@ class MirrorManifestTests(unittest.TestCase):
             )
             self.assertTrue(any("fold.ts: content differs" in item for item in violations))
             self.assertTrue(any("unlisted.spec.ts: mirrored file is absent" in item for item in violations))
-            self.assertFalse(any("index.js.map" in item for item in violations))
-            self.assertFalse(any("tsconfig.tsbuildinfo" in item for item in violations))
+            self.assertTrue(any("index.js.map" in item for item in violations))
+            self.assertTrue(any("tsconfig.tsbuildinfo" in item for item in violations))
             self.assertFalse(any("kersor-viewer/tsdown.config.ts" in item for item in violations))
+
+    def test_package_manifests_are_explicit_distribution_owned_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            shutil.copytree(ROOT / "plugins", checkout / "plugins")
+            manifest_path = checkout / "plugins" / "dsh-mirror.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            entry = next(
+                item
+                for item in manifest["files"]
+                if item["path"] == "plugins/kersor/package.json"
+            )
+            entry["origin"] = "tracked"
+            entry["source"] = "packages/extensions/kersor/package.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            violations = sync_plugins.manifest_violations(
+                checkout,
+                manifest_path,
+            )
+
+            self.assertTrue(
+                any("origin must be distribution-owned" in item for item in violations),
+                violations,
+            )
+
+    def test_unreconciled_snapshot_is_not_publishable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            shutil.copytree(ROOT / "plugins", checkout / "plugins")
+            manifest_path = checkout / "plugins" / "dsh-mirror.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["authority"]["reconciled"] = False
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            violations = sync_plugins.manifest_violations(
+                checkout,
+                manifest_path,
+            )
+
+            self.assertTrue(
+                any("authority.reconciled must be true" in item for item in violations),
+                violations,
+            )
 
     def test_ci_validates_the_public_snapshot_without_private_checkout(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "validate.yml").read_text(

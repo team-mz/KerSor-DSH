@@ -1,10 +1,32 @@
-# kersor — 已登记 KerSor Mission 启动器
+# kersor — DSH 原生 KerSor 控制器与已登记 Mission 启动器
 
 [English](README.md) | 中文
 
-让 [KerSor](https://github.com/qhy991/KerSor) autonomous Mission 可从 dsh 启动的 Host 插件，同时不把浏览器变成 shell。部署配置登记一份有限任务清单；remote 可以列出任务、通过 KerSor 的 Session-binding runner 启动其中一项、列出仍由 dsh 托管的进程树，并停止一棵受管进程树。
+`./control` function plugin 把一个 KerSor 实验绑定到当前 dsh 对话，并在一个持久、可续接的 dsh 子 Session 中执行。包根仍是可选 Host 启动器，让已登记的 [KerSor](https://github.com/qhy991/KerSor) autonomous Mission 可从 dsh 启动，同时不把浏览器变成 shell。
 
-KerSor 继续作为 Mission 校验、workflow 状态、事件历史、摘要、artifact 与 resume 行为的事实源。本包只负责启动授权、显式凭据转发和进程树生命周期。与 [`@deepseek-ai/dsh-kersor-viewer`](../kersor-viewer/README.md) 及 [`@deepseek-ai/dsh-client-ui-kersor-viewer`](../ui-kersor-viewer/README.md) 组合后，可观察 workflow 状态，并在 Web UI 中显示可选控制区。
+KerSor 文件继续作为优化状态、证据、artifact 与 resume 决策的事实源。父 dsh Session 只持有不可变的 Experiment-to-child 绑定和单调展示 checkpoint；子 dsh Session 持有完整控制器对话与现有 `tool-workflow/*` 执行树。与 [`@deepseek-ai/dsh-kersor-viewer`](../kersor-viewer/README.md) 及 [`@deepseek-ai/dsh-client-ui-kersor-viewer`](../ui-kersor-viewer/README.md) 组合后，可同时获得全局只读视图和 keyed Experiment Chat 节点。
+
+## 对话控制器
+
+在 KerSor agent preset 中挂载 `@deepseek-ai/dsh-kersor/control`。`kersor_start` 预留 Experiment id 与 continuable child id，追加并 flush `kersor/experiment-start`，然后通过进程内 `spawn` provider 启动子任务。`kersor_attach` 为工作区内已有 Session 建立同样的绑定。`kersor_resume` 只接受开放绑定，并把 follow-up 送入原 child；它不能创建第二个 Experiment，也不能静默重复 dispatch。KerSor `phase=stalled` 会把该绑定关闭为 `blocked`：resume 会明确拒绝，下一动作置空；解除 blocker 后，父对话可以创建新 Experiment。
+
+`kersor_start` 可选接收一个不可变 `launch` 对象。提供时，所有字段均为必填：非空 `backend`、`language` 与 `integration_pattern`；正数 `target_speedup`；正整数 `max_workflows`；属于 `auto|guided|explore` 的 `mode`；非负整数 `workflow_authoring_budget`；属于 `on|off` 的显式 `retrieval_mode`、`experience_mode` 与 `kernelwiki_experience_export_mode`；属于 `full|measured-only|off` 的 `transfer_mode`；以及非空单行 `correctness_command` 与 `benchmark_command`。校验后的对象按规范字段顺序存入 `kersor/experiment-start`，resume 会原样复用。它的权威性高于冲突的 objective 或 continuation prose：数字字段保持没有 `x` 或 `%` 后缀的 JSON number，两条命令保持逐字不变。`runtime` 被刻意排除，因为控制器始终使用 `dsh`；Host `KERSOR_PYTHON` 继续是独立的解释器权威。
+
+控制器把 KerSor runtime 固定为 `dsh`。只要 canonical phase 仍为 active，名为 `STALLED` 的 round selection 就只是可恢复的 routing gap：当 Workflow authoring 已启用且 saved-Proposal budget 仍有余量时，child 必须先完成 Phase 3.6、同轮完整 selection commit 及由此产生的 dispatch，之后才能 synthesis terminal `STALLED` decision。顶层对话绑定 controller child 后，执行器策略会把直接委派保留给该对话所有 `kersor/experiment-start` 事件声明的 child id：父侧的 subagent、fork、Workflow、agent-control、job-control 与 status 工具都会被拒绝，而 controller child 仍可创建自己的 DSH 原生 worker。控制器内部仍会拒绝递归 KerSor 控制调用与产品专属 Claude/Codex subagent 工具。stalled、completed 或 cancelled 控制器只能调用 `kersor_status`；该终态状态调用成功后会结束其 Turn。每次成功的 `kersor_status` 调用都会生成去重并 flush 的 checkpoint，其中包含阶段、轮次、已选 Workflow、九个协议里程碑、下一动作与实测摘要字段。父 Turn 完成不会终止 Experiment，也不会把它标成 interrupted。
+
+对话控制器要求 Host `KERSOR_PYTHON` 是非空绝对路径，且能解析为可执行文件。Start 和 attach 会在写入绑定前校验它；resume 会在发送 follow-up 前校验它。解析后的路径会冻结进每条 child 指令；指令要求每条涉及 KerSor bridge、helper 或 setup 的 shell 命令都以显式 `KERSOR_PYTHON='<frozen-path>'` 赋值开头，并禁止使用 `which`、`PATH` 查找、文件系统搜索或替换解释器。
+
+该解释器契约同时也是执行门，而不只是 prompt 指导。每次 Bash 调用前，控制器都会沿调用 Session 的 live `parentSession` 链检查 ancestry；controller 及其每层 descendant 的 KerSor bridge／helper／setup 命令都必须以精确的规范 `KERSOR_PYTHON='<frozen-path>'; export KERSOR_PYTHON;` 前缀开头。整条 ancestry 内都会拒绝 Python 发现与替换。无关 task Bash、KerSor agents／docs 的读取与列举、非 Bash 工具，以及不属于 Experiment ancestry 的 agent 均不受影响。
+
+规范 setup 边界同时拥有其 Bash 沙箱处置。携带精确 Host 生成命令，且 workdir 缺省、为字面量 `.` 或与规范 controller workspace 字符串完全相同的前台调用，仍是唯一耐久 setup 身份；其他拼写会被拒绝，避免 symlink/`..` 别名跨越鉴权边界。该 registry execution 通过鉴权后，模型写入的任何 `sandbox_permissions` 与 `justification` 都会在 Bash 校验升权或请求审批前被抑制。因此 setup 始终在 Session 常驻 workspace policy 下运行；模型写入的升权既不能通过非法配对阻断首次执行，也不能扩大其权限。授权以 registry 创建的 execution object 为键，并在最终 `tools/result` 再次清理，不能跨越失败、call-id 复用、dispose 或 reload。
+
+Gate B 向 direct controller 提供与事件绑定的 transform 命令，而不要求它重建脚本语法。唯一的前台 dispatch producer 写入两份语义文件后，Host 会先创建一条 `KERSOR_DISPATCH_TRANSFORM_COMMAND_V1` 模型上下文，再发布 receipt、追加并 flush `kersor/dispatch-args-produced`；只有这次持久化成功后才会返回该上下文。无法创建上下文时既不发布 receipt，也不发布事件。该上下文把事件中的精确 `run_dir` 与 producer call 身份绑定到一条完整 Bash 命令，并要求逐字执行，禁止增加 flag、变量、重定向、前缀或后缀，也禁止检查、探测或重试。pre-execution 鉴权仍要求完整命令与恰好一条持久 producer event 逐字相同；不匹配的调用不会到达 Bash executor，而存在唯一 pending transform 时，诊断会指出绑定事件与必需命令。
+
+Workflow authoring 在 Host handoff seal 前把 staging 独占交给前台 author。Direct controller 在 seal 前不能读取、搜索、列举或修改 staging，author child 则保留 seal 前文件写入与 syntax self-check。文件工具门禁会递归检查嵌套路径字段，以及 Glob/Grep 的 root 和 filter；Bash 门禁会在 dispatch 前解析模型提供的 workdir、shell cwd 变更、静态变量与 wrapper、glob target、保留原始段的 symlink/`..` 遍历、symlink alias 和常规文件身份。Host 只根据完整的 Host-minted Bash envelope 识别 seal 与 Proposal-save，因此 basename 拆分、alias、`source`、替代解释器、变量或额外字段都无法取得门禁身份。Host 把三份 direct staging file 和 `author-handoff.json` 哈希绑定进 `kersor/author-handoff-sealed`，随后永久拒绝所有 Experiment actor 通过直接路径或 alias 访问 staging。第一次精确的规范 Proposal-save 调用会在 Bash 执行前追加并 flush `kersor/author-save-attempted`；无论脚本成功还是失败都会消费该调用，后续调用在 dispatch 前被拒绝，sealed bytes 也不会重新开放以供修复。
+
+成功的 `workflow` 结果只有一个 Host-owned 文件系统边界。每个 Experiment descendant 都必须传入绝对 `args.exp_dir`，且该路径不能经过 symlink，必须精确解析到 `<workspace>/.kersor/<session>/run-N`。结果到达模型前，Host 会校验规范 `{runId, agentsStarted, result}`，要求 raw `result` 是不超过 4 MiB 的 JSON object，写完完整临时文件后再通过原子、独占 hard link 发布为 `output.json`。路径非法、symlink escape、非对象或超限结果，以及已存在的 output 都会 block Workflow 结果；绝不覆盖任何文件。工具渲染结果可以截断，但该文件来自未截断的规范值。
+
+一旦 `run-N/output.json` 存在，Experiment descendant 可以读取，但不能通过 `write`、`edit`、明显的 Bash 重定向／`tee`／`cp`／`mv`／`rm` 或 Python open/write 路径修改它。只有成功 Workflow 结果由 Host commit。失败 Workflow 不创建文件，因此 controller 可在文件缺失时使用 `write` 一次来创建 failure stub；首次创建后，同一不可变规则生效。
 
 ## 配置
 
@@ -46,11 +68,19 @@ Mission 必须是 JSON `kersor-mission-v1` 文档。其 `workspace`、`session` 
 
 ## 模型体验
 
-间接且在进程外。本插件不会向 dsh Session 添加文本，也不会改写 KerSor prompt。它启动配置好的 KerSor runtime；planner/worker prompt、模型选择与 artifact 仍属于 KerSor。
+### 控制工具与 child prompt
+
+#### 模型看到什么
+
+父模型只看到 start、attach、resume 三个小型工具 schema。每个成功结果都会声明后续工作归 controller 所有，要求父级结束当前 Turn、不得轮询、委派或检查工作区，并携带实际强制停止的 runtime conclusion marker。Start schema 通过逐字段 enum、数字、命令与权威性描述公开可选 typed launch contract。控制器 child 收到冻结目标、当前工作区、解析后的 Host Python 路径、显式 `runtime=dsh`、提供时的规范 launch JSON 及逐字段指令，以及 Host-owned Workflow output contract。Dispatch producer 成功后，它还会以有序 user context 收到与事件绑定的精确 Gate B transform 命令，无需推导 run path 或命令语法。它被要求在 Workflow 成功后读取 raw `output.json`，不得从受限结果文本重建；只有 Workflow error 且文件缺失时才能创建 stub。Child 还会收到加载已安装 KerSor skill 及通过 `kersor_status` 报告阶段变化的要求；它不会收到父对话历史。Session persistence 会为后续每次 resume 保留解释器、launch 与 custody 指令。
+
+#### Token 影响
+
+父对话只承担工具调用与 checkpoint card 的 token。控制器和每个 Workflow 成员使用独立子历史，因此其 token 不会累积进父对话。每个成功的 dispatch producer 都会向 controller 的下一次模型请求与持久历史加入一条有界的规范命令 user context。
 
 #### KV Cache 影响
 
-dsh 内无影响。启动后的 KerSor runtime 自行负责模型侧 cache 行为。
+父对话与每个 child 使用独立 cache prefix。Resume 追加到同一个控制器 child 历史；它不会创建新上下文，也不会使父对话此前的 prefix 失效。
 
 ## 已知限制与顺延工作
 
@@ -58,3 +88,5 @@ dsh 内无影响。启动后的 KerSor runtime 自行负责模型侧 cache 行�
 - remote 不暴露 resume。Resume 校验与策略仍由 KerSor 标准 runner 持有。
 - launcher stdout/stderr 为诊断而有界捕获，但不暴露给浏览器；workflow 诊断应读取 KerSor `.runtime` 文件。
 - launcher 不从进程退出推断 workflow 成功；viewer 折叠出的 KerSor 状态才是权威状态。
+- 关闭页面或切换对话不会停止控制器 child。Host 重启会保留父子两个 Session，但需要显式 `kersor_resume`；当前 Workflow engine 无法从一次前台脚本调用的中间位置恢复。
+- 可选的已登记 Mission 启动器是独立兼容面，可能使用 Mission 声明的外部 runtime；对话控制器才是标准 DSH-only 优化路径。

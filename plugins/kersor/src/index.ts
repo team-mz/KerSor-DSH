@@ -10,7 +10,14 @@ export type { Config, KersorTaskConfig } from './service.ts'
 export type {
   KersorActiveFrame,
   KersorActiveLaunch,
+  KersorExperimentCheckpointEventData,
+  KersorExperimentId,
+  KersorExperimentStartEventData,
+  KersorExperimentStatus,
+  KersorExperimentStep,
+  KersorLaunchContract,
   KersorRunId,
   KersorTaskId,
   KersorTaskRef,
 } from './types.ts'
+export { parseKersorLaunchContract } from './types.ts'

@@ -4,16 +4,44 @@
  * @module @deepseek-ai/dsh-client-ui-kersor-viewer/client
  */
 import { KersorView } from "./KersorView.js";
+import { KersorExperimentNode } from "./KersorExperimentNode.js";
+import { kersorExperimentDefinition } from "./experiment-definition.js";
 import { KersorViewerStore } from "./store.js";
 import { en, NS, zh } from "./locales.js";
 export { KersorViewerStore as KersorViewerStoreClass } from "./store.js";
 export { NS };
 /** Required services: viewer UI seams, assembled Remotes, and Host inventory. */
-export const inject = ['slots', 'locale', 'remote', 'remote.pluginInventory'];
+export const inject = [
+    'slots', 'locale', 'remote', 'remote.pluginInventory', 'sessions', 'conversationEvents',
+];
 /** Mount the KerSor viewer surfaces over the API assembly's Remote namespaces. */
 export function apply(ctx) {
     ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'kersor-viewer: dictionaries');
+    ctx.conversationEvents.register(kersorExperimentDefinition);
+    ctx.slots.inject('conversation.chat.node', () => ctx.slots.register({
+        name: 'conversation.chat.node',
+        key: 'kersor-experiment',
+        locale: NS,
+        inject: () => ({
+            openController(childSessionId) {
+                const parentSessionId = ctx.sessions.list.getSnapshot().current;
+                if (parentSessionId === undefined)
+                    return;
+                void ctx.sessions.refreshSubagents(parentSessionId).then(() => {
+                    ctx.sessions.openSubagent({ parentSessionId, childSessionId, mode: 'continuable' });
+                });
+            },
+        }),
+    }, KersorExperimentNode));
     const store = new KersorViewerStore();
+    const classicDetailRevisions = new Map();
+    const classicRevision = (sessionDir) => {
+        const session = store.getSnapshot().snapshot?.classic.sessions
+            .find(candidate => candidate.session_dir === sessionDir);
+        return session === undefined
+            ? undefined
+            : `${session.last_activity_at ?? ''}:${session.phase ?? ''}:${session.current_round ?? ''}`;
+    };
     const launcherRemote = () => ctx.get('remote.kersor');
     const viewerRemote = () => {
         const remote = ctx.get('remote.kersorViewer');
@@ -49,7 +77,7 @@ export function apply(ctx) {
             }
             const selectedClassic = store.selectedClassicSessionDir;
             if (selectedClassic !== undefined)
-                await loadClassic(selectedClassic);
+                await loadClassicIfChanged(selectedClassic);
         }
         catch (error) {
             store.setTransportError(error instanceof Error ? error.message : String(error));
@@ -108,9 +136,32 @@ export function apply(ctx) {
                 return;
             }
             store.setClassicDetail(sessionDir, answered.value);
+            const revision = classicRevision(sessionDir);
+            if (revision !== undefined)
+                classicDetailRevisions.set(sessionDir, revision);
         }
         catch (error) {
             store.setClassicDetailError(sessionDir, error instanceof Error ? error.message : String(error));
+        }
+    };
+    const loadClassicIfChanged = async (sessionDir) => {
+        const revision = classicRevision(sessionDir);
+        if (revision !== undefined && classicDetailRevisions.get(sessionDir) === revision)
+            return;
+        await loadClassic(sessionDir);
+    };
+    const loadCallDetail = async (runDir, callId) => {
+        store.setCallDetailLoading(runDir, callId);
+        try {
+            const answered = await viewerRemote().runCallDetail(runDir, callId);
+            if (!answered.ok) {
+                store.setCallDetailError(runDir, callId, `${answered.error.code}: ${answered.error.message}`);
+                return;
+            }
+            store.setCallDetail(runDir, callId, answered.value);
+        }
+        catch (error) {
+            store.setCallDetailError(runDir, callId, error instanceof Error ? error.message : String(error));
         }
     };
     const refresh = async () => {
@@ -156,19 +207,20 @@ export function apply(ctx) {
     };
     ctx.on('connection/reset', () => {
         store.reset();
+        classicDetailRevisions.clear();
         void refresh();
     });
     ctx.remote.$on('kersor/event', (frame) => {
         store.applyFrame(frame);
         if (frame.kind === 'snapshot' && store.selectedClassicSessionDir !== undefined) {
-            void loadClassic(store.selectedClassicSessionDir);
+            void loadClassicIfChanged(store.selectedClassicSessionDir);
         }
     });
     ctx.remote.$on('kersor/active', (frame) => {
         store.applyActiveFrame(frame);
     });
     void refresh();
-    const face = { store, refresh, loadRun, loadClassic, start, stop };
+    const face = { store, refresh, loadRun, loadCallDetail, loadClassic, start, stop };
     const t = ctx.locale.bind(NS);
     ctx.slots.inject('conversation.view', () => ctx.slots.register({
         name: 'conversation.view',
@@ -176,7 +228,10 @@ export function apply(ctx) {
         order: 20,
         locale: NS,
         label: () => t('view.kersor'),
-        inject: () => face,
+        inject: (sessionId) => {
+            const currentWorkspace = ctx.sessions.list.getSnapshot().byId[sessionId]?.cwd;
+            return { ...face, ...(currentWorkspace === undefined ? {} : { currentWorkspace }) };
+        },
     }, KersorView));
 }
 //# sourceMappingURL=index.js.map

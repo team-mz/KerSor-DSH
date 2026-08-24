@@ -1,5 +1,9 @@
 /** Terminal-aware presentation policy for a Session's historical fit verdict. */
-/** A terminal veto outranks any fit result produced before the Session stopped. */
+/**
+ * Apply the rule that a terminal veto outranks any earlier fit result.
+ * @param session - Session whose lifecycle and historical confidence are projected.
+ * @returns Visible confidence, or `undefined` when terminal ownership suppresses it.
+ */
 export function visibleFitConfidence(session) {
     if (session.lifecycle === 'stalled' || session.lifecycle === 'cancelled')
         return undefined;

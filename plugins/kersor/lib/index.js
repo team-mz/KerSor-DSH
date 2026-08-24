@@ -1,3 +1,4 @@
+import { n as parseKersorLaunchContract } from "./types-C5MPqkXa.js";
 import { randomUUID } from "node:crypto";
 import { access, readFile } from "node:fs/promises";
 import path from "node:path";
@@ -1118,4 +1119,4 @@ function createRunId(taskId) {
 	return `${(/* @__PURE__ */ new Date()).toISOString().replaceAll(/[-:.]/g, "")}-${String(taskId).replaceAll(/[^A-Za-z0-9._-]/g, "-").slice(0, 48) || "mission"}-${randomUUID().slice(0, 8)}`;
 }
 //#endregion
-export { KersorService, KersorService as default };
+export { KersorService, KersorService as default, parseKersorLaunchContract };

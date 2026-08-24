@@ -5,4 +5,5 @@
  * @module @deepseek-ai/dsh-kersor
  */
 export { KersorService, default } from "./service.js";
+export { parseKersorLaunchContract } from "./types.js";
 //# sourceMappingURL=index.js.map
