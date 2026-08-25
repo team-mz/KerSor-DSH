@@ -2,7 +2,7 @@
   "schema_version": 2,
   "authority": {
     "repository": "https://github.com/qhy991/deepseek-harness.git",
-    "revision": "b5ab15c71547eabcd382c0ea4bc62274425c191e",
+    "revision": "00db21d4b4f40a6ebb91823b0b7995a705039ee8",
     "source_root": "packages/extensions",
     "reconciled": true
   },
