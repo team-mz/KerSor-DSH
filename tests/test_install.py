@@ -309,7 +309,7 @@ class InstallTests(unittest.TestCase):
                     "max_frame_bytes": 16 * 1024 * 1024,
                     "provider": "deepseek-official",
                     "model": "kimi-k2.7-code",
-                    "timeout_seconds": 900,
+                    "timeout_seconds": 3600,
                 },
             }),
             encoding="utf-8",

@@ -40,6 +40,7 @@ DSH_RPC_NONCE_ENV = "KERSOR_DSH_RPC_NONCE"
 DSH_RPC_MAX_FRAME_BYTES = 16 * 1024 * 1024
 DSH_PROVIDER = "deepseek-official"
 DSH_MODEL = "kimi-k2.7-code"
+DSH_ACTIVATION_TIMEOUT_SECONDS = 3600
 MAX_RUNTIME_CONFIG_BYTES = 1 * 1024 * 1024
 MAX_MODEL_ID_LENGTH = 128
 MAX_AUTONOMOUS_BINDING_BYTES = 256 * 1024
@@ -864,7 +865,7 @@ def validate_dsh_runtime_config(
         "max_frame_bytes": DSH_RPC_MAX_FRAME_BYTES,
         "provider": DSH_PROVIDER,
         "model": DSH_MODEL,
-        "timeout_seconds": 900,
+        "timeout_seconds": DSH_ACTIVATION_TIMEOUT_SECONDS,
     }
     if not isinstance(broker, dict):
         raise RuntimeError("generic DSH evolve requires broker.type=dsh-host-rpc")

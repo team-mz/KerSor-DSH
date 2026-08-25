@@ -1200,7 +1200,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
                     "max_frame_bytes": 16 * 1024 * 1024,
                     "provider": "deepseek-official",
                     "model": "kimi-k2.7-code",
-                    "timeout_seconds": 900,
+                    "timeout_seconds": 3600,
                 },
             }),
             encoding="utf-8",
@@ -1239,6 +1239,8 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             "}\n"
             "if 'activation_model_role' in contract_value:\n"
             "  request['activation']['model_role'] = contract_value['activation_model_role']\n"
+            "if 'activation_timeout_seconds' in contract_value:\n"
+            "  request['activation']['timeout_seconds'] = contract_value['activation_timeout_seconds']\n"
             "if contract_value.get('probe_mode') in ('sequential-65', 'two-delayed'):\n"
             "  activation_count = 65 if contract_value['probe_mode'] == 'sequential-65' else 2\n"
             "  last = None\n"
@@ -1455,6 +1457,43 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self.assertTrue(result["ok"], result.get("error"))
         self.assertEqual(result["value"]["status"], "completed", result)
         self.assertEqual(result["value"]["activation_count"], 2)
+
+    def test_dsh_activation_timeout_is_bounded_to_one_hour(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "hour-timeout"),
+            runtime="dsh",
+            activation_timeout_seconds=3600,
+            mission={
+                "mission_id": "hour-timeout",
+                "goal": "accept the canonical DSH activation ceiling",
+                "authority": ["read workspace"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{"name": "inspect", "side_effect": "read"}],
+        )
+
+        accepted = self.invoke_dsh_native(contract)
+
+        self.assertTrue(accepted["ok"], accepted.get("error"))
+        self.assertEqual(accepted["value"]["status"], "completed", accepted)
+        self.assertEqual(len(accepted["telemetry"]["starts"]), 1)
+
+        contract_value = json.loads(contract.read_text(encoding="utf-8"))
+        contract_value["activation_timeout_seconds"] = 3601
+        contract_value["probe_mode"] = "capture-error"
+        contract.write_text(json.dumps(contract_value), encoding="utf-8")
+
+        rejected = self.invoke_dsh_native(contract)
+
+        self.assertTrue(rejected["ok"], rejected.get("error"))
+        self.assertEqual(rejected["value"]["status"], "failed", rejected)
+        self.assertIn("timeout_seconds must be in (0, 3600]", rejected["value"]["error"])
+        self.assertEqual(rejected["telemetry"]["starts"], [])
 
     def test_public_host_rejects_fixed_task_phase_drift_before_child_start(self) -> None:
         self.prepare_dsh_native_core()

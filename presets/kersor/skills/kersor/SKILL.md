@@ -85,8 +85,10 @@ wrong.
   PATH, and KerSor routing values; ambient cloud, provider, and SSH tokens are
   never inherited. DSH does not add a competing process-wide elapsed-time
   watchdog around the complete multi-activation Core run; each activation and
-  Host evaluator retains its own finite timeout, while cancellation and output
-  caps stay active at the outer process. Provider CLIs use their
+  Host evaluator retains its own finite timeout. The canonical DSH activation
+  timeout defaults to and is capped at 3600 seconds; Host evaluators keep their
+  separate 120-second ceiling. Cancellation and output caps stay active at the
+  outer process. Provider CLIs use their
   install-recorded local login. Resume only on a later user turn
   in a new top-level DSH session with the same absolute `run_dir` and
   `resume:true`; every session may call `kersor_evolve` only once, including a
