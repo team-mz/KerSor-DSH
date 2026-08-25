@@ -16,19 +16,13 @@ import { isDeepStrictEqual } from 'node:util'
 import { createContext, Script } from 'node:vm'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { CallId, createUserMessage, type ContentBlock, type UserMessage } from '@deepseek-ai/dsh-llm'
+import { CallId, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { JsonValue, Session, SessionEvent } from '@deepseek-ai/dsh-session'
-import type {} from '@deepseek-ai/dsh-subagent'
+import type { SubagentResult } from '@deepseek-ai/dsh-subagent'
+import type {} from '@deepseek-ai/dsh-subprocess'
 import { defineTool, type ToolExecution } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-tool-bash'
-import {
-  canonicalAuthorCommandKind,
-  canonicalAuthorHandoffSealCommand,
-  canonicalAuthorSaveCommand,
-  hostCanonicalAuthorToolArguments,
-} from './author-tool-commands.ts'
-import type { CanonicalAuthorCommandKind, CanonicalAuthorCommands } from './author-tool-commands.ts'
 import { hostNormalizableSetupArguments } from './setup-tool-arguments.ts'
 import { canonicalKersorJson, parseKersorLaunchContract } from './types.ts'
 import type {
@@ -36,6 +30,7 @@ import type {
   KersorBaselineInitializedEventData,
   KersorBaselineRecordedEventData,
   KersorBaselineVerifiedEventData,
+  KersorAuthorProducedEventData,
   KersorAuthorHandoffSealedEventData,
   KersorAuthorSaveAttemptedEventData,
   KersorCandidateOwnershipSealedEventData,
@@ -67,6 +62,11 @@ const MAX_KERSOR_PYTHON_BYTES = 128 * 1024 * 1024
 const MAX_AUTHOR_HANDOFF_BYTES = 64 * 1024
 const MAX_AUTHOR_FILE_BYTES = 2 * 1024 * 1024
 const MAX_WORKFLOW_OUTPUT_BYTES = 4 * 1024 * 1024
+const MAX_KERSOR_PROTOCOL_CONTEXT_BYTES = 4 * 1024 * 1024
+const KERSOR_PROTOCOL_OUTPUT_BYTES = 64 * 1024
+const KERSOR_PROTOCOL_GRACE_MS = 1_000
+const DISPATCH_TRANSFORM_OUTPUT_BYTES = 64 * 1024
+const DISPATCH_TRANSFORM_GRACE_MS = 1_000
 const DSH_AGENT_BINDING_NAME = '__kersor_dsh_controller_agent_v1__'
 const DSH_MODEL_POLICY = 'inherit_controller'
 const DSH_ALLOWED_CHILD_TOOLS = Object.freeze(['glob', 'grep', 'read'])
@@ -166,9 +166,9 @@ type CheckpointProjection = Omit<
   'experimentId' | 'childSessionId' | 'revision' | 'status'
 >
 
-/** Required host services: tools, durable sessions, and continuable subagents. */
+/** Required Host services: tools, durable sessions, continuable subagents, and managed subprocesses. */
 export const name = 'kersor-control'
-export const inject = ['tools', 'sessions', 'subagents']
+export const inject = ['tools', 'sessions', 'subagents', 'subprocess']
 
 function callLocation(session: Session, callId: string): { turn: number; step: number } {
   for (let index = session.events.length - 1; index >= 0; index -= 1) {
@@ -352,6 +352,7 @@ function effectiveLaunch(
 
 function workflowCustodyPrompt(): string[] {
   return [
+    'Use kersor_protocol for profile, select_workflow, and author. Do not use Bash, construct KerSor helper paths, write routing-decision.json, or dispatch the profiler, strategy selector, or author yourself: the Host owns each complete protocol handoff.',
     'A round selection whose selected_workflow.name is STALLED is a recoverable routing gap, not a canonical terminal phase.',
     'When Workflow authoring is enabled and saved-Proposal budget remains, complete Phase 3.6 and the full same-round selection sequence (select, strategy decision when required, finalize), then dispatch any non-STALLED commit before synthesizing a terminal STALLED decision.',
     'Dispatch the selected run only with kersor_workflow({exp_dir: <exact absolute run-N directory>}). The Host reads and validates dsh-workflow.json and invokes the native DSH Workflow with its exact meta/script/args; never call workflow directly or reconstruct, normalize, summarize, hash-check, extract, or retype that envelope.',
@@ -361,7 +362,8 @@ function workflowCustodyPrompt(): string[] {
     'If a workflow call fails, the Host writes no output.json; only then may you use write once to create a missing failure stub. Once output.json exists it cannot be overwritten or edited.',
     'The foreground session-synthesizer is the sole writer of round-N-summary.md and round-N-transfer.json. If it fails or either file is missing, end this controller turn at the unchanged canonical round and resume later; never write, edit, reconstruct, or repair either artifact in the controller.',
     `For Gate B, the direct controller may never write, edit, or shell-mutate dispatch-args.json, dispatch-args-provenance.json, or either Host receipt. Invoke exactly one foreground subagent with description ${JSON.stringify(DISPATCH_PRODUCER_DESCRIPTION)}, run_in_background=false, and a prompt beginning with four lines: ${DISPATCH_PRODUCER_MARKER}, SESSION_DIR=<exact absolute Session>, RUN_DIR=<exact absolute run-N>, WORKFLOW_NAME=<selected name>. That child must read and follow agents/dispatch-arg-synthesizer.md and use write exactly once for each semantic output. A failed call consumes the run; never manufacture or repair its receipts.`,
-    'After the Host producer receipt exists, its successful tool result adds one KERSOR_DISPATCH_TRANSFORM_COMMAND_V1 context bound to the durable run_dir and producer_call_id. Copy that returned command verbatim as the next Bash call. Do not add flags, variables, redirections, prefixes, or suffixes; do not inspect the injector, probe alternate syntax, or retry after any rejection or failure. The Host authorizes only that deterministic post-pass, compares its current hashes to the producer input, and mints the transformation receipt. No other post-producer mutation is allowed; cost reductions or user-supplied corrections require a fresh run/round rather than controller patching.',
+    'After the foreground dispatch producer succeeds, the Host applies runtime controls and mints the transformation receipt before returning the tool result. The controller must not invoke or reconstruct that Host-owned post-pass. No other post-producer mutation is allowed; cost reductions or user-supplied corrections require a fresh run/round rather than controller patching.',
+    'After kersor_protocol author completes, call kersor_author_commit with action seal. Review only the exact sealed staging files, then call the same tool with action save. The Host owns both executions, receipt custody, and exact-once consumption; never invoke or reconstruct their scripts.',
     'After DSH preparation succeeds, run candidate-ownership.py seal exactly once through the documented Host-frozen canonical Bash command. The Host independently rechecks the Session config, passing baseline witness, protected files, complete worktree, and dispatch package before durably binding the seal bytes and call identity. The controller and every descendant are forbidden from creating, editing, redirecting, replacing, or repairing candidate-ownership-seal.json.',
     'Never call kersor-state.sh set current_round or kersor-state.sh advance. Only the deterministic normalize-transfer.py gate may commit a DSH CONTINUE round boundary.',
     'For an exact COMPLETE decision, normalize-transfer.py runs KerSor\'s deterministic acceptance rule gate: branch only on PHASE_COMMITTED=complete, advanced, or stalled. A prose COMPLETE while canonical phase remains optimizing is not terminal.',
@@ -869,6 +871,667 @@ function createResume(ctx: Context) {
       }
     },
     presentCall: () => ({ card: 'generic', title: 'Resume KerSor experiment', kind: 'execute' }),
+  })
+}
+
+const KERSOR_PROTOCOL_ACTIONS = Object.freeze([
+  'profile',
+  'select_workflow',
+  'author',
+] as const)
+
+type KersorProtocolAction = typeof KERSOR_PROTOCOL_ACTIONS[number]
+
+interface KersorProtocolArgs {
+  readonly action: KersorProtocolAction
+}
+
+interface KersorProtocolAuthority {
+  readonly controller: Agent
+  readonly sessionDir: string
+  readonly workspace: string
+  readonly kersorPython: string
+  readonly kersorRoot: string
+  readonly workflowDir: string
+  readonly currentRound: number
+  readonly launch: KersorLaunchContract
+}
+
+function validateKersorProtocolArgs(args: KersorProtocolArgs): void {
+  if (!hasExactKeys(args as unknown as Record<string, unknown>, ['action'])
+    || !KERSOR_PROTOCOL_ACTIONS.includes(args.action)) {
+    throw new Error('kersor_protocol requires exactly one supported action')
+  }
+}
+
+function consumeKersorProtocolAction(
+  agent: Agent,
+  callId: string,
+  action: 'profile' | 'author',
+  afterEventIndex = -1,
+): void {
+  const calls = agent.session.events.flatMap((event, index) => {
+    if (index <= afterEventIndex) return []
+    if (event.type !== 'tool/call' || event.data.name !== 'kersor_protocol') return []
+    let value: unknown
+    try {
+      value = JSON.parse(event.data.arguments)
+    } catch {
+      return []
+    }
+    const args = record(value)
+    return args !== undefined && hasExactKeys(args, ['action']) && args.action === action
+      ? [event.data.callId]
+      : []
+  })
+  if (calls[0] !== callId) {
+    throw new Error(`KerSor ${action} action is already consumed by its first durable controller tool/call`)
+  }
+}
+
+async function kersorProtocolAuthority(
+  ctx: Context,
+  agent: Agent,
+): Promise<KersorProtocolAuthority> {
+  const owned = controllerBinding(ctx, agent)
+  if (owned === undefined) {
+    throw new Error('kersor_protocol is available only to the direct bound KerSor controller')
+  }
+  if (owned.binding.closure !== undefined) {
+    throw new Error(`kersor_protocol requires an open KerSor Experiment; current controller is ${owned.binding.closure}`)
+  }
+  if (owned.binding.start.origin !== 'created') {
+    throw new Error('kersor_protocol requires a created Session and is unavailable to an attached controller')
+  }
+  const initializationEvents = agent.session.events.filter(
+    (event): event is Extract<SessionEvent, { type: 'kersor/session-initialized' }> =>
+      event.type === 'kersor/session-initialized'
+      && event.data.experiment_id === owned.binding.start.experimentId,
+  )
+  const initializationEvent = initializationEvents[0]
+  if (initializationEvents.length !== 1 || initializationEvent === undefined) {
+    throw new Error('kersor_protocol requires exactly one durable Host Session initialization')
+  }
+  const sessionDir = initializationEvent.data.session_dir
+  const authority = await validateSessionAuthority(
+    ctx, agent, owned.binding, sessionDir,
+  )
+  const data = authority.data
+  const workspace = data.workspace
+  if (typeof workspace !== 'string') {
+    throw new Error('kersor_protocol durable authority lost its workspace')
+  }
+  const kersorPython = historicalFileBinding(
+    data.kersor_python, undefined, 'kersor_protocol frozen Python',
+  )
+  const currentPython = await boundedFileBinding(
+    kersorPython.path, MAX_KERSOR_PYTHON_BYTES, 'kersor_protocol frozen Python',
+  )
+  if (!isDeepStrictEqual(currentPython, kersorPython)) {
+    throw new Error('kersor_protocol frozen Python changed after Session initialization')
+  }
+  const adapter = historicalFileBinding(
+    data.adapter, undefined, 'kersor_protocol frozen adapter',
+  )
+  const kersorRoot = dirname(dirname(adapter.path))
+  if (adapter.path !== join(kersorRoot, 'scripts', 'setup-session.sh')
+    || await realpath(kersorRoot) !== kersorRoot) {
+    throw new Error('kersor_protocol frozen adapter does not identify one canonical KerSor root')
+  }
+  const sessionConfig = historicalFileBinding(
+    data.session_config, join(sessionDir, 'session-config.json'),
+    'kersor_protocol Session config',
+  )
+  const currentSessionConfig = await boundedFileBinding(
+    sessionConfig.path, MAX_BASELINE_AUTHORITY_BYTES, 'kersor_protocol Session config',
+  )
+  if (!isDeepStrictEqual(currentSessionConfig, sessionConfig)) {
+    throw new Error('kersor_protocol Session config changed after Host initialization')
+  }
+  const config = await readBoundedJsonObject(
+    sessionConfig.path, MAX_BASELINE_AUTHORITY_BYTES, 'kersor_protocol Session config',
+  )
+  const workflowDir = config.workflow_dir
+  if (typeof workflowDir !== 'string' || !isAbsolute(workflowDir)
+    || resolve(workflowDir) !== workflowDir || await realpath(workflowDir) !== workflowDir
+    || !(await lstat(workflowDir)).isDirectory()) {
+    throw new Error('kersor_protocol Session workflow_dir is not one canonical directory')
+  }
+  const state = await currentSessionStateSnapshot(
+    sessionDir, owned.binding.start.launch, undefined, agent.id,
+  )
+  return {
+    controller: agent,
+    sessionDir,
+    workspace,
+    kersorPython: kersorPython.path,
+    kersorRoot,
+    workflowDir,
+    currentRound: state.currentRound,
+    launch: owned.binding.start.launch,
+  }
+}
+
+async function kersorProtocolScript(
+  authority: KersorProtocolAuthority,
+  name: string,
+): Promise<string> {
+  const path = join(authority.kersorRoot, 'scripts', name)
+  await boundedFileBinding(path, MAX_DSH_WORKFLOW_SOURCE_BYTES, `KerSor protocol script ${name}`)
+  return path
+}
+
+interface KersorProtocolOutput {
+  readonly stdout: string
+  readonly stderr: string
+}
+
+interface KersorProtocolDispatch {
+  readonly description: string
+  readonly prompt: string
+}
+
+type KersorSelectionDisposition = 'stalled' | 'locked' | 'agent-advise'
+
+interface KersorSelectionContext {
+  readonly disposition: KersorSelectionDisposition
+  readonly context: { readonly path: string; readonly sha256: string }
+  readonly selection: { readonly path: string; readonly sha256: string }
+  readonly catalog: { readonly path: string; readonly sha256: string }
+  readonly decisionPath: string
+  readonly dispatch?: KersorProtocolDispatch
+}
+
+async function runKersorProtocolProcess(
+  ctx: Context,
+  authority: KersorProtocolAuthority,
+  action: string,
+  argv: readonly string[],
+  signal: AbortSignal,
+  env: Readonly<Record<string, string>> = {},
+): Promise<KersorProtocolOutput> {
+  const handle = ctx.subprocess.spawn({
+    argv,
+    cwd: authority.workspace,
+    env: {
+      KERSOR_PYTHON: authority.kersorPython,
+      KERSOR_ROOT: authority.kersorRoot,
+      ...env,
+    },
+    stdio: {
+      stdin: 'ignore',
+      stdout: { maxBytes: KERSOR_PROTOCOL_OUTPUT_BYTES },
+      stderr: { maxBytes: KERSOR_PROTOCOL_OUTPUT_BYTES },
+    },
+    graceMs: KERSOR_PROTOCOL_GRACE_MS,
+    signal,
+  })
+  let outcome: Awaited<typeof handle.done>
+  try {
+    outcome = await handle.done
+  } finally {
+    await handle.waitForExit()
+  }
+  const stdout = handle.collected.stdout?.readFrom(0)
+  const stderr = handle.collected.stderr?.readFrom(0)
+  if (stdout === undefined || stderr === undefined || stdout.lossy || stderr.lossy) {
+    throw new Error(`KerSor ${action} output exceeded its bounded capture`)
+  }
+  if (outcome.exitCode !== 0 || outcome.signal !== null) {
+    const disposition = outcome.signal ?? `exit ${String(outcome.exitCode)}`
+    const detail = stderr.text.trim() || stdout.text.trim()
+    throw new Error(`KerSor ${action} failed with ${disposition}${detail ? `: ${detail}` : ''}`)
+  }
+  return { stdout: stdout.text, stderr: stderr.text }
+}
+
+async function kersorProtocolDispatch(
+  authority: KersorProtocolAuthority,
+  path: string,
+  label: string,
+): Promise<KersorProtocolDispatch> {
+  const context = await readBoundedJsonObject(
+    path, MAX_KERSOR_PROTOCOL_CONTEXT_BYTES, label,
+  )
+  const dispatch = record(context.dispatch)
+  if (context.session_dir !== authority.sessionDir) {
+    throw new Error(`${label} Session binding mismatch`)
+  }
+  if (dispatch === undefined
+    || typeof dispatch.description !== 'string' || dispatch.description.trim().length === 0
+    || typeof dispatch.prompt !== 'string' || dispatch.prompt.trim().length === 0
+    || dispatch.run_in_background !== false) {
+    throw new Error(`${label} must contain a non-empty foreground dispatch`)
+  }
+  return { description: dispatch.description, prompt: dispatch.prompt }
+}
+
+function kersorProtocolChildFailure(result: SubagentResult): string | undefined {
+  if (result.stopReason === 'completed') return undefined
+  const diagnostic = result.diagnostic === undefined ? '' : `: ${result.diagnostic}`
+  return `KerSor protocol child ended with ${result.stopReason}${diagnostic}`
+}
+
+async function runKersorProtocolChild(
+  ctx: Context,
+  authority: KersorProtocolAuthority,
+  dispatch: KersorProtocolDispatch,
+  signal: AbortSignal,
+): Promise<string> {
+  const run = await ctx.subagents.start('spawn', {
+    label: dispatch.description,
+    prompt: [{ type: 'text', text: dispatch.prompt }],
+    parent: authority.controller,
+    signal,
+  })
+  const [execution] = await Promise.allSettled([run.result])
+  const [disposal] = await Promise.allSettled([run.dispose()])
+  if (execution.status === 'rejected' && disposal.status === 'rejected') {
+    throw new AggregateError(
+      [execution.reason, disposal.reason],
+      'KerSor protocol child execution and disposal both failed',
+    )
+  }
+  if (execution.status === 'rejected') throw execution.reason
+  if (disposal.status === 'rejected') {
+    throw new Error('KerSor protocol child disposal failed', { cause: disposal.reason })
+  }
+  const failure = kersorProtocolChildFailure(execution.value)
+  if (failure !== undefined) throw new Error(failure)
+  return run.id
+}
+
+async function runKersorSelectionChild(
+  ctx: Context,
+  authority: KersorProtocolAuthority,
+  dispatch: KersorProtocolDispatch,
+  decisionPath: string,
+  hostGate: WorkflowHostGateState,
+  signal: AbortSignal,
+): Promise<string> {
+  const run = await ctx.subagents.start('spawn', {
+    label: dispatch.description,
+    prompt: [{ type: 'text', text: dispatch.prompt }],
+    parent: authority.controller,
+    signal,
+    toolFilter: { allow: ['read', 'glob', 'grep', 'write'] },
+  })
+  const state: SelectionChildState = {
+    controller: authority.controller,
+    decisionPath,
+    successfulWrite: false,
+  }
+  hostGate.selectionChildren.set(run.id, state)
+  try {
+    const [execution] = await Promise.allSettled([run.result])
+    const [disposal] = await Promise.allSettled([run.dispose()])
+    if (execution.status === 'rejected' && disposal.status === 'rejected') {
+      throw new AggregateError(
+        [execution.reason, disposal.reason],
+        'KerSor selection child execution and disposal both failed',
+      )
+    }
+    if (execution.status === 'rejected') throw execution.reason
+    if (disposal.status === 'rejected') {
+      throw new Error('KerSor selection child disposal failed', { cause: disposal.reason })
+    }
+    const failure = kersorProtocolChildFailure(execution.value)
+    if (failure !== undefined) throw new Error(failure)
+    if (!state.successfulWrite) {
+      throw new Error(
+        'KerSor strategy-selector completed without one Host-observed successful routing-decision write',
+      )
+    }
+    return run.id
+  } finally {
+    hostGate.selectionChildren.delete(run.id)
+  }
+}
+
+function combinedKersorProtocolOutput(
+  outputs: readonly KersorProtocolOutput[],
+): KersorProtocolOutput {
+  return {
+    stdout: outputs.map(output => output.stdout).filter(Boolean).join(''),
+    stderr: outputs.map(output => output.stderr).filter(Boolean).join(''),
+  }
+}
+
+function kersorSelectionContextPath(authority: KersorProtocolAuthority): string {
+  return join(
+    authority.sessionDir,
+    'selection-handoff',
+    `round-${authority.currentRound}-context.json`,
+  )
+}
+
+async function ensureKersorSelectionBoundary(
+  authority: KersorProtocolAuthority,
+  currentCatalog: { readonly path: string; readonly sha256: string },
+): Promise<void> {
+  if (process.env.KERSOR_PAIR_ID?.trim()) {
+    throw new Error(
+      'kersor_protocol select_workflow does not support environment-only paired routing; bind the pair identity and shared decision store to durable Session authority first',
+    )
+  }
+  const contextPath = kersorSelectionContextPath(authority)
+  if (!await pathExists(contextPath)) {
+    if (await pathExists(join(
+      authority.sessionDir,
+      `round-${authority.currentRound}-selection.json`,
+    ))) {
+      throw new Error('KerSor selection exists without its Host-owned selection context')
+    }
+    return
+  }
+  const previous = await readBoundedJsonObject(
+    contextPath,
+    MAX_KERSOR_PROTOCOL_CONTEXT_BYTES,
+    'previous KerSor selection context',
+  )
+  if (previous.session_dir !== authority.sessionDir
+    || previous.round !== authority.currentRound) {
+    throw new Error('previous KerSor selection context authority mismatch')
+  }
+  const previousCatalog = historicalFileBinding(
+    previous.catalog,
+    currentCatalog.path,
+    'previous KerSor selection context catalog',
+  )
+  if (isDeepStrictEqual(previousCatalog, currentCatalog)) {
+    throw new Error(
+      'KerSor select_workflow action is already consumed for the current round and unchanged workflow catalog',
+    )
+  }
+}
+
+async function readKersorSelectionContext(
+  authority: KersorProtocolAuthority,
+  expectedCatalog: { readonly path: string; readonly sha256: string },
+): Promise<KersorSelectionContext> {
+  const contextPath = kersorSelectionContextPath(authority)
+  const context = await readBoundedJsonObject(
+    contextPath,
+    MAX_KERSOR_PROTOCOL_CONTEXT_BYTES,
+    'KerSor selection context',
+  )
+  if (context.schema_version !== 1
+    || context.session_dir !== authority.sessionDir
+    || context.round !== authority.currentRound) {
+    throw new Error('KerSor selection context authority mismatch')
+  }
+  const contextBinding = await boundedFileBinding(
+    contextPath,
+    MAX_KERSOR_PROTOCOL_CONTEXT_BYTES,
+    'KerSor selection context',
+  )
+  const catalog = historicalFileBinding(
+    context.catalog,
+    expectedCatalog.path,
+    'KerSor selection context catalog',
+  )
+  if (!isDeepStrictEqual(catalog, expectedCatalog)) {
+    throw new Error('KerSor selection context catalog changed before dispatch')
+  }
+  const selectionPath = join(
+    authority.sessionDir,
+    `round-${authority.currentRound}-selection.json`,
+  )
+  const selection = historicalFileBinding(
+    context.selection,
+    selectionPath,
+    'KerSor selection context selection',
+  )
+  const currentSelection = await boundedFileBinding(
+    selectionPath,
+    MAX_KERSOR_SELECTION_BYTES,
+    'KerSor selection context selection',
+  )
+  if (!isDeepStrictEqual(selection, currentSelection)) {
+    throw new Error('KerSor selection changed after its context was built')
+  }
+  const decisionPath = context.decision_path
+  if (decisionPath !== join(
+    authority.sessionDir,
+    `round-${authority.currentRound}-routing-decision.json`,
+  )) {
+    throw new Error('KerSor selection context decision path mismatch')
+  }
+  if (await pathExists(decisionPath)) {
+    throw new Error('KerSor selection context must begin without a routing decision')
+  }
+  const disposition = context.disposition
+  if (disposition !== 'stalled' && disposition !== 'locked'
+    && disposition !== 'agent-advise') {
+    throw new Error('KerSor selection context disposition is unsupported')
+  }
+  let dispatch: KersorProtocolDispatch | undefined
+  if (disposition === 'agent-advise') {
+    const value = record(context.dispatch)
+    if (value === undefined
+      || typeof value.description !== 'string' || value.description.trim().length === 0
+      || typeof value.prompt !== 'string' || value.prompt.trim().length === 0
+      || value.run_in_background !== false) {
+      throw new Error('KerSor agent-advise selection requires one foreground dispatch')
+    }
+    dispatch = { description: value.description, prompt: value.prompt }
+  } else if (context.dispatch !== null) {
+    throw new Error('KerSor locked or STALLED selection must not dispatch an agent')
+  }
+  return {
+    disposition,
+    context: contextBinding,
+    selection,
+    catalog,
+    decisionPath,
+    ...(dispatch === undefined ? {} : { dispatch }),
+  }
+}
+
+async function validateCurrentKersorSelectionContext(
+  context: KersorSelectionContext,
+): Promise<void> {
+  const current = await Promise.all([
+    boundedFileBinding(
+      context.context.path,
+      MAX_KERSOR_PROTOCOL_CONTEXT_BYTES,
+      'KerSor selection context',
+    ),
+    boundedFileBinding(
+      context.selection.path,
+      MAX_KERSOR_SELECTION_BYTES,
+      'KerSor selection input',
+    ),
+    boundedFileBinding(
+      context.catalog.path,
+      MAX_KERSOR_CATALOG_BYTES,
+      'KerSor selection catalog',
+    ),
+  ])
+  if (!isDeepStrictEqual(current, [context.context, context.selection, context.catalog])) {
+    throw new Error('KerSor selection authority changed while its foreground child was running')
+  }
+}
+
+async function executeKersorProtocol(
+  ctx: Context,
+  authority: KersorProtocolAuthority,
+  action: KersorProtocolAction,
+  callId: CallId,
+  hostGate: WorkflowHostGateState,
+  signal: AbortSignal,
+): Promise<KersorProtocolOutput> {
+  if (action === 'profile') {
+    const script = await kersorProtocolScript(authority, 'profile-handoff.py')
+    const outputs = [await runKersorProtocolProcess(ctx, authority, action, [
+      authority.kersorPython, script, 'context', '--session', authority.sessionDir,
+    ], signal)]
+    const dispatch = await kersorProtocolDispatch(
+      authority,
+      join(authority.sessionDir, 'profile-handoff', 'context.json'),
+      'KerSor profile context',
+    )
+    const producerSessionId = await runKersorProtocolChild(
+      ctx, authority, dispatch, signal,
+    )
+    outputs.push(await runKersorProtocolProcess(ctx, authority, action, [
+      authority.kersorPython, script,
+      'seal', '--session', authority.sessionDir,
+      '--producer-session-id', producerSessionId,
+    ], signal))
+    outputs.push(await runKersorProtocolProcess(ctx, authority, action, [
+      authority.kersorPython, script, 'verify', '--session', authority.sessionDir,
+    ], signal))
+    return combinedKersorProtocolOutput(outputs)
+  }
+  if (action === 'select_workflow') {
+    const catalog = join(authority.sessionDir, 'workflow-catalog.json')
+    const currentCatalog = await boundedFileBinding(
+      catalog, MAX_KERSOR_CATALOG_BYTES, 'kersor_protocol workflow catalog',
+    )
+    await ensureKersorSelectionBoundary(authority, currentCatalog)
+    const outputs = [await runKersorProtocolProcess(ctx, authority, action, [
+      'bash',
+      await kersorProtocolScript(authority, 'select-workflow.sh'),
+      authority.sessionDir,
+      String(authority.currentRound),
+      catalog,
+    ], signal)]
+    outputs.push(await runKersorProtocolProcess(ctx, authority, action, [
+      'bash',
+      await kersorProtocolScript(authority, 'run-kersor-python.sh'),
+      'selection-handoff.py',
+      '--session', authority.sessionDir,
+      '--round', String(authority.currentRound),
+    ], signal))
+    const selectionContext = await readKersorSelectionContext(
+      authority, currentCatalog,
+    )
+    if (selectionContext.dispatch !== undefined) {
+      await runKersorSelectionChild(
+        ctx, authority, selectionContext.dispatch, selectionContext.decisionPath,
+        hostGate, signal,
+      )
+    }
+    await validateCurrentKersorSelectionContext(selectionContext)
+    if (selectionContext.dispatch === undefined) {
+      if (await pathExists(selectionContext.decisionPath)) {
+        throw new Error('KerSor locked or STALLED selection unexpectedly acquired a routing decision')
+      }
+    } else if (!await pathExists(selectionContext.decisionPath)) {
+      throw new Error('KerSor strategy-selector reported success without its routing decision')
+    } else {
+      await boundedFileBinding(
+        selectionContext.decisionPath,
+        MAX_KERSOR_SELECTION_BYTES,
+        'KerSor routing decision',
+      )
+    }
+    outputs.push(await runKersorProtocolProcess(ctx, authority, action, [
+      'bash',
+      await kersorProtocolScript(authority, 'finalize-selection.sh'),
+      authority.sessionDir,
+      String(authority.currentRound),
+    ], signal))
+    return combinedKersorProtocolOutput(outputs)
+  }
+  const contextPath = join(
+    authority.sessionDir, 'workflow-authoring', 'author-context.json',
+  )
+  const output = await runKersorProtocolProcess(ctx, authority, action, [
+    'bash',
+    await kersorProtocolScript(authority, 'run-kersor-python.sh'),
+    'author-workflow-context.py',
+    '--session', authority.sessionDir,
+    '--out', contextPath,
+  ], signal)
+  const dispatch = await kersorProtocolDispatch(
+    authority, contextPath, 'KerSor author context',
+  )
+  const authorContext = await boundedFileBinding(
+    contextPath, MAX_KERSOR_PROTOCOL_CONTEXT_BYTES, 'KerSor author context',
+  )
+  const authorSessionId = SessionId(await runKersorProtocolChild(
+    ctx, authority, dispatch, signal,
+  ))
+  const currentAuthorContext = await boundedFileBinding(
+    contextPath, MAX_KERSOR_PROTOCOL_CONTEXT_BYTES, 'KerSor author context',
+  )
+  if (!isDeepStrictEqual(currentAuthorContext, authorContext)) {
+    throw new Error('KerSor author context changed while its foreground child was running')
+  }
+  const event: KersorAuthorProducedEventData = {
+    schema_version: 1,
+    contract: 'dsh_author_producer_v1',
+    authority: 'dsh_host',
+    session_dir: authority.sessionDir,
+    controller_session_id: authority.controller.id,
+    author_call_id: callId,
+    author_session_id: authorSessionId,
+    author_context: authorContext,
+  }
+  authority.controller.session.append('kersor/author-produced', event)
+  await ctx.sessions.flush(authority.controller.session)
+  return output
+}
+
+function createKersorProtocol(ctx: Context, hostGate: WorkflowHostGateState) {
+  return defineTool({
+    name: 'kersor_protocol',
+    description: 'Run one complete Host-bound KerSor profile, selection, or author handoff without model-authored paths, shell syntax, or subagent envelopes.',
+    parameters: {
+      action: {
+        type: 'string',
+        required: true,
+        enum: [...KERSOR_PROTOCOL_ACTIONS],
+        description: 'The complete Host-owned protocol action.',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          action: { type: 'string', required: true, enum: [...KERSOR_PROTOCOL_ACTIONS] },
+          stdout: { type: 'string', required: true },
+          stderr: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: [
+          `KerSor ${value.action} completed.`,
+          value.stdout,
+          value.stderr,
+        ].filter(Boolean).join('\n'),
+      }],
+    },
+    async execute(args: KersorProtocolArgs, exec) {
+      validateKersorProtocolArgs(args)
+      if (exec.agent === undefined) {
+        throw new Error('kersor_protocol requires a calling dsh controller Agent')
+      }
+      const authority = await kersorProtocolAuthority(ctx, exec.agent)
+      if (args.action === 'profile') {
+        const baseline = await validateBaselineCustody(
+          ctx, exec.agent, authority.sessionDir, authority.launch,
+        )
+        consumeKersorProtocolAction(
+          exec.agent, exec.callId, 'profile', baseline.verifiedEventIndex,
+        )
+      } else if (args.action === 'author') {
+        consumeKersorProtocolAction(exec.agent, exec.callId, 'author')
+      }
+      const output = await executeKersorProtocol(
+        ctx, authority, args.action, exec.callId, hostGate, exec.signal,
+      )
+      return { action: args.action, ...output }
+    },
+    presentCall: args => ({
+      card: 'generic',
+      title: `Run KerSor ${args.action}`,
+      kind: 'execute',
+    }),
   })
 }
 
@@ -1484,15 +2147,19 @@ interface WorkflowCallContract {
 interface WorkflowHostGateState {
   readonly authorizedNativeCallIds: Set<string>
   readonly consumedRuns: Set<string>
+  readonly selectionChildren: Map<string, SelectionChildState>
   readonly producerCalls: Map<string, DispatchProducerState>
   readonly producerChildren: Map<string, DispatchProducerState>
-  readonly transformationCalls: Map<string, DispatchTransformationState>
   readonly candidateSealCalls: Map<string, CandidateSealState>
   readonly baselineCalls: Map<string, BaselineCallState>
-  readonly authorSealCalls: WeakMap<ToolExecution, AuthorSealCallState>
-  readonly consumedAuthorSaves: Set<string>
   readonly setupCalls: WeakMap<ToolExecution, SessionSetupCallState>
   readonly activeExperiments: Set<string>
+}
+
+interface SelectionChildState {
+  readonly controller: Agent
+  readonly decisionPath: string
+  successfulWrite: boolean
 }
 
 interface SessionSetupCallState {
@@ -1533,24 +2200,15 @@ function agentWithAuthorityEvents(
 interface DispatchProducerState {
   readonly controller: Agent
   readonly callId: string
+  readonly workspace: string
   readonly sessionDir: string
   readonly runDir: string
   readonly round: number
   readonly workflowName: string
+  readonly kersorRoot: string
+  readonly kersorPython: string
   producerSessionId?: string
   readonly successfulWrites: Set<string>
-}
-
-interface DispatchTransformationState {
-  readonly controller: Agent
-  readonly callId: string
-  readonly sessionDir: string
-  readonly runDir: string
-  readonly producer: KersorDispatchArgsProducedEventData
-  readonly producerReceiptPath: string
-  readonly producerReceiptSha256: string
-  readonly beforeArgs: Record<string, unknown>
-  readonly beforeProvenance: Record<string, unknown>
 }
 
 interface CandidateSealState {
@@ -1563,24 +2221,11 @@ interface CandidateSealState {
 
 interface AuthorAuthority {
   readonly controller: Agent
-  readonly directController: boolean
   readonly sessionDir: string
   readonly stagingDir: string
   readonly handoffPath: string
   readonly kersorRoot: string
   readonly kersorPython: string
-}
-
-interface AuthorSealCallState extends AuthorAuthority {
-  readonly callId: string
-  readonly command: string
-}
-
-function canonicalAuthorCommands(authority: AuthorAuthority): CanonicalAuthorCommands {
-  return {
-    seal: canonicalAuthorHandoffSealCommand(authority.kersorPython, authority.sessionDir),
-    save: canonicalAuthorSaveCommand(authority.kersorPython, authority.sessionDir),
-  }
 }
 
 type BaselinePhase = 'initialized' | 'recorded' | 'verified'
@@ -2147,23 +2792,6 @@ async function durableDispatchProducerCallIds(agent: Agent, runDir: string): Pro
   return matches
 }
 
-async function durableDispatchTransformationCallIds(
-  agent: Agent,
-  runDir: string,
-): Promise<string[]> {
-  const matches: string[] = []
-  for (const event of agent.session.events) {
-    if (event.type !== 'tool/call' || event.data.name !== 'bash') continue
-    let argumentsValue: unknown
-    try { argumentsValue = JSON.parse(event.data.arguments) } catch { continue }
-    const command = bashCommand(argumentsValue)
-    if (command !== undefined && await isRuntimeControlsCommand(command, runDir)) {
-      matches.push(event.data.callId)
-    }
-  }
-  return matches
-}
-
 async function durableCandidateSealCallIds(agent: Agent, runDir: string): Promise<string[]> {
   const matches: string[] = []
   for (const event of agent.session.events) {
@@ -2700,6 +3328,28 @@ function catalogEntries(catalog: Record<string, unknown>): readonly unknown[] {
   return catalog.workflows
 }
 
+function committedSelectedWorkflow(
+  selection: Record<string, unknown>,
+  selectionName: string,
+): Record<string, unknown> {
+  const selected = record(selection.selected_workflow)
+  const attemptPlan = record(selection.attempt_plan)
+  const commit = record(attemptPlan?.commit)
+  const routing = record(selection.routing)
+  const decidedBy = routing?.decided_by
+  if (selected === undefined || typeof selected.name !== 'string'
+    || selected.name.trim().length === 0 || selected.name === 'STALLED'
+    || attemptPlan?.status !== 'committed'
+    || commit?.status !== 'committed' || commit.workflow !== selected.name
+    || typeof decidedBy !== 'string' || decidedBy.trim().length === 0
+    || decidedBy.toLowerCase().includes('pending')) {
+    throw new Error(
+      `${selectionName} must contain one committed selection whose attempt_plan commit and non-pending routing decision bind selected_workflow.name`,
+    )
+  }
+  return selected
+}
+
 async function hostSelectedWorkflowName(runDir: string): Promise<string> {
   const sessionDir = dirname(runDir)
   const round = Number.parseInt(basename(runDir).slice('run-'.length), 10)
@@ -2714,10 +3364,7 @@ async function hostSelectedWorkflowName(runDir: string): Promise<string> {
     || selection.catalog_path !== catalogPath) {
     throw new Error(`${selectionName} does not identify this exact Session, round, and workflow-catalog.json`)
   }
-  const selected = record(selection.selected_workflow)
-  if (selected === undefined || selected.name === 'STALLED') {
-    throw new Error(`${selectionName} must contain one non-STALLED selected_workflow`)
-  }
+  const selected = committedSelectedWorkflow(selection, selectionName)
   if (typeof selected.name !== 'string' || typeof selected.directory !== 'string'
     || typeof selected.candidate_type !== 'string') {
     throw new Error(`${selectionName} selected_workflow identity is incomplete`)
@@ -2769,10 +3416,7 @@ async function validateWorkflowSourceBinding(
   if (selection.round !== round || selection.session_dir !== sessionDir || selection.catalog_path !== catalogPath) {
     throw new Error(`${selectionName} does not identify this exact Session, round, and workflow-catalog.json`)
   }
-  const selected = record(selection.selected_workflow)
-  if (selected === undefined || selected.name === 'STALLED') {
-    throw new Error(`${selectionName} must contain one non-STALLED selected_workflow`)
-  }
+  const selected = committedSelectedWorkflow(selection, selectionName)
   if (typeof selected.name !== 'string'
     || typeof selected.directory !== 'string'
     || typeof selected.candidate_type !== 'string') {
@@ -3012,8 +3656,9 @@ const BASELINE_WITNESS_KEYS = Object.freeze([
   'executions', 'policy',
 ])
 const BASELINE_EXECUTION_KEYS = Object.freeze([
-  'kind', 'command', 'shell', 'started_at', 'finished_at', 'exit_code',
-  'timed_out', 'stdout', 'stderr', 'stdout_truncated', 'stderr_truncated',
+  'kind', 'command', 'execution_mode', 'argv', 'cwd', 'started_at', 'finished_at',
+  'exit_code', 'timed_out', 'stdout', 'stderr', 'stdout_truncated',
+  'stderr_truncated',
 ])
 const SESSION_STATE_KEYS = Object.freeze([
   'schema_version', 'phase', 'current_round', 'stall_count', 'pending_terminal',
@@ -3304,12 +3949,16 @@ function pathIsStrictlyInside(root: string, target: string): boolean {
   return value.length > 0 && !isAbsolute(value) && value !== '..' && !value.startsWith(`..${sep}`)
 }
 
-async function currentSessionState(
+async function currentSessionStateSnapshot(
   sessionDir: string,
   launch: KersorLaunchContract,
   expectedRound?: number,
   expectedSessionId?: string,
-): Promise<{ readonly path: string; readonly sha256: string }> {
+): Promise<{
+  readonly path: string
+  readonly sha256: string
+  readonly currentRound: number
+}> {
   const path = join(sessionDir, 'state.json')
   const bytes = await readBoundedRegularFile(path, MAX_SESSION_STATE_BYTES, 'state.json')
   let decoded: unknown
@@ -3355,7 +4004,23 @@ async function currentSessionState(
     || typeof state.yolo !== 'boolean' || record(state.extensions) === undefined) {
     throw new Error('state.json contains invalid canonical Session state values')
   }
-  return { path, sha256: createHash('sha256').update(bytes).digest('hex') }
+  return {
+    path,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    currentRound: state.current_round as number,
+  }
+}
+
+async function currentSessionState(
+  sessionDir: string,
+  launch: KersorLaunchContract,
+  expectedRound?: number,
+  expectedSessionId?: string,
+): Promise<{ readonly path: string; readonly sha256: string }> {
+  const { path, sha256 } = await currentSessionStateSnapshot(
+    sessionDir, launch, expectedRound, expectedSessionId,
+  )
+  return { path, sha256 }
 }
 
 function baselineTime(value: unknown, label: string): number {
@@ -3501,13 +4166,19 @@ function baselineExecution(
   value: unknown,
   expectedKind: 'correctness' | 'benchmark',
   expectedCommand: string,
+  expectedCwd: string,
   sessionStarted: number,
   previousFinished: number,
 ): { readonly event: KersorBaselineExecutionEventData; readonly finished: number } {
   const execution = record(value)
+  const argv = execution?.argv
   if (execution === undefined || !hasExactKeys(execution, BASELINE_EXECUTION_KEYS)
     || execution.kind !== expectedKind || execution.command !== expectedCommand
-    || typeof execution.shell !== 'string' || !isAbsolute(execution.shell)
+    || execution.execution_mode !== 'direct_argv'
+    || !Array.isArray(argv) || argv.length === 0
+    || argv.some(item => typeof item !== 'string')
+    || typeof argv[0] !== 'string' || !isAbsolute(argv[0])
+    || execution.cwd !== expectedCwd
     || execution.timed_out !== false
     || typeof execution.stdout !== 'string' || typeof execution.stderr !== 'string'
     || typeof execution.stdout_truncated !== 'boolean'
@@ -3593,11 +4264,11 @@ async function validateBaselineWitness(authority: BaselineAuthority): Promise<{
   const sessionStarted = baselineTime(authority.startedAt, 'session-config.started_at')
   const correctness = baselineExecution(
     witness.executions[0], 'correctness', authority.commands.correctness,
-    sessionStarted, sessionStarted,
+    authority.workspace, sessionStarted, sessionStarted,
   )
   const benchmark = baselineExecution(
     witness.executions[1], 'benchmark', authority.commands.benchmark,
-    sessionStarted, correctness.finished,
+    authority.workspace, sessionStarted, correctness.finished,
   )
   const recordedAt = baselineTime(witness.recorded_at, 'baseline-witness.recorded_at')
   if (recordedAt < benchmark.finished) {
@@ -3713,7 +4384,7 @@ async function validateDispatchCustody(
     || transformation.round !== round || transformation.workflow_name !== workflowName
     || transformation.controller_session_id !== agent.id
     || !nonWhitespaceToken(transformation.controller_session_id)
-    || !nonWhitespaceToken(transformation.transformation_call_id)
+    || transformation.transformation_call_id !== producer.producer_call_id
     || producerReceiptBinding?.sha256 !== producerHash
     || input === undefined || !hasExactKeys(input, ['dispatch_args', 'dispatch_args_provenance'])
     || output === undefined || !hasExactKeys(output, ['dispatch_args', 'dispatch_args_provenance'])
@@ -3758,22 +4429,13 @@ async function validateDispatchCustody(
     || !isDeepStrictEqual(transformationEvent.data, transformation)) {
     throw new Error('dispatch transformation receipt lacks one matching durable Host event')
   }
-  const transformationCalls = await durableDispatchTransformationCallIds(agent, runDir)
-  if (transformationCalls.length !== 1
-    || transformationCalls[0] !== transformation.transformation_call_id) {
-    throw new Error('dispatch transformation receipt lacks its exact durable canonical Bash call')
-  }
   const producerEventIndex = agent.session.events.indexOf(producerEvent)
   const transformationEventIndex = agent.session.events.indexOf(transformationEvent)
   const producerCallIndex = agent.session.events.findIndex(event =>
     event.type === 'tool/call' && event.data.name === 'subagent'
     && event.data.callId === producer.producer_call_id)
-  const transformationCallIndex = agent.session.events.findIndex(event =>
-    event.type === 'tool/call' && event.data.name === 'bash'
-    && event.data.callId === transformation.transformation_call_id)
   if (producerCallIndex < 0 || producerEventIndex <= producerCallIndex
-    || transformationCallIndex <= producerEventIndex
-    || transformationEventIndex <= transformationCallIndex) {
+    || transformationEventIndex <= producerEventIndex) {
     throw new Error('dispatch transformation durable event does not follow its producer event')
   }
   const transformationHash = createHash('sha256').update(transformationBytes).digest('hex')
@@ -4428,7 +5090,6 @@ async function authorAuthorityForAgent(
   }
   return {
     controller,
-    directController: controller.id === agent.id,
     sessionDir,
     stagingDir: join(sessionDir, 'workflow-authoring', 'staging'),
     handoffPath: join(sessionDir, 'workflow-authoring', AUTHOR_HANDOFF),
@@ -4582,6 +5243,14 @@ const SHELL_PATH_COMMANDS = new Set([
   'tee', 'test', 'unlink', 'wc', 'zsh',
 ])
 const SHELL_EXECUTION_WRAPPERS = new Set(['command', 'env', 'exec', 'nohup'])
+
+function isPythonShellExecutable(executable: string): boolean {
+  return /^python(?:\d+(?:\.\d+)*)?$/u.test(executable)
+}
+
+function shellExecutableUsesPathOperands(executable: string): boolean {
+  return SHELL_PATH_COMMANDS.has(executable) || isPythonShellExecutable(executable)
+}
 
 function shellRedirectionAt(command: string, index: number): string | undefined {
   for (const operator of ['&>>', '<<<', '&>', '>>', '<<', '<>', '>|', '<&', '>&', '>', '<']) {
@@ -4929,7 +5598,8 @@ async function shellInvokesAuthorGate(
   const realExecutable = await realMutationTarget(executablePath)
   if (realExecutable === wrapper
     && operands.some(operand => basename(operand) === 'seal-author-handoff.py')) return true
-  if (!['.', 'bash', 'python', 'python3', 'sh', 'source', 'zsh'].includes(executable)) {
+  if (!['.', 'bash', 'sh', 'source', 'zsh'].includes(executable)
+    && !isPythonShellExecutable(executable)) {
     return false
   }
   const targets = operands.filter(operand => !operand.startsWith('-'))
@@ -4975,6 +5645,70 @@ async function authorBashWorkdir(
     invalid: false,
     staging: pathInside(staging, canonical),
   }
+}
+
+async function authorBashEnvelopeTargetsStaging(
+  argumentsValue: unknown,
+  authority: AuthorAuthority,
+  agent: Agent,
+): Promise<boolean> {
+  const workdir = await authorBashWorkdir(argumentsValue, authority, agent)
+  return workdir.invalid || workdir.staging
+}
+
+async function isTrustedKersorHelperInvocation(
+  argumentsValue: unknown,
+  authority: AuthorAuthority,
+): Promise<boolean> {
+  const command = bashCommand(argumentsValue)
+  if (command === undefined) return false
+  const prefix = frozenPythonPrefix(authority.kersorPython)
+  if (!command.startsWith(prefix)) return false
+  const tokens = staticShellTokens(command.slice(prefix.length).trim())
+  if (tokens === undefined || tokens.length < 2
+    || tokens.some(token => SHELL_CONTROL_WORDS.has(token))) return false
+  const redirections = shellRedirections(tokens)
+  if (redirections.dynamic || redirections.targets.length !== 0
+    || redirections.invocation.length !== tokens.length) return false
+
+  const executable = tokens[0]
+  const script = tokens[1]
+  const python = executable === '$KERSOR_PYTHON'
+  const bash = executable === 'bash'
+  if (script === undefined || !isAbsolute(script)
+    || python && !script.endsWith('.py')
+    || bash && !script.endsWith('.sh')
+    || !python && !bash) return false
+  const variables = new Map([['KERSOR_PYTHON', authority.kersorPython]])
+  const operands: string[] = []
+  for (const token of tokens.slice(2)) {
+    const expanded = expandStaticShellWord(token, variables)
+    if (expanded === undefined) return false
+    operands.push(expanded)
+  }
+
+  const [scriptsDir, realScript] = await Promise.all([
+    realpath(join(authority.kersorRoot, 'scripts')).catch(() => undefined),
+    realpath(script).catch(() => undefined),
+  ])
+  const scriptMetadata = realScript === undefined
+    ? undefined
+    : await stat(realScript).catch(() => undefined)
+  if (scriptsDir === undefined || realScript === undefined || scriptMetadata === undefined
+    || realScript === scriptsDir || !pathInside(scriptsDir, realScript)
+    || !scriptMetadata.isFile()) return false
+  const scriptName = basename(realScript)
+  const custodyScripts = [
+    join(scriptsDir, 'seal-author-handoff.py'),
+    join(scriptsDir, 'save-authored-workflow.sh'),
+    join(scriptsDir, 'run-kersor-python.sh'),
+  ]
+  if (custodyScripts.map(path => basename(path)).includes(scriptName)
+    || await sameRegularFileIdentity(realScript, custodyScripts)) return false
+  if (operands[0] !== 'save') return true
+  const proposals = join(scriptsDir, 'kersor-proposals.py')
+  return scriptName !== basename(proposals)
+    && !await sameRegularFileIdentity(realScript, [proposals])
 }
 
 async function bashTouchesAuthorStaging(
@@ -5034,7 +5768,7 @@ async function bashTouchesAuthorStaging(
       for (const word of invocationWords.slice(index + 1)) {
         const expanded = expandStaticShellWord(word, variables)
         if (expanded === undefined) {
-          if (SHELL_PATH_COMMANDS.has(initialExecutable)
+          if (shellExecutableUsesPathOperands(initialExecutable)
             || SHELL_EXECUTION_WRAPPERS.has(initialExecutable)) return true
           continue
         }
@@ -5078,7 +5812,7 @@ async function bashTouchesAuthorStaging(
         if (effectiveOperands.length === 0
           || await inspect(effectiveOperands.join(' '), cwd, effectiveVariables, depth + 1)) return true
       }
-      if (!SHELL_PATH_COMMANDS.has(executable)) continue
+      if (!shellExecutableUsesPathOperands(executable)) continue
       if (!stagingAccess) continue
       const candidates = effectiveOperands.filter(operand => !operand.startsWith('-'))
       if ((executable === 'ls' || executable === 'find') && candidates.length === 0) {
@@ -5105,6 +5839,18 @@ function authorSealEvent(
   return events[0]
 }
 
+function authorProducedEvent(
+  authority: AuthorAuthority,
+): Extract<SessionEvent, { type: 'kersor/author-produced' }> | undefined {
+  const events = authority.controller.session.events.filter(
+    (event): event is Extract<SessionEvent, { type: 'kersor/author-produced' }> =>
+      event.type === 'kersor/author-produced'
+      && event.data.session_dir === authority.sessionDir,
+  )
+  if (events.length > 1) throw new Error('author handoff has duplicate durable Host producers')
+  return events[0]
+}
+
 function authorSaveEvents(
   authority: AuthorAuthority,
 ): readonly Extract<SessionEvent, { type: 'kersor/author-save-attempted' }>[] {
@@ -5115,169 +5861,388 @@ function authorSaveEvents(
   )
 }
 
-function durableAuthorCommandCallIds(
+function durableAuthorCommitCallIds(
   controller: Agent,
-  command: string,
+  action: AuthorCommitAction,
+  afterSeq: number,
 ): string[] {
   const calls: string[] = []
   for (const event of controller.session.events) {
-    if (event.type !== 'tool/call' || event.data.name !== 'bash') continue
+    if (event.seq <= afterSeq
+      || event.type !== 'tool/call' || event.data.name !== 'kersor_author_commit') continue
     try {
-      if (hostCanonicalAuthorToolArguments(JSON.parse(event.data.arguments), command)) {
+      const args = record(JSON.parse(event.data.arguments))
+      if (args !== undefined && hasExactKeys(args, ['action']) && args.action === action) {
         calls.push(event.data.callId)
       }
     } catch {
-      // A malformed historical Bash envelope is not a canonical author gate.
+      // A malformed historical tool call is not one typed author commit.
     }
   }
   return calls
 }
 
-type AuthorFileBindings = KersorAuthorHandoffSealedEventData['files']
+async function authorHandoffReceipt(
+  authority: AuthorAuthority,
+): Promise<{ readonly path: string; readonly sha256: string }> {
+  const staging = await validateCanonicalAuthorStaging(authority)
+  const files = Object.fromEntries(await Promise.all(AUTHOR_STAGING_FILES.map(async (name) => {
+    const path = join(staging, name)
+    const bytes = await readBoundedRegularFile(path, MAX_AUTHOR_FILE_BYTES, `author staging ${name}`)
+    return [name, `sha256:${createHash('sha256').update(bytes).digest('hex')}`]
+  }))) as Record<string, string>
+  const handoffBytes = await readBoundedRegularFile(
+    authority.handoffPath, MAX_AUTHOR_HANDOFF_BYTES, 'author handoff seal',
+  )
+  let value: unknown
+  try { value = JSON.parse(handoffBytes.toString('utf8')) } catch {
+    throw new Error('author handoff seal is malformed JSON')
+  }
+  const handoff = record(value)
+  const sealedFiles = record(handoff?.files)
+  if (handoff === undefined || handoff.schema_version !== 1 || handoff.staging !== staging
+    || sealedFiles === undefined || !hasExactKeys(sealedFiles, AUTHOR_STAGING_FILES)) {
+    throw new Error('author handoff seal required schema, staging, or file map is invalid')
+  }
+  for (const name of AUTHOR_STAGING_FILES) {
+    if (sealedFiles[name] !== files[name]) {
+      throw new Error(`author handoff changed after seal: ${name} hash mismatch`)
+    }
+  }
+  return {
+    path: authority.handoffPath,
+    sha256: createHash('sha256').update(handoffBytes).digest('hex'),
+  }
+}
 
-async function authorHandoffBindings(authority: AuthorAuthority): Promise<{
-  readonly handoff: { readonly path: string; readonly sha256: string }
-  readonly files: AuthorFileBindings
-}> {
+async function validateCanonicalAuthorStaging(authority: AuthorAuthority): Promise<string> {
+  const stagingEntry = await lstat(authority.stagingDir)
   const staging = await realpath(authority.stagingDir)
-  if (staging !== authority.stagingDir) {
-    throw new Error('author staging directory contains a symlink or path alias')
+  if (staging !== authority.stagingDir || stagingEntry.isSymbolicLink()
+    || !stagingEntry.isDirectory()) {
+    throw new Error('author staging must be one canonical non-symlink directory')
   }
   const entries = await readdir(staging, { withFileTypes: true })
   const names = entries.map(entry => entry.name).sort()
   if (!isDeepStrictEqual(names, [...AUTHOR_STAGING_FILES].sort())
     || entries.some(entry => !entry.isFile() || entry.isSymbolicLink())) {
-    throw new Error('author staging must contain exactly the three direct author files')
+    throw new Error('author staging must contain exactly the three direct regular files')
   }
-  const files = Object.fromEntries(await Promise.all(AUTHOR_STAGING_FILES.map(async (name) => {
+  await Promise.all(AUTHOR_STAGING_FILES.map(async (name) => {
     const path = join(staging, name)
-    const bytes = await readBoundedRegularFile(path, MAX_AUTHOR_FILE_BYTES, `author staging ${name}`)
-    return [name, { path, sha256: createHash('sha256').update(bytes).digest('hex') }]
-  }))) as unknown as AuthorFileBindings
-  const handoffBytes = await readBoundedRegularFile(
-    authority.handoffPath, MAX_AUTHOR_HANDOFF_BYTES, 'author handoff seal',
-  )
-  let handoffValue: unknown
-  try { handoffValue = JSON.parse(handoffBytes.toString('utf8')) } catch {
-    throw new Error('author handoff seal is malformed JSON')
-  }
-  const handoff = record(handoffValue)
-  const sealedFiles = record(handoff?.files)
-  if (handoff === undefined || !hasExactKeys(handoff, ['schema_version', 'staging', 'files'])
-    || handoff.schema_version !== 1 || handoff.staging !== staging
-    || sealedFiles === undefined || !hasExactKeys(sealedFiles, AUTHOR_STAGING_FILES)) {
-    throw new Error('author handoff seal schema or staging identity is invalid')
-  }
-  for (const name of AUTHOR_STAGING_FILES) {
-    if (sealedFiles[name] !== `sha256:${files[name].sha256}`) {
-      throw new Error(`author handoff changed after seal: ${name} hash mismatch`)
+    const entry = await lstat(path)
+    if (!entry.isFile() || entry.isSymbolicLink()) {
+      throw new Error(`author staging ${name} must be a direct regular non-symlink file`)
     }
+    await readBoundedRegularFile(path, MAX_AUTHOR_FILE_BYTES, `author staging ${name}`)
+  }))
+  return staging
+}
+
+async function validateAuthoringWriteTargets(authority: AuthorAuthority): Promise<void> {
+  const authoring = dirname(authority.stagingDir)
+  const entry = await lstat(authoring)
+  const canonical = await realpath(authoring)
+  if (canonical !== authoring || entry.isSymbolicLink() || !entry.isDirectory()) {
+    throw new Error('workflow-authoring must be one canonical non-symlink directory')
   }
-  return {
-    handoff: {
-      path: authority.handoffPath,
-      sha256: createHash('sha256').update(handoffBytes).digest('hex'),
-    },
-    files,
+  const store = join(authoring, 'proposals')
+  try {
+    const storeEntry = await lstat(store)
+    const canonicalStore = await realpath(store)
+    if (canonicalStore !== store || storeEntry.isSymbolicLink() || !storeEntry.isDirectory()) {
+      throw new Error('authored Proposal store must be one canonical non-symlink directory')
+    }
+  } catch (error: unknown) {
+    if (nodeErrorCode(error) !== 'ENOENT') throw error
+    await access(authoring, constants.W_OK)
   }
 }
 
-async function beginAuthorHandoffSeal(
-  authority: AuthorAuthority,
-  exec: ToolExecution,
-  command: string,
-  hostGate: WorkflowHostGateState,
-): Promise<string | undefined> {
-  const callId = exec.callId
-  const expected = canonicalAuthorHandoffSealCommand(
-    authority.kersorPython, authority.sessionDir,
-  )
-  if (command !== expected) {
-    return `author handoff sealing must use the exact Host-authorized command: ${expected}`
-  }
-  if (!hostCanonicalAuthorToolArguments(exec.arguments, expected)) {
-    return 'author handoff sealing requires the exact foreground Host-owned Bash envelope'
-  }
-  if (authorSealEvent(authority) !== undefined || authorSaveEvents(authority).length !== 0
-    || await pathExists(authority.handoffPath)) {
-    return 'author handoff sealing is exact-once and this Session is already sealed or consumed'
-  }
-  const calls = durableAuthorCommandCallIds(authority.controller, expected)
-  if (calls.length !== 1 || calls[0] !== callId) {
-    return 'author handoff sealing is exact-once; a prior canonical attempt consumed this Session'
-  }
-  hostGate.authorSealCalls.set(exec, { ...authority, callId, command })
-  return undefined
+const AUTHOR_COMMIT_ACTIONS = Object.freeze(['seal', 'save'] as const)
+type AuthorCommitAction = typeof AUTHOR_COMMIT_ACTIONS[number]
+
+interface AuthorCommitArgs {
+  readonly action: AuthorCommitAction
 }
 
-async function finishAuthorHandoffSeal(
+function validateAuthorCommitArgs(args: AuthorCommitArgs): void {
+  if (!hasExactKeys(args as unknown as Record<string, unknown>, ['action'])
+    || !AUTHOR_COMMIT_ACTIONS.includes(args.action)) {
+    throw new Error('kersor_author_commit requires exactly one supported action')
+  }
+}
+
+async function authorCommitAuthority(
   ctx: Context,
-  state: AuthorSealCallState,
-): Promise<void> {
-  const bindings = await authorHandoffBindings(state)
-  const event: KersorAuthorHandoffSealedEventData = {
-    schema_version: 1,
-    contract: 'dsh_author_handoff_seal_v1',
-    authority: 'dsh_host',
-    session_dir: state.sessionDir,
-    controller_session_id: state.controller.id,
-    seal_call_id: state.callId,
-    seal_command: state.command,
-    staging_dir: state.stagingDir,
-    handoff: bindings.handoff,
-    files: bindings.files,
+  agent: Agent,
+): Promise<AuthorAuthority> {
+  const protocol = await kersorProtocolAuthority(ctx, agent)
+  if (protocol.launch.workflow_authoring_budget < 1) {
+    throw new Error('kersor_author_commit requires an enabled workflow authoring budget')
   }
-  state.controller.session.append('kersor/author-handoff-sealed', event)
-  await ctx.sessions.flush(state.controller.session)
+  const authority = await authorAuthorityForAgent(ctx, agent)
+  if (authority === undefined) {
+    throw new Error('kersor_author_commit requires one Host-initialized authoring Session')
+  }
+  return authority
 }
 
-async function beginAuthorSaveAttempt(
-  ctx: Context,
+function consumeAuthorCommit(
   authority: AuthorAuthority,
   callId: string,
-  command: string,
-  argumentsValue: unknown,
-  hostGate: WorkflowHostGateState,
-): Promise<string | undefined> {
-  const expected = canonicalAuthorSaveCommand(authority.kersorPython, authority.sessionDir)
-  if (command !== expected) {
-    return `authored Proposal save must use the exact Host-authorized command: ${expected}`
+  action: AuthorCommitAction,
+  afterSeq: number,
+): void {
+  const calls = durableAuthorCommitCallIds(authority.controller, action, afterSeq)
+  if (calls[0] !== callId) {
+    throw new Error(`author ${action} is exact-once and was consumed by its first durable controller tool/call`)
   }
-  if (!hostCanonicalAuthorToolArguments(argumentsValue, expected)) {
-    return 'authored Proposal save requires the exact foreground Host-owned Bash envelope'
+}
+
+async function sealAuthorHandoff(
+  ctx: Context,
+  authority: AuthorAuthority,
+  callId: CallId,
+  signal: AbortSignal,
+): Promise<KersorProtocolOutput> {
+  const produced = authorProducedEvent(authority)
+  if (produced === undefined) {
+    throw new Error('author handoff seal requires one durable Host-run foreground author')
   }
-  const seal = authorSealEvent(authority)
-  if (seal === undefined) return 'authored Proposal save requires its durable Host author seal'
-  if (hostGate.consumedAuthorSaves.has(authority.sessionDir)
-    || authorSaveEvents(authority).length !== 0) {
-    return 'authored Proposal save is exact-once; its canonical attempt is already consumed'
+  consumeAuthorCommit(authority, callId, 'seal', produced.seq)
+  if (authorSealEvent(authority) !== undefined || authorSaveEvents(authority).length !== 0
+    || await pathExists(authority.handoffPath)) {
+    throw new Error('author handoff sealing is exact-once and this Session is already sealed or consumed')
   }
-  const calls = durableAuthorCommandCallIds(authority.controller, expected)
-  if (calls.length !== 1 || calls[0] !== callId) {
-    return 'authored Proposal save is exact-once; a prior canonical attempt consumed this Session'
+  const currentContext = await boundedFileBinding(
+    produced.data.author_context.path,
+    MAX_KERSOR_PROTOCOL_CONTEXT_BYTES,
+    'KerSor author context',
+  )
+  if (!isDeepStrictEqual(currentContext, produced.data.author_context)) {
+    throw new Error('KerSor author context changed after its foreground child completed')
   }
-  const current = await authorHandoffBindings(authority)
-  if (!isDeepStrictEqual(current.handoff, seal.data.handoff)
-    || !isDeepStrictEqual(current.files, seal.data.files)) {
-    return 'authored Proposal save input differs from its durable Host author seal'
-  }
-  const event: KersorAuthorSaveAttemptedEventData = {
+  await validateCanonicalAuthorStaging(authority)
+  await validateAuthoringWriteTargets(authority)
+  const protocolAuthority = await kersorProtocolAuthority(ctx, authority.controller)
+  const output = await runKersorProtocolProcess(ctx, protocolAuthority, 'author seal', [
+    authority.kersorPython,
+    await kersorProtocolScript(protocolAuthority, 'seal-author-handoff.py'),
+    '--from', authority.stagingDir,
+    '--out', authority.handoffPath,
+  ], signal)
+  const handoff = await authorHandoffReceipt(authority)
+  const event: KersorAuthorHandoffSealedEventData = {
     schema_version: 1,
-    contract: 'dsh_author_save_attempt_v1',
+    contract: 'dsh_author_handoff_seal_v2',
     authority: 'dsh_host',
     session_dir: authority.sessionDir,
     controller_session_id: authority.controller.id,
-    save_call_id: callId,
-    save_command: command,
-    seal_call_id: seal.data.seal_call_id,
-    staging_dir: authority.stagingDir,
-    handoff: current.handoff,
-    files: current.files,
+    author_call_id: produced.data.author_call_id,
+    author_session_id: produced.data.author_session_id,
+    seal_call_id: callId,
+    handoff,
   }
-  hostGate.consumedAuthorSaves.add(authority.sessionDir)
-  authority.controller.session.append('kersor/author-save-attempted', event)
+  authority.controller.session.append('kersor/author-handoff-sealed', event)
   await ctx.sessions.flush(authority.controller.session)
-  return undefined
+  return output
+}
+
+async function saveAuthorHandoff(
+  ctx: Context,
+  authority: AuthorAuthority,
+  callId: CallId,
+  signal: AbortSignal,
+): Promise<KersorProtocolOutput> {
+  const seal = authorSealEvent(authority)
+  if (seal === undefined) throw new Error('authored Proposal save requires its durable Host author seal')
+  consumeAuthorCommit(authority, callId, 'save', seal.seq)
+  try {
+    if (authorSaveEvents(authority).length !== 0) {
+      throw new Error('authored Proposal save is exact-once; its canonical attempt is already consumed')
+    }
+    await validateAuthoringWriteTargets(authority)
+    const handoff = await authorHandoffReceipt(authority)
+    if (!isDeepStrictEqual(handoff, seal.data.handoff)) {
+      throw new Error('authored Proposal save input differs from its durable Host author seal')
+    }
+    const event: KersorAuthorSaveAttemptedEventData = {
+      schema_version: 1,
+      contract: 'dsh_author_save_attempt_v2',
+      authority: 'dsh_host',
+      session_dir: authority.sessionDir,
+      controller_session_id: authority.controller.id,
+      save_call_id: callId,
+      seal_call_id: seal.data.seal_call_id,
+      handoff,
+    }
+    authority.controller.session.append('kersor/author-save-attempted', event)
+    await ctx.sessions.flush(authority.controller.session)
+    const protocolAuthority = await kersorProtocolAuthority(ctx, authority.controller)
+    const saveOutput = await runKersorProtocolProcess(ctx, protocolAuthority, 'author save', [
+      'bash',
+      await kersorProtocolScript(protocolAuthority, 'save-authored-workflow.sh'),
+      '--from', authority.stagingDir,
+      '--store', join(authority.sessionDir, 'workflow-authoring', 'proposals'),
+      '--handoff', authority.handoffPath,
+    ], signal)
+    const proposal = await validateSavedAuthorProposal(authority, saveOutput.stdout)
+    const proposalsStore = join(authority.sessionDir, 'workflow-authoring', 'proposals')
+    const catalogPath = join(authority.sessionDir, 'workflow-catalog.json')
+    const catalogOutput = await runKersorProtocolProcess(
+      ctx,
+      protocolAuthority,
+      'author catalog refresh',
+      [
+        'bash',
+        await kersorProtocolScript(protocolAuthority, 'generate-catalog.sh'),
+        protocolAuthority.workflowDir,
+        catalogPath,
+      ],
+      signal,
+      { KERSOR_PROPOSALS_DIR: proposalsStore },
+    )
+    await validateRefreshedAuthorCatalog(catalogPath, proposal)
+    return combinedKersorProtocolOutput([saveOutput, catalogOutput])
+  } catch (error: unknown) {
+    throw new Error(
+      `authored Proposal save is consumed and needs_revision; do not retry: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    )
+  }
+}
+
+interface SavedAuthorProposal {
+  readonly name: string
+  readonly directory: string
+  readonly workflowPath: string
+  readonly bindingHash: string
+}
+
+async function validateSavedAuthorProposal(
+  authority: AuthorAuthority,
+  stdout: string,
+): Promise<SavedAuthorProposal> {
+  const required = [
+    'PROPOSAL_NAME', 'PROPOSAL_DIR', 'ORIGIN', 'STATUS', 'METADATA', 'RECORD',
+  ] as const
+  const values = new Map<string, string[]>()
+  for (const line of stdout.split(/\r?\n/u)) {
+    const separator = line.indexOf('=')
+    if (separator < 1) continue
+    const key = line.slice(0, separator)
+    if (!required.includes(key as typeof required[number])) continue
+    const entries = values.get(key) ?? []
+    entries.push(line.slice(separator + 1))
+    values.set(key, entries)
+  }
+  const field = (key: typeof required[number]): string => {
+    const entries = values.get(key)
+    if (entries?.length !== 1 || entries[0]?.trim().length === 0) {
+      throw new Error(`KerSor authored Proposal save must emit one non-empty ${key}`)
+    }
+    return entries[0] as string
+  }
+  const proposalName = field('PROPOSAL_NAME')
+  const proposalDir = field('PROPOSAL_DIR')
+  const metadata = field('METADATA')
+  const recordPath = field('RECORD')
+  if (field('ORIGIN') !== 'authored' || field('STATUS') !== 'probation') {
+    throw new Error('KerSor authored Proposal save must report origin=authored and status=probation')
+  }
+  const store = join(authority.sessionDir, 'workflow-authoring', 'proposals')
+  if (!isAbsolute(proposalDir) || resolve(proposalDir) !== proposalDir
+    || dirname(proposalDir) !== store || basename(proposalDir) !== proposalName) {
+    throw new Error('KerSor authored Proposal save returned a non-canonical Session-local Proposal directory')
+  }
+  const proposalEntry = await lstat(proposalDir)
+  const canonicalProposal = await realpath(proposalDir)
+  if (canonicalProposal !== proposalDir || proposalEntry.isSymbolicLink()
+    || !proposalEntry.isDirectory()) {
+    throw new Error('KerSor authored Proposal directory must be one canonical non-symlink directory')
+  }
+  if (metadata !== join(proposalDir, 'metadata.json')
+    || recordPath !== join(proposalDir, 'proposal.json')) {
+    throw new Error('KerSor authored Proposal save returned redirected metadata or record paths')
+  }
+  const workflowPath = join(proposalDir, 'workflow.js')
+  const [workflow, , proposalRecord] = await Promise.all([
+    boundedFileBinding(workflowPath, MAX_DSH_WORKFLOW_SOURCE_BYTES, 'saved authored workflow'),
+    boundedFileBinding(metadata, MAX_AUTHOR_FILE_BYTES, 'saved authored metadata'),
+    readBoundedJsonObject(recordPath, MAX_AUTHOR_FILE_BYTES, 'saved authored Proposal record'),
+  ])
+  const evidenceBinding = record(proposalRecord.evidence_binding)
+  const bindingHash = evidenceBinding?.binding_hash
+  if (proposalRecord.workflow_name !== proposalName || proposalRecord.origin !== 'authored'
+    || proposalRecord.status !== 'probation'
+    || typeof bindingHash !== 'string' || bindingHash.trim().length === 0
+    || evidenceBinding?.workflow_hash !== `sha256:${workflow.sha256}`) {
+    throw new Error('saved authored Proposal record does not bind its name, lifecycle, and workflow bytes')
+  }
+  return { name: proposalName, directory: proposalDir, workflowPath, bindingHash }
+}
+
+async function validateRefreshedAuthorCatalog(
+  catalogPath: string,
+  proposal: SavedAuthorProposal,
+): Promise<void> {
+  const catalog = await readBoundedJsonObject(
+    catalogPath, MAX_KERSOR_CATALOG_BYTES, 'refreshed workflow-catalog.json',
+  )
+  const matches = catalogEntries(catalog).flatMap((value) => {
+    const entry = record(value)
+    return entry?.name === proposal.name ? [entry] : []
+  })
+  const entry = matches[0]
+  if (matches.length !== 1 || entry === undefined
+    || entry.js_path !== proposal.workflowPath
+    || entry.probation !== true || entry.proposal_status !== 'probation'
+    || entry.proposal_binding_hash !== proposal.bindingHash) {
+    throw new Error('refreshed workflow-catalog.json does not bind the just-saved authored probation Proposal')
+  }
+}
+
+function createAuthorCommit(ctx: Context) {
+  return defineTool({
+    name: 'kersor_author_commit',
+    description: 'Seal or save the current Host-run KerSor author result without model-authored paths or shell syntax.',
+    parameters: {
+      action: {
+        type: 'string', required: true, enum: [...AUTHOR_COMMIT_ACTIONS],
+        description: 'Seal the Host-run author result, or save the unchanged sealed bytes.',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          action: { type: 'string', required: true, enum: [...AUTHOR_COMMIT_ACTIONS] },
+          stdout: { type: 'string', required: true },
+          stderr: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: [`KerSor author ${value.action} completed.`, value.stdout, value.stderr]
+          .filter(Boolean).join('\n'),
+      }],
+    },
+    async execute(args: AuthorCommitArgs, exec) {
+      validateAuthorCommitArgs(args)
+      if (exec.agent === undefined) {
+        throw new Error('kersor_author_commit requires a calling dsh controller Agent')
+      }
+      const authority = await authorCommitAuthority(ctx, exec.agent)
+      const output = args.action === 'seal'
+        ? await sealAuthorHandoff(ctx, authority, exec.callId, exec.signal)
+        : await saveAuthorHandoff(ctx, authority, exec.callId, exec.signal)
+      return { action: args.action, ...output }
+    },
+    presentCall: args => ({
+      card: 'generic', title: `Commit KerSor author ${args.action}`, kind: 'execute',
+    }),
+  })
 }
 
 function dispatchArtifactAt(
@@ -5389,11 +6354,6 @@ function hasBaselineAuthorityMutation(command: string): boolean {
     || /\bos\.(?:remove|unlink|replace|rename)\s*\(/i.test(command)
 }
 
-async function canonicalRuntimeControlsCommand(runDir: string): Promise<string> {
-  const prefix = frozenPythonPrefix(await frozenKersorPython())
-  return `${prefix} bridge="\${DSH_HOME:-$HOME/.dsh}/.agent-presets/kersor/bin/kersor_bridge.py"; kersor_root="$("$KERSOR_PYTHON" "$bridge" root)"; "$KERSOR_PYTHON" "$kersor_root/scripts/inject-runtime-controls.py" ${shellQuote(runDir)}`
-}
-
 async function canonicalCandidateOwnershipSealCommand(runDir: string): Promise<string> {
   const prefix = frozenPythonPrefix(await frozenKersorPython())
   return `${prefix} bridge="\${DSH_HOME:-$HOME/.dsh}/.agent-presets/kersor/bin/kersor_bridge.py"; kersor_root="$("$KERSOR_PYTHON" "$bridge" root)"; "$KERSOR_PYTHON" "$kersor_root/scripts/candidate-ownership.py" seal --session ${shellQuote(dirname(runDir))} --run-dir ${shellQuote(runDir)}`
@@ -5418,6 +6378,75 @@ async function canonicalBaselineCommand(
     return `${prefix} record --session ${shellQuote(sessionDir)} --project-root ${shellQuote(workspace)}`
   }
   return `${prefix} verify --session ${shellQuote(sessionDir)}`
+}
+
+function baselineCommandName(phase: BaselinePhase): 'init' | 'record' | 'verify' {
+  return phase === 'initialized' ? 'init' : phase === 'recorded' ? 'record' : 'verify'
+}
+
+function nextBaselinePhase(
+  events: readonly SessionEvent[],
+  sessionDir: string,
+): BaselinePhase | undefined {
+  const phases: readonly BaselinePhase[] = ['initialized', 'recorded', 'verified']
+  let previousIndex = -1
+  for (const [phaseIndex, phase] of phases.entries()) {
+    const type = baselineEventType(phase)
+    const matches = events.flatMap((event, eventIndex) =>
+      event.type === type && record(event.data)?.session_dir === sessionDir ? [eventIndex] : [])
+    if (matches.length > 1) {
+      throw new Error(`current Session has duplicate baseline ${phase} Host events`)
+    }
+    const eventIndex = matches[0]
+    if (eventIndex === undefined) {
+      const later = phases.slice(phaseIndex + 1).some((laterPhase) => {
+        const laterType = baselineEventType(laterPhase)
+        return events.some(event =>
+          event.type === laterType && record(event.data)?.session_dir === sessionDir)
+      })
+      if (later) throw new Error('current Session baseline Host events are out of order')
+      return phase
+    }
+    if (eventIndex <= previousIndex) {
+      throw new Error('current Session baseline Host events are out of order')
+    }
+    previousIndex = eventIndex
+  }
+  return undefined
+}
+
+async function currentCanonicalBaselineCommand(
+  ctx: Context,
+  agent: Agent,
+  binding: ExperimentBinding,
+  launch: KersorLaunchContract,
+): Promise<{ readonly phase: BaselinePhase; readonly command: string } | undefined> {
+  let sessionDir: string | undefined
+  if (binding.start.origin === 'created') {
+    const events = agent.session.events.filter(event =>
+      event.type === 'kersor/session-initialized'
+      && event.data.experiment_id === binding.start.experimentId)
+    const eventSessionDir = events.length === 1
+      ? record(events[0]?.data)?.session_dir
+      : undefined
+    sessionDir = typeof eventSessionDir === 'string' ? eventSessionDir : undefined
+  } else {
+    sessionDir = binding.start.authorityIntent?.session_dir
+  }
+  if (typeof sessionDir !== 'string') {
+    throw new Error('current Experiment lacks one Host-authorized KerSor Session')
+  }
+  const authority = await validateSessionAuthority(ctx, agent, binding, sessionDir)
+  const events = authority.authorityAgent.id === agent.id
+    ? authority.authorityEvents
+    : [...authority.authorityEvents, ...agent.session.events]
+  const phase = nextBaselinePhase(events, sessionDir)
+  if (phase === undefined) return undefined
+  const workspace = await canonicalWorkspacePath(workspaceOf(agent))
+  return {
+    phase,
+    command: await canonicalBaselineCommand(phase, sessionDir, workspace, launch),
+  }
 }
 
 function canonicalShellValue(value: string): string | undefined {
@@ -5462,10 +6491,6 @@ async function baselineCommandSpec(
   return undefined
 }
 
-async function isRuntimeControlsCommand(command: string, runDir: string): Promise<boolean> {
-  return command === await canonicalRuntimeControlsCommand(runDir)
-}
-
 function roundSynthesisPathParts(root: string, target: string): string[] | undefined {
   const path = relative(root, target)
   if (path.length === 0 || isAbsolute(path) || path === '..' || path.startsWith(`..${sep}`)) {
@@ -5506,6 +6531,61 @@ function hasRoundSynthesisMutation(command: string): boolean {
     || new RegExp(String.raw`\bopen\s*\([^)]*${artifact}[^)]*,\s*["'][wax+][^"']*["']`, 'i').test(command)
     || new RegExp(String.raw`\b(?:write_text|write_bytes)\s*\([^)]*${artifact}`, 'i').test(command)
     || new RegExp(String.raw`\bos\.(?:remove|unlink|replace|rename)\s*\([^)]*${artifact}`, 'i').test(command)
+}
+
+function routingDecisionPathParts(root: string, target: string): string[] | undefined {
+  const path = relative(root, target)
+  if (path.length === 0 || isAbsolute(path) || path === '..' || path.startsWith(`..${sep}`)) {
+    return undefined
+  }
+  const parts = path.split(sep)
+  return parts.length === 3
+    && parts[0] === '.kersor'
+    && parts[1]?.length !== 0
+    && /^round-[1-9]\d*-routing-decision\.json$/u.test(parts[2] ?? '')
+    ? parts
+    : undefined
+}
+
+async function isRoutingDecisionArtifact(agent: Agent, filePath: string): Promise<boolean> {
+  const workspace = agent.session.header.cwd
+  if (workspace === undefined) return false
+  const lexicalWorkspace = resolve(workspace)
+  const lexicalTarget = isAbsolute(filePath) ? resolve(filePath) : resolve(lexicalWorkspace, filePath)
+  if (routingDecisionPathParts(lexicalWorkspace, lexicalTarget) !== undefined) return true
+  const [realWorkspace, realTarget] = await Promise.all([
+    realpath(lexicalWorkspace).catch(() => undefined),
+    realMutationTarget(lexicalTarget),
+  ])
+  return realWorkspace !== undefined && realTarget !== undefined
+    && routingDecisionPathParts(realWorkspace, realTarget) !== undefined
+}
+
+async function isExactSelectionDecisionTarget(
+  agent: Agent,
+  filePath: string,
+  expected: string,
+): Promise<boolean> {
+  const workspace = agent.session.header.cwd
+  if (workspace === undefined) return false
+  const lexical = isAbsolute(filePath) ? resolve(filePath) : resolve(workspace, filePath)
+  if (lexical !== expected) return false
+  return await realMutationTarget(lexical) === expected
+}
+
+function hasRoutingDecisionMutation(command: string): boolean {
+  const artifact = String.raw`round-[1-9]\d*-routing-decision\.json`
+  if (!new RegExp(artifact, 'iu').test(command)) return false
+  return new RegExp(String.raw`(?:>|>>|>\|)\s*[^\n;|&]*${artifact}`, 'iu').test(command)
+    || new RegExp(String.raw`\b(?:tee|cp|mv|rm|install)\b[^\n;|&]*${artifact}`, 'iu').test(command)
+    || new RegExp(String.raw`\bopen\s*\([^)]*${artifact}[^)]*,\s*["'][wax+][^"']*["']`, 'iu').test(command)
+    || new RegExp(String.raw`\b(?:write_text|write_bytes)\s*\([^)]*${artifact}`, 'iu').test(command)
+    || new RegExp(String.raw`\bos\.(?:remove|unlink|replace|rename)\s*\([^)]*${artifact}`, 'iu').test(command)
+}
+
+function manuallyRunsSelectionProtocol(command: string): boolean {
+  return /\b(?:select-workflow\.sh|selection-handoff\.py|finalize-selection\.sh)\b/iu.test(command)
+    || /\bkersor-router\.py\b[^\n;|&]*\bfinalize\b/iu.test(command)
 }
 
 function manuallyAdvancesRound(command: string): boolean {
@@ -5574,6 +6654,23 @@ function reportAsync(ctx: Context, operation: Promise<void>): void {
   })
 }
 
+function dispatchRuntimeAuthority(
+  authority: SessionInitializationBinding,
+  sessionDir: string,
+): { readonly kersorPython: string; readonly kersorRoot: string } {
+  const initialized = authority.authorityEvents.filter(event =>
+    event.type === 'kersor/session-initialized'
+    && event.data.session_dir === sessionDir)
+  const event = initialized[0]
+  if (initialized.length !== 1 || event?.type !== 'kersor/session-initialized') {
+    throw new Error('dispatch transform lacks one frozen Session initialization authority')
+  }
+  return {
+    kersorPython: event.data.kersor_python.path,
+    kersorRoot: dirname(dirname(event.data.adapter.path)),
+  }
+}
+
 async function beginDispatchProducer(
   ctx: Context,
   agent: Agent,
@@ -5590,6 +6687,7 @@ async function beginDispatchProducer(
     return 'dispatch producer SESSION_DIR does not own its exact RUN_DIR'
   }
   const baseline = await validateBaselineCustody(ctx, agent, sessionDir, launch)
+  const runtime = dispatchRuntimeAuthority(baseline.sessionAuthority, sessionDir)
   const producerCallIndex = agent.session.events.findIndex(event =>
     event.type === 'tool/call' && event.data.name === 'subagent'
     && event.data.callId === callId)
@@ -5611,10 +6709,13 @@ async function beginDispatchProducer(
   hostGate.producerCalls.set(callId, {
     controller: agent,
     callId,
+    workspace: baseline.authority.workspace,
     sessionDir,
     runDir,
     round,
     workflowName: spec.workflowName,
+    kersorRoot: runtime.kersorRoot,
+    kersorPython: runtime.kersorPython,
     successfulWrites: new Set<string>(),
   })
   return undefined
@@ -5624,7 +6725,8 @@ async function finishDispatchProducer(
   ctx: Context,
   state: DispatchProducerState,
   resultValue: unknown,
-): Promise<UserMessage> {
+  signal: AbortSignal,
+): Promise<void> {
   const result = record(resultValue)
   if (result?.kind !== 'foreground' || typeof result.runId !== 'string'
     || state.producerSessionId !== result.runId) {
@@ -5669,29 +6771,10 @@ async function finishDispatchProducer(
       join(state.runDir, 'dispatch-args-provenance.json'), 'dispatch-args-provenance.json',
     ),
   }
-  const transformationContext = await dispatchTransformationContext(receipt)
   await atomicHostReceipt(join(state.runDir, DISPATCH_PRODUCER_RECEIPT), receipt)
   state.controller.session.append('kersor/dispatch-args-produced', receipt)
   await ctx.sessions.flush(state.controller.session)
-  return transformationContext
-}
-
-async function dispatchTransformationContext(
-  producer: KersorDispatchArgsProducedEventData,
-): Promise<UserMessage> {
-  return createUserMessage({
-    content: [{
-      type: 'text',
-      text: [
-        'KERSOR_DISPATCH_TRANSFORM_COMMAND_V1',
-        `Host durable producer binding: run_dir=${producer.run_dir}; producer_call_id=${producer.producer_call_id}.`,
-        'Execute the following exact single Bash command once, verbatim:',
-        await canonicalRuntimeControlsCommand(producer.run_dir),
-        'Do not add flags, variables, redirections, prefixes, or suffixes. Do not inspect the injector, probe alternate syntax, or retry after any rejection or failure.',
-      ].join('\n'),
-    }],
-    source: { kind: 'plugin', plugin: 'kersor' },
-  })
+  await transformDispatchArgs(ctx, state, receipt, signal)
 }
 
 function topLevelChangedFields(
@@ -5710,119 +6793,98 @@ const RUNTIME_ARGS_FIELDS = new Set([
 ])
 const RUNTIME_PROVENANCE_FIELDS = new Set(['runtime_controls', 'benchmark_gpu_lease'])
 
-async function beginDispatchTransformation(
-  agent: Agent,
-  callId: string,
-  command: string,
-  hostGate: WorkflowHostGateState,
-): Promise<string | undefined> {
-  if (!command.includes('inject-runtime-controls.py')) return undefined
-  const produced = agent.session.events
-    .filter((event): event is Extract<SessionEvent, { type: 'kersor/dispatch-args-produced' }> =>
-      event.type === 'kersor/dispatch-args-produced')
-  const matching: typeof produced = []
-  for (const event of produced) {
-    if (await isRuntimeControlsCommand(command, event.data.run_dir)) matching.push(event)
-  }
-  if (matching.length !== 1) {
-    const transformedRuns = new Set(agent.session.events.flatMap(event =>
-      event.type === 'kersor/dispatch-args-transformed' ? [event.data.run_dir] : []))
-    const pending = produced.filter(event => !transformedRuns.has(event.data.run_dir))
-    const producer = pending.length === 1 ? pending[0]?.data : undefined
-    if (producer !== undefined) {
-      return [
-        'runtime-control injection command does not match the unique pending Host producer event.',
-        `Bound run_dir=${producer.run_dir}; producer_call_id=${producer.producer_call_id}.`,
-        `Required exact command: ${await canonicalRuntimeControlsCommand(producer.run_dir)}`,
-        'Do not retry this transform call after the Host rejection.',
-      ].join(' ')
-    }
-    return 'runtime-control injection must identify one Host-produced dispatch run'
-  }
-  const matchingProducer = matching[0]
-  if (matchingProducer === undefined) return 'runtime-control injection lost its producer event'
-  const producer = matchingProducer.data
-  if (!await isRuntimeControlsCommand(command, producer.run_dir)) {
-    return `runtime-control injection command is not the exact single deterministic injector invocation. Required: ${await canonicalRuntimeControlsCommand(producer.run_dir)}`
-  }
-  const priorCalls = await durableDispatchTransformationCallIds(agent, producer.run_dir)
-  if (priorCalls.length !== 1 || priorCalls[0] !== callId) {
-    return 'runtime-control injection is exact-once for this dispatch run'
-  }
+async function transformDispatchArgs(
+  ctx: Context,
+  state: DispatchProducerState,
+  producer: KersorDispatchArgsProducedEventData,
+  signal: AbortSignal,
+): Promise<void> {
   const receiptPath = join(producer.run_dir, DISPATCH_PRODUCER_RECEIPT)
   const receiptBytes = await readBoundedRegularFile(
     receiptPath, MAX_DSH_DISPATCH_RECEIPT_BYTES, DISPATCH_PRODUCER_RECEIPT,
   )
-  const receipt = JSON.parse(receiptBytes.toString('utf8')) as unknown
-  if (!isDeepStrictEqual(receipt, producer)) return 'producer receipt differs from the durable Host producer event'
+  const persistedProducer = JSON.parse(receiptBytes.toString('utf8')) as unknown
+  if (!isDeepStrictEqual(persistedProducer, producer)) {
+    throw new Error('producer receipt differs from the durable Host producer event')
+  }
   const currentArgs = await dispatchFileBinding(producer.dispatch_args.path, 'dispatch-args.json')
   const currentProvenance = await dispatchFileBinding(
     producer.dispatch_args_provenance.path, 'dispatch-args-provenance.json',
   )
   if (!isDeepStrictEqual(currentArgs, producer.dispatch_args)
     || !isDeepStrictEqual(currentProvenance, producer.dispatch_args_provenance)) {
-    return 'runtime-control injection input differs from the Host producer bytes'
+    throw new Error('runtime-control injection input differs from the Host producer bytes')
   }
   if (await pathExists(join(producer.run_dir, DISPATCH_TRANSFORMATION_RECEIPT))) {
-    return 'dispatch transformation receipt already exists'
+    throw new Error('dispatch transformation receipt already exists')
   }
-  hostGate.transformationCalls.set(callId, {
-    controller: agent,
-    callId,
-    sessionDir: producer.session_dir,
-    runDir: producer.run_dir,
-    producer,
-    producerReceiptPath: receiptPath,
-    producerReceiptSha256: createHash('sha256').update(receiptBytes).digest('hex'),
-    beforeArgs: await readBoundedJsonObject(
-      producer.dispatch_args.path, MAX_DSH_DISPATCH_ARGS_BYTES, 'dispatch-args.json',
-    ),
-    beforeProvenance: await readBoundedJsonObject(
-      producer.dispatch_args_provenance.path, MAX_DSH_DISPATCH_ARGS_BYTES,
-      'dispatch-args-provenance.json',
-    ),
-  })
-  return undefined
-}
-
-async function finishDispatchTransformation(
-  ctx: Context,
-  state: DispatchTransformationState,
-): Promise<void> {
-  const afterArgs = await readBoundedJsonObject(
-    state.producer.dispatch_args.path, MAX_DSH_DISPATCH_ARGS_BYTES, 'dispatch-args.json',
+  const beforeArgs = await readBoundedJsonObject(
+    producer.dispatch_args.path, MAX_DSH_DISPATCH_ARGS_BYTES, 'dispatch-args.json',
   )
-  const afterProvenance = await readBoundedJsonObject(
-    state.producer.dispatch_args_provenance.path, MAX_DSH_DISPATCH_ARGS_BYTES,
+  const beforeProvenance = await readBoundedJsonObject(
+    producer.dispatch_args_provenance.path, MAX_DSH_DISPATCH_ARGS_BYTES,
     'dispatch-args-provenance.json',
   )
-  const argsFields = topLevelChangedFields(state.beforeArgs, afterArgs)
-  const provenanceFields = topLevelChangedFields(state.beforeProvenance, afterProvenance)
+  const injector = await realpath(join(
+    state.kersorRoot, 'scripts', 'inject-runtime-controls.py',
+  ))
+  const handle = ctx.subprocess.spawn({
+    argv: [state.kersorPython, injector, producer.run_dir],
+    cwd: state.workspace,
+    env: { KERSOR_PYTHON: state.kersorPython, KERSOR_ROOT: state.kersorRoot },
+    stdio: {
+      stdin: 'ignore',
+      stdout: { maxBytes: DISPATCH_TRANSFORM_OUTPUT_BYTES },
+      stderr: { maxBytes: DISPATCH_TRANSFORM_OUTPUT_BYTES },
+    },
+    graceMs: DISPATCH_TRANSFORM_GRACE_MS,
+    signal,
+  })
+  const outcome = await handle.done
+  await handle.waitForExit()
+  if (outcome.exitCode !== 0 || outcome.signal !== null) {
+    const stderr = handle.collected.stderr?.readFrom(0).text.trim()
+    throw new Error(
+      `inject-runtime-controls failed with ${outcome.signal ?? `exit ${String(outcome.exitCode)}`}${stderr ? `: ${stderr}` : ''}`,
+    )
+  }
+  const afterArgs = await readBoundedJsonObject(
+    producer.dispatch_args.path, MAX_DSH_DISPATCH_ARGS_BYTES, 'dispatch-args.json',
+  )
+  const afterProvenance = await readBoundedJsonObject(
+    producer.dispatch_args_provenance.path, MAX_DSH_DISPATCH_ARGS_BYTES,
+    'dispatch-args-provenance.json',
+  )
+  const argsFields = topLevelChangedFields(beforeArgs, afterArgs)
+  const provenanceFields = topLevelChangedFields(beforeProvenance, afterProvenance)
   if (argsFields.some(field => !RUNTIME_ARGS_FIELDS.has(field))
     || provenanceFields.some(field => !RUNTIME_PROVENANCE_FIELDS.has(field))) {
     throw new Error('inject-runtime-controls changed a field outside its deterministic allowlist')
   }
-  const outputArgs = await dispatchFileBinding(state.producer.dispatch_args.path, 'dispatch-args.json')
+  const outputArgs = await dispatchFileBinding(producer.dispatch_args.path, 'dispatch-args.json')
   const outputProvenance = await dispatchFileBinding(
-    state.producer.dispatch_args_provenance.path, 'dispatch-args-provenance.json',
+    producer.dispatch_args_provenance.path, 'dispatch-args-provenance.json',
   )
-  const changed = !isDeepStrictEqual(outputArgs, state.producer.dispatch_args)
-    || !isDeepStrictEqual(outputProvenance, state.producer.dispatch_args_provenance)
+  const changed = !isDeepStrictEqual(outputArgs, producer.dispatch_args)
+    || !isDeepStrictEqual(outputProvenance, producer.dispatch_args_provenance)
   const receipt: KersorDispatchArgsTransformedEventData = {
     schema_version: 1,
     contract: 'dsh_dispatch_args_transformation_v1',
     authority: 'dsh_host',
     transformer: 'inject-runtime-controls',
-    session_dir: state.sessionDir,
-    run_dir: state.runDir,
-    round: state.producer.round,
-    workflow_name: state.producer.workflow_name,
+    session_dir: producer.session_dir,
+    run_dir: producer.run_dir,
+    round: producer.round,
+    workflow_name: producer.workflow_name,
     controller_session_id: state.controller.id,
-    transformation_call_id: state.callId,
-    producer_receipt: { path: state.producerReceiptPath, sha256: state.producerReceiptSha256 },
+    transformation_call_id: producer.producer_call_id,
+    producer_receipt: {
+      path: receiptPath,
+      sha256: createHash('sha256').update(receiptBytes).digest('hex'),
+    },
     input: {
-      dispatch_args: state.producer.dispatch_args,
-      dispatch_args_provenance: state.producer.dispatch_args_provenance,
+      dispatch_args: producer.dispatch_args,
+      dispatch_args_provenance: producer.dispatch_args_provenance,
     },
     output: { dispatch_args: outputArgs, dispatch_args_provenance: outputProvenance },
     changed,
@@ -5831,7 +6893,7 @@ async function finishDispatchTransformation(
       dispatch_args_provenance: provenanceFields,
     },
   }
-  await atomicHostReceipt(join(state.runDir, DISPATCH_TRANSFORMATION_RECEIPT), receipt)
+  await atomicHostReceipt(join(producer.run_dir, DISPATCH_TRANSFORMATION_RECEIPT), receipt)
   state.controller.session.append('kersor/dispatch-args-transformed', receipt)
   await ctx.sessions.flush(state.controller.session)
 }
@@ -5936,6 +6998,7 @@ async function validateBaselineCustody(
   readonly executions: readonly KersorBaselineExecutionEventData[]
   readonly verifiedEventIndex: number
   readonly stateSessionId: string
+  readonly sessionAuthority: SessionInitializationBinding
 }> {
   if (launch === undefined) {
     throw new Error('baseline Host custody requires the immutable typed launch contract')
@@ -6013,6 +7076,7 @@ async function validateBaselineCustody(
     stateSessionId: binding.start.origin === 'created'
       ? agent.id
       : String(sessionAuthority.data.source_controller_session_id),
+    sessionAuthority,
   }
 }
 
@@ -6034,7 +7098,11 @@ async function beginBaselineWitness(
   const workspace = await realpath(resolve(cwd))
   const spec = await baselineCommandSpec(command, workspace, launch)
   if (spec === undefined) {
-    return 'baseline init/record/verify must use one exact canonical Host-authorized command'
+    const next = await currentCanonicalBaselineCommand(ctx, agent, binding, launch)
+    if (next === undefined) {
+      return 'baseline init/record/verify must use one exact canonical Host-authorized command; the current Session baseline is already complete'
+    }
+    return `Baseline command is not byte-exact. Current Session next baseline phase is ${baselineCommandName(next.phase)}. Required exact command: ${next.command}`
   }
   const initialization = await validateSessionAuthority(
     ctx, agent, binding, spec.sessionDir,
@@ -6149,6 +7217,39 @@ async function finishBaselineWitness(
   await ctx.sessions.flush(state.controller.session)
 }
 
+function failedBaselineBashFeedback(
+  state: BaselineCallState,
+  value: JsonValue,
+): ContentBlock[] | undefined {
+  const outcome = record(value)
+  if (outcome?.kind !== 'foreground') return undefined
+  const clean = outcome.exitCode === 0 && outcome.signal === null
+    && outcome.timedOut === false && outcome.aborted === false
+  if (clean) return undefined
+  const stderr = record(outcome.stderr)
+  const stderrText = typeof stderr?.text === 'string' && stderr.text.length > 0
+    ? stderr.text
+    : '<empty>'
+  const truncation = stderr?.truncated === true ? ' (truncated by Bash)' : ''
+  const status = [
+    typeof outcome.exitCode === 'number' && Number.isSafeInteger(outcome.exitCode)
+      ? `exit code ${outcome.exitCode}`
+      : 'exit code unavailable',
+    typeof outcome.signal === 'string' ? `signal ${outcome.signal}` : undefined,
+    outcome.timedOut === true ? 'timed out' : undefined,
+    outcome.aborted === true ? 'aborted' : undefined,
+  ].filter((item): item is string => item !== undefined).join(', ')
+  return [{
+    type: 'text',
+    text: [
+      `Baseline ${baselineCommandName(state.phase)} Bash did not exit cleanly: ${status}.`,
+      `stderr${truncation}:`,
+      stderrText,
+      'This exact-once baseline phase is consumed; do not retry it or create or repair its authority artifacts manually.',
+    ].join('\n'),
+  }]
+}
+
 async function beginCandidateOwnershipSeal(
   agent: Agent,
   callId: string,
@@ -6231,19 +7332,19 @@ export function apply(ctx: Context): void {
   const workflowHostGate: WorkflowHostGateState = {
     authorizedNativeCallIds: new Set<string>(),
     consumedRuns: new Set<string>(),
+    selectionChildren: new Map<string, SelectionChildState>(),
     producerCalls: new Map<string, DispatchProducerState>(),
     producerChildren: new Map<string, DispatchProducerState>(),
-    transformationCalls: new Map<string, DispatchTransformationState>(),
     candidateSealCalls: new Map<string, CandidateSealState>(),
     baselineCalls: new Map<string, BaselineCallState>(),
-    authorSealCalls: new WeakMap<ToolExecution, AuthorSealCallState>(),
-    consumedAuthorSaves: new Set<string>(),
     setupCalls: new WeakMap<ToolExecution, SessionSetupCallState>(),
     activeExperiments: new Set<string>(),
   }
   ctx.tools.register(createStart(ctx))
   ctx.tools.register(createAttach(ctx))
   ctx.tools.register(createResume(ctx))
+  ctx.tools.register(createKersorProtocol(ctx, workflowHostGate))
+  ctx.tools.register(createAuthorCommit(ctx))
   ctx.tools.register(createSealedWorkflow(ctx, workflowHostGate))
   ctx.on('bash/sandbox-escalation', (exec, escalation) => {
     const setup = workflowHostGate.setupCalls.get(exec)
@@ -6251,7 +7352,6 @@ export function apply(ctx: Context): void {
   })
   ctx.on('tools/result', (exec) => {
     workflowHostGate.setupCalls.delete(exec)
-    workflowHostGate.authorSealCalls.delete(exec)
   })
   const forbiddenControllerTools = new Set([
     'kersor_start', 'kersor_attach', 'kersor_resume',
@@ -6304,17 +7404,11 @@ export function apply(ctx: Context): void {
       }
     }
     let authorAuthority: AuthorAuthority | undefined
-    let authorCommand: CanonicalAuthorCommandKind | undefined
     let acceptedNonAuthorHostBashGate = false
     if (experimentAncestry !== undefined
       && (exec.name === 'bash' || authorPathTools.has(exec.name))) {
       try {
         authorAuthority = await authorAuthorityForAgent(ctx, agent)
-        if (exec.name === 'bash' && authorAuthority !== undefined) {
-          authorCommand = canonicalAuthorCommandKind(
-            exec.arguments, canonicalAuthorCommands(authorAuthority),
-          )
-        }
       } catch (error: unknown) {
         return {
           kind: 'deny' as const,
@@ -6339,9 +7433,30 @@ export function apply(ctx: Context): void {
         if (await authorPathToolTargetsStaging(
           authorAuthority, agent, exec.name, exec.arguments,
         )) {
-          return {
-            kind: 'deny' as const,
-            reason: 'The direct KerSor controller may not inspect or mutate author staging; only the foreground author may self-check before the Host seal.',
+          const seal = authorSealEvent(authorAuthority)
+          const filePath = filePathArgument(exec.arguments)
+          const exactSealedRead = seal !== undefined && exec.name === 'read'
+            && authorSaveEvents(authorAuthority).length === 0
+            && filePath !== undefined
+            && AUTHOR_STAGING_FILES.some(name =>
+              filePath === join(authorAuthority.stagingDir, name))
+          let currentSeal = false
+          if (exactSealedRead) {
+            try {
+              currentSeal = isDeepStrictEqual(
+                await authorHandoffReceipt(authorAuthority), seal.data.handoff,
+              )
+            } catch {
+              currentSeal = false
+            }
+          }
+          if (!exactSealedRead || !currentSeal) {
+            return {
+              kind: 'deny' as const,
+              reason: seal === undefined
+                ? 'The direct KerSor controller may not inspect or mutate author staging before the Host seal; only the foreground author may self-check.'
+                : 'Sealed author staging is immutable; the direct controller may only read one exact sealed file for semantic review.',
+            }
           }
         }
       }
@@ -6361,41 +7476,13 @@ export function apply(ctx: Context): void {
       }
       if (exec.name === 'bash') {
         const command = bashCommand(exec.arguments)
-        if (command !== undefined && authorCommand === 'seal') {
-          if (authorAuthority === undefined) {
-            return {
-              kind: 'deny' as const,
-              reason: 'author handoff sealing requires one Host-initialized authoring Session',
-            }
-          }
-          try {
-            const reason = await beginAuthorHandoffSeal(
-              authorAuthority, exec, command, workflowHostGate,
-            )
-            if (reason !== undefined) return { kind: 'deny' as const, reason }
-          } catch (error: unknown) {
-            return {
-              kind: 'deny' as const,
-              reason: `author handoff custody failed closed: ${error instanceof Error ? error.message : String(error)}`,
-            }
-          }
-        } else if (command !== undefined && authorCommand === 'save') {
-          if (authorAuthority === undefined) {
-            return {
-              kind: 'deny' as const,
-              reason: 'authored Proposal save requires one Host-initialized authoring Session',
-            }
-          }
-          try {
-            const reason = await beginAuthorSaveAttempt(
-              ctx, authorAuthority, exec.callId, command, exec.arguments, workflowHostGate,
-            )
-            if (reason !== undefined) return { kind: 'deny' as const, reason }
-          } catch (error: unknown) {
-            return {
-              kind: 'deny' as const,
-              reason: `authored Proposal save custody failed closed: ${error instanceof Error ? error.message : String(error)}`,
-            }
+        if (command !== undefined && authorAuthority !== undefined
+          && await authorBashEnvelopeTargetsStaging(
+            exec.arguments, authorAuthority, agent,
+          )) {
+          return {
+            kind: 'deny' as const,
+            reason: 'The direct KerSor controller may not execute Bash from author staging; omit workdir or use a canonical directory outside staging.',
           }
         } else if (command !== undefined && command.includes('setup-session.sh')) {
           try {
@@ -6436,23 +7523,10 @@ export function apply(ctx: Context): void {
               reason: `candidate ownership seal custody failed closed: ${error instanceof Error ? error.message : String(error)}`,
             }
           }
-        } else if (command !== undefined && command.includes('inject-runtime-controls.py')) {
-          try {
-            const reason = await beginDispatchTransformation(
-              agent, exec.callId, command, workflowHostGate,
-            )
-            if (reason !== undefined) return { kind: 'deny' as const, reason }
-            acceptedNonAuthorHostBashGate = true
-          } catch (error: unknown) {
-            return {
-              kind: 'deny' as const,
-              reason: `dispatch transformation custody failed closed: ${error instanceof Error ? error.message : String(error)}`,
-            }
-          }
         } else if (command !== undefined && hasDispatchArtifactMutation(command)) {
           return {
             kind: 'deny' as const,
-            reason: 'The direct KerSor controller may not shell-mutate dispatch args, provenance, or Host receipts; use the foreground producer and authorized runtime-control pass.',
+            reason: 'The direct KerSor controller may not shell-mutate dispatch args, provenance, or Host receipts; use the foreground producer and Host-owned runtime-control pass.',
           }
         } else if (command !== undefined && hasBaselineAuthorityMutation(command)) {
           return {
@@ -6518,10 +7592,16 @@ export function apply(ctx: Context): void {
     if (exec.name === 'bash' && experimentDescendant) {
       const command = bashCommand(exec.arguments)
       if (command !== undefined) {
-        if (owned === undefined && authorCommand !== undefined) {
+        if (manuallyRunsSelectionProtocol(command)) {
           return {
             kind: 'deny' as const,
-            reason: 'Only the direct KerSor controller may execute Host-authorized author seal and save commands.',
+            reason: 'KerSor descendants must run selection only through kersor_protocol action select_workflow; the Host owns filtering, the optional selector, and finalization.',
+          }
+        }
+        if (hasRoutingDecisionMutation(command)) {
+          return {
+            kind: 'deny' as const,
+            reason: 'KerSor descendants may not shell-mutate the routing decision; only the active Host-started strategy-selector may write it.',
           }
         }
         if (owned === undefined && authorAuthority !== undefined
@@ -6558,12 +7638,6 @@ export function apply(ctx: Context): void {
             reason: 'Only the direct KerSor controller may execute the Host-authorized candidate seal.',
           }
         }
-        if (owned === undefined && command.includes('inject-runtime-controls.py')) {
-          return {
-            kind: 'deny' as const,
-            reason: 'Only the direct KerSor controller may execute the exact Host-authorized runtime-control injector.',
-          }
-        }
         if (hasDispatchArtifactMutation(command)) {
           return {
             kind: 'deny' as const,
@@ -6593,13 +7667,14 @@ export function apply(ctx: Context): void {
       }
     }
     if (exec.name === 'bash' && owned !== undefined && authorAuthority !== undefined
-      && authorCommand === undefined && !acceptedNonAuthorHostBashGate) {
+      && !acceptedNonAuthorHostBashGate) {
       const command = bashCommand(exec.arguments)
       if (command !== undefined
+        && !await isTrustedKersorHelperInvocation(exec.arguments, authorAuthority)
         && await bashTouchesAuthorStaging(exec.arguments, authorAuthority, agent)) {
         return {
           kind: 'deny' as const,
-          reason: 'The direct KerSor controller may not inspect or mutate author staging; its first staging action is the exact Host-authorized seal.',
+          reason: 'The direct KerSor controller may not inspect or mutate author staging through Bash; use the typed Host author commit.',
         }
       }
     }
@@ -6615,9 +7690,35 @@ export function apply(ctx: Context): void {
         }
       }
     }
+    const selectionChild = workflowHostGate.selectionChildren.get(agent.id)
+    if (selectionChild !== undefined && authorPathTools.has(exec.name)
+      && exec.name !== 'read' && exec.name !== 'glob' && exec.name !== 'grep') {
+      const filePath = filePathArgument(exec.arguments)
+      if (exec.name !== 'write' || filePath === undefined
+        || !await isExactSelectionDecisionTarget(
+          agent, filePath, selectionChild.decisionPath,
+        )) {
+        return {
+          kind: 'deny' as const,
+          reason: 'The active strategy-selector may write only its exact canonical routing-decision.json.',
+        }
+      }
+      if (selectionChild.successfulWrite) {
+        return {
+          kind: 'deny' as const,
+          reason: 'The active strategy-selector may write its routing decision exactly once.',
+        }
+      }
+    }
     if ((exec.name === 'write' || exec.name === 'edit') && experimentDescendant) {
       const filePath = filePathArgument(exec.arguments)
       if (filePath !== undefined) {
+        if (selectionChild === undefined && await isRoutingDecisionArtifact(agent, filePath)) {
+          return {
+            kind: 'deny' as const,
+            reason: 'Only the active Host-started strategy-selector may create the canonical routing decision.',
+          }
+        }
         if (await baselineArtifact(agent, filePath) !== undefined) {
           return {
             kind: 'deny' as const,
@@ -6671,6 +7772,17 @@ export function apply(ctx: Context): void {
     const decision = await next()
     if (exec.agent !== undefined && exec.name === 'write'
       && decision.kind === 'accept' && !result.isError) {
+      const selection = workflowHostGate.selectionChildren.get(exec.agent.id)
+      const filePath = filePathArgument(exec.arguments)
+      if (selection !== undefined && filePath !== undefined
+        && await isExactSelectionDecisionTarget(
+          exec.agent, filePath, selection.decisionPath,
+        )) {
+        selection.successfulWrite = true
+      }
+    }
+    if (exec.agent !== undefined && exec.name === 'write'
+      && decision.kind === 'accept' && !result.isError) {
       const state = workflowHostGate.producerChildren.get(exec.agent.id)
       const filePath = filePathArgument(exec.arguments)
       if (state !== undefined && filePath !== undefined) {
@@ -6680,38 +7792,12 @@ export function apply(ctx: Context): void {
         }
       }
     }
-    const authorSealState = workflowHostGate.authorSealCalls.get(exec)
-    if (authorSealState !== undefined) {
-      try {
-        if (decision.kind !== 'accept' || result.isError) return decision
-        await finishAuthorHandoffSeal(ctx, authorSealState)
-        return decision
-      } catch (error: unknown) {
-        return {
-          kind: 'block' as const,
-          feedback: [{
-            type: 'text' as const,
-            text: `Author handoff custody failed: ${error instanceof Error ? error.message : String(error)}. This exact-once seal attempt is consumed; do not inspect, edit, or re-seal author staging.`,
-          }],
-        }
-      } finally {
-        workflowHostGate.authorSealCalls.delete(exec)
-      }
-    }
     const producerState = workflowHostGate.producerCalls.get(exec.callId)
     if (producerState !== undefined) {
       try {
         if (decision.kind !== 'accept' || result.isError) return decision
-        const transformationContext = await finishDispatchProducer(
-          ctx, producerState, result.value,
-        )
-        return {
-          ...decision,
-          additionalContexts: [
-            ...decision.additionalContexts ?? [],
-            transformationContext,
-          ],
-        }
+        await finishDispatchProducer(ctx, producerState, result.value, exec.signal)
+        return decision
       } catch (error: unknown) {
         return {
           kind: 'block' as const,
@@ -6745,24 +7831,6 @@ export function apply(ctx: Context): void {
         workflowHostGate.setupCalls.delete(exec)
       }
     }
-    const transformationState = workflowHostGate.transformationCalls.get(exec.callId)
-    if (transformationState !== undefined) {
-      try {
-        if (decision.kind !== 'accept' || result.isError) return decision
-        await finishDispatchTransformation(ctx, transformationState)
-        return decision
-      } catch (error: unknown) {
-        return {
-          kind: 'block' as const,
-          feedback: [{
-            type: 'text' as const,
-            text: `Dispatch runtime-control custody failed: ${error instanceof Error ? error.message : String(error)}. Do not mutate or re-seal the dispatch package manually.`,
-          }],
-        }
-      } finally {
-        workflowHostGate.transformationCalls.delete(exec.callId)
-      }
-    }
     const candidateSealState = workflowHostGate.candidateSealCalls.get(exec.callId)
     if (candidateSealState !== undefined) {
       try {
@@ -6785,6 +7853,10 @@ export function apply(ctx: Context): void {
     if (baselineState !== undefined) {
       try {
         if (decision.kind !== 'accept' || result.isError) return decision
+        const failure = failedBaselineBashFeedback(baselineState, result.value)
+        if (failure !== undefined) {
+          return { kind: 'block' as const, feedback: failure }
+        }
         await finishBaselineWitness(ctx, baselineState)
         return decision
       } catch (error: unknown) {

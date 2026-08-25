@@ -11,11 +11,6 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { InvariantFailure, InvariantInstaller } from '@deepseek-ai/dsh-invariants'
 import {
-  canonicalAuthorHandoffSealCommand,
-  canonicalAuthorSaveCommand,
-  hostCanonicalAuthorToolArguments,
-} from './author-tool-commands.ts'
-import {
   canonicalKersorJson,
   parseKersorLaunchContract,
   type KersorLaunchContract,
@@ -46,7 +41,10 @@ type BaselineTrace = Map<string, {
   verified?: Record<string, unknown>
 }>
 type AuthorTrace = Map<string, {
-  readonly seal: Record<string, unknown>
+  readonly produced: Record<string, unknown>
+  readonly producedSeq: number
+  seal?: Record<string, unknown>
+  sealSeq?: number
   saveAttempted?: Record<string, unknown>
 }>
 interface SessionAuthorityTrace {
@@ -115,15 +113,18 @@ const CANDIDATE_SEAL_KEYS = Object.freeze([
   'schema_version', 'contract', 'authority', 'session_dir', 'run_dir', 'round',
   'controller_session_id', 'seal_call_id', 'seal', 'state',
 ])
+const AUTHOR_PRODUCED_KEYS = Object.freeze([
+  'schema_version', 'contract', 'authority', 'session_dir', 'controller_session_id',
+  'author_call_id', 'author_session_id', 'author_context',
+])
 const AUTHOR_SEAL_KEYS = Object.freeze([
   'schema_version', 'contract', 'authority', 'session_dir', 'controller_session_id',
-  'seal_call_id', 'seal_command', 'staging_dir', 'handoff', 'files',
+  'author_call_id', 'author_session_id', 'seal_call_id', 'handoff',
 ])
 const AUTHOR_SAVE_KEYS = Object.freeze([
   'schema_version', 'contract', 'authority', 'session_dir', 'controller_session_id',
-  'save_call_id', 'save_command', 'seal_call_id', 'staging_dir', 'handoff', 'files',
+  'save_call_id', 'seal_call_id', 'handoff',
 ])
-const AUTHOR_FILES = Object.freeze(['workflow.js', 'metadata.json', 'rationale.md'])
 const BASELINE_COMMON_KEYS = Object.freeze([
   'schema_version', 'contract', 'authority', 'launch', 'workspace', 'session_dir',
   'controller_session_id', 'call_id', 'session_config', 'task_dir', 'kernel',
@@ -432,28 +433,34 @@ function requirePrecedingBashCall(
   }
 }
 
-function requirePrecedingAuthorBashCall(
+function requirePrecedingAuthorActionCall(
   session: Session,
   event: SessionEvent,
   callId: string,
-  command: string,
+  toolName: 'kersor_protocol' | 'kersor_author_commit',
+  action: 'author' | 'seal' | 'save',
+  afterSeq: number,
   fail: InvariantFailure,
 ): void {
   const calls = session.events.filter(
     (candidate): candidate is Extract<SessionEvent, { type: 'tool/call' }> =>
       candidate.seq < event.seq
+      && candidate.seq > afterSeq
       && candidate.type === 'tool/call'
-      && candidate.data.name === 'bash',
+      && candidate.data.name === toolName,
   )
-  const canonical = calls.filter((call) => {
+  const matching = calls.filter((call) => {
     try {
-      return hostCanonicalAuthorToolArguments(JSON.parse(call.data.arguments), command)
+      const args = JSON.parse(call.data.arguments) as unknown
+      return args !== null && typeof args === 'object' && !Array.isArray(args)
+        && Object.keys(args).length === 1
+        && (args as Record<string, unknown>).action === action
     } catch {
       return false
     }
   })
-  if (canonical.length !== 1 || canonical[0]?.data.callId !== callId) {
-    fail(`${event.type} call identity must bind the first and only preceding canonical Bash envelope`)
+  if (matching.length !== 1 || matching[0]?.data.callId !== callId) {
+    fail(`${event.type} call identity must bind the first and only preceding ${toolName} ${action} action`)
   }
 }
 
@@ -1082,22 +1089,9 @@ function isBaselineEvent(event: SessionEvent): boolean {
 }
 
 function isAuthorEvent(event: SessionEvent): boolean {
-  return event.type === 'kersor/author-handoff-sealed'
+  return event.type === 'kersor/author-produced'
+    || event.type === 'kersor/author-handoff-sealed'
     || event.type === 'kersor/author-save-attempted'
-}
-
-function authorFileBindings(
-  value: unknown,
-  stagingDir: string,
-  label: string,
-  fail: InvariantFailure,
-): Record<string, unknown> {
-  const files = object(value, `${label} files`, fail)
-  exactKeys(files, AUTHOR_FILES, `${label} files`, fail)
-  for (const name of AUTHOR_FILES) {
-    fileBinding(files[name], join(stagingDir, name), `${label} ${name}`, fail)
-  }
-  return files
 }
 
 function applyAuthorEvent(
@@ -1109,11 +1103,17 @@ function applyAuthorEvent(
   fail: InvariantFailure,
 ): void {
   const data = record(event, fail)
+  const produced = event.type === 'kersor/author-produced'
   const sealed = event.type === 'kersor/author-handoff-sealed'
-  exactKeys(data, sealed ? AUTHOR_SEAL_KEYS : AUTHOR_SAVE_KEYS, event.type, fail)
-  const expectedContract = sealed
-    ? 'dsh_author_handoff_seal_v1'
-    : 'dsh_author_save_attempt_v1'
+  exactKeys(
+    data,
+    produced ? AUTHOR_PRODUCED_KEYS : sealed ? AUTHOR_SEAL_KEYS : AUTHOR_SAVE_KEYS,
+    event.type,
+    fail,
+  )
+  const expectedContract = produced
+    ? 'dsh_author_producer_v1'
+    : sealed ? 'dsh_author_handoff_seal_v2' : 'dsh_author_save_attempt_v2'
   if (data.schema_version !== 1 || data.contract !== expectedContract
     || data.authority !== 'dsh_host') {
     fail(`${event.type} must carry its dsh_host authored Workflow custody contract`)
@@ -1133,15 +1133,25 @@ function applyAuthorEvent(
   if (data.controller_session_id !== context.controllerSessionId) {
     fail(`${event.type} controller_session_id differs from its owning Session`)
   }
-  const initialization = authorityTrace.initialized
-  const python = initialization === undefined
-    ? undefined : object(initialization.kersor_python, `${event.type} kersor_python`, fail)
-  const pythonPath = python === undefined
-    ? undefined : text(python.path, `${event.type} kersor_python path`, fail)
-  if (pythonPath === undefined) fail(`${event.type} lost its Host-frozen Python authority`)
-  const stagingDir = join(sessionDir, 'workflow-authoring', 'staging')
-  if (data.staging_dir !== stagingDir) {
-    fail(`${event.type} staging_dir differs from the canonical author staging directory`)
+  const current = trace.get(sessionDir)
+  if (produced) {
+    if (current !== undefined) fail(`kersor/author-produced repeats Session ${sessionDir}`)
+    const callId = token(data.author_call_id, 'author author_call_id', fail)
+    const authorSessionId = token(data.author_session_id, 'author author_session_id', fail)
+    if (authorSessionId === context.controllerSessionId) {
+      fail('kersor/author-produced author_session_id must identify its foreground child')
+    }
+    fileBinding(
+      data.author_context,
+      join(sessionDir, 'workflow-authoring', 'author-context.json'),
+      'kersor/author-produced author_context',
+      fail,
+    )
+    requirePrecedingAuthorActionCall(
+      session, event, callId, 'kersor_protocol', 'author', -1, fail,
+    )
+    trace.set(sessionDir, { produced: data, producedSeq: event.seq })
+    return
   }
   const handoff = fileBinding(
     data.handoff,
@@ -1149,31 +1159,31 @@ function applyAuthorEvent(
     `${event.type} handoff`,
     fail,
   )
-  const files = authorFileBindings(data.files, stagingDir, event.type, fail)
-  const current = trace.get(sessionDir)
   if (sealed) {
-    if (current !== undefined) fail(`kersor/author-handoff-sealed repeats Session ${sessionDir}`)
+    if (current === undefined) fail('kersor/author-handoff-sealed has no durable Host author producer')
+    if (current.seal !== undefined) fail(`kersor/author-handoff-sealed repeats Session ${sessionDir}`)
     const callId = token(data.seal_call_id, 'author seal_call_id', fail)
-    const command = text(data.seal_command, 'author seal_command', fail)
-    const expected = canonicalAuthorHandoffSealCommand(pythonPath, sessionDir)
-    if (command !== expected) fail('author seal_command differs from its canonical Host command')
-    requirePrecedingAuthorBashCall(session, event, callId, expected, fail)
-    trace.set(sessionDir, { seal: data })
+    if (data.author_call_id !== current.produced.author_call_id
+      || data.author_session_id !== current.produced.author_session_id) {
+      fail('kersor/author-handoff-sealed differs from its Host-run foreground author')
+    }
+    requirePrecedingAuthorActionCall(
+      session, event, callId, 'kersor_author_commit', 'seal', current.producedSeq, fail,
+    )
+    current.seal = data
+    current.sealSeq = event.seq
     return
   }
-  if (current === undefined) fail('kersor/author-save-attempted has no durable author seal')
+  if (current?.seal === undefined) fail('kersor/author-save-attempted has no durable author seal')
   if (current.saveAttempted !== undefined) {
     fail(`kersor/author-save-attempted repeats consumed Session ${sessionDir}`)
   }
   const callId = token(data.save_call_id, 'author save_call_id', fail)
-  const command = text(data.save_command, 'author save_command', fail)
-  const expected = canonicalAuthorSaveCommand(pythonPath, sessionDir)
-  if (command !== expected) fail('author save_command differs from its canonical Host command')
-  requirePrecedingAuthorBashCall(session, event, callId, expected, fail)
+  requirePrecedingAuthorActionCall(
+    session, event, callId, 'kersor_author_commit', 'save', current.sealSeq ?? -1, fail,
+  )
   if (data.seal_call_id !== current.seal.seal_call_id
-    || data.staging_dir !== current.seal.staging_dir
-    || !isDeepStrictEqual(handoff, current.seal.handoff)
-    || !isDeepStrictEqual(files, current.seal.files)) {
+    || !isDeepStrictEqual(handoff, current.seal.handoff)) {
     fail('kersor/author-save-attempted differs from its sealed author bytes')
   }
   current.saveAttempted = data
@@ -1270,7 +1280,9 @@ function applyDispatchEvent(
     || data.controller_session_id !== current.producer.controller_session_id) {
     fail('kersor/dispatch-args-transformed does not extend its producer event')
   }
-  token(data.transformation_call_id, 'kersor/dispatch-args-transformed transformation_call_id', fail)
+  if (data.transformation_call_id !== current.producer.producer_call_id) {
+    fail('kersor/dispatch-args-transformed must reuse its producer call identity')
+  }
   const producerReceipt = fileBinding(
     data.producer_receipt, join(runDir, 'dispatch-args-producer-receipt.json'),
     'kersor/dispatch-args-transformed producer_receipt', fail,

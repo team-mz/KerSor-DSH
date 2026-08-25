@@ -6,12 +6,9 @@ import { Context } from '@deepseek-ai/cordis'
 import InvariantRegistry from '@deepseek-ai/dsh-invariants'
 import SessionStore, { SessionId, type Session } from '@deepseek-ai/dsh-session'
 import { CallId } from '@deepseek-ai/dsh-llm'
-import {
-  canonicalAuthorHandoffSealCommand,
-  canonicalAuthorSaveCommand,
-} from '../src/author-tool-commands.ts'
 import { canonicalKersorJson } from '../src/types.ts'
 import type {
+  KersorAuthorProducedEventData,
   KersorAuthorHandoffSealedEventData,
   KersorAuthorSaveAttemptedEventData,
   KersorDispatchArgsProducedEventData,
@@ -142,7 +139,7 @@ const dispatchTransformation = {
   round: dispatchProducer.round,
   workflow_name: dispatchProducer.workflow_name,
   controller_session_id: dispatchProducer.controller_session_id,
-  transformation_call_id: 'transform-call',
+  transformation_call_id: dispatchProducer.producer_call_id,
   producer_receipt: {
     path: `${dispatchRun}/dispatch-args-producer-receipt.json`,
     sha256: 'c'.repeat(64),
@@ -202,62 +199,62 @@ const sessionInitialized = {
   kernel: { path: '/work/kernel/kernel.py', sha256: '5'.repeat(64) },
 } satisfies KersorSessionInitializedEventData
 
-const authorStaging = `${baselineSession}/workflow-authoring/staging`
-const authorSealCommand = canonicalAuthorHandoffSealCommand(
-  sessionInitialized.kersor_python.path,
-  baselineSession,
-)
-const authorSaveCommand = canonicalAuthorSaveCommand(
-  sessionInitialized.kersor_python.path,
-  baselineSession,
-)
-const authorFiles = {
-  'workflow.js': { path: `${authorStaging}/workflow.js`, sha256: '6'.repeat(64) },
-  'metadata.json': { path: `${authorStaging}/metadata.json`, sha256: '7'.repeat(64) },
-  'rationale.md': { path: `${authorStaging}/rationale.md`, sha256: '8'.repeat(64) },
-} as const
-const authorSeal = {
+const authorProduced = {
   schema_version: 1,
-  contract: 'dsh_author_handoff_seal_v1',
+  contract: 'dsh_author_producer_v1',
   authority: 'dsh_host',
   session_dir: baselineSession,
-  controller_session_id: 'controller',
-  seal_call_id: 'author-seal-call',
-  seal_command: authorSealCommand,
-  staging_dir: authorStaging,
+  controller_session_id: SessionId('controller'),
+  author_call_id: CallId('author-call'),
+  author_session_id: SessionId('author-child'),
+  author_context: {
+    path: `${baselineSession}/workflow-authoring/author-context.json`,
+    sha256: '6'.repeat(64),
+  },
+} satisfies KersorAuthorProducedEventData
+const authorSeal = {
+  schema_version: 1,
+  contract: 'dsh_author_handoff_seal_v2',
+  authority: 'dsh_host',
+  session_dir: baselineSession,
+  controller_session_id: SessionId('controller'),
+  author_call_id: authorProduced.author_call_id,
+  author_session_id: authorProduced.author_session_id,
+  seal_call_id: CallId('author-seal-call'),
   handoff: {
     path: `${baselineSession}/workflow-authoring/author-handoff.json`,
     sha256: '9'.repeat(64),
   },
-  files: authorFiles,
 } satisfies KersorAuthorHandoffSealedEventData
 const authorSaveAttempt = {
   schema_version: 1,
-  contract: 'dsh_author_save_attempt_v1',
+  contract: 'dsh_author_save_attempt_v2',
   authority: 'dsh_host',
   session_dir: baselineSession,
-  controller_session_id: 'controller',
-  save_call_id: 'author-save-call',
-  save_command: authorSaveCommand,
+  controller_session_id: SessionId('controller'),
+  save_call_id: CallId('author-save-call'),
   seal_call_id: authorSeal.seal_call_id,
-  staging_dir: authorStaging,
   handoff: authorSeal.handoff,
-  files: authorFiles,
 } satisfies KersorAuthorSaveAttemptedEventData
 
-function appendAuthorBashCall(
+function appendAuthorActionCall(
   session: Session,
   callId: string,
-  command: string,
-  argumentsOverride: Record<string, unknown> = {},
+  toolName: 'kersor_protocol' | 'kersor_author_commit',
+  action: 'author' | 'seal' | 'save',
 ): void {
   session.append('tool/call', {
     turn: 1,
     step: 1,
     callId: CallId(callId),
-    name: 'bash',
-    arguments: JSON.stringify({ command, ...argumentsOverride }),
+    name: toolName,
+    arguments: JSON.stringify({ action }),
   })
+}
+
+function appendAuthorProduced(session: Session): void {
+  appendAuthorActionCall(session, authorProduced.author_call_id, 'kersor_protocol', 'author')
+  session.append('kersor/author-produced', authorProduced)
 }
 
 function appendSetupCall(
@@ -787,75 +784,84 @@ describe('KerSor Session authority invariants', () => {
 })
 
 describe('KerSor authored Workflow custody invariants', () => {
-  it('accepts one exact author seal followed by one pre-execution save attempt', async () => {
+  it('accepts one Host author producer, typed seal, and pre-execution save attempt', async () => {
     const { session } = await setupBaseline()
-    appendAuthorBashCall(session, authorSeal.seal_call_id, authorSealCommand)
+    appendAuthorProduced(session)
+    appendAuthorActionCall(
+      session, authorSeal.seal_call_id, 'kersor_author_commit', 'seal',
+    )
     session.append('kersor/author-handoff-sealed', authorSeal)
-    appendAuthorBashCall(session, authorSaveAttempt.save_call_id, authorSaveCommand)
+    appendAuthorActionCall(
+      session, authorSaveAttempt.save_call_id, 'kersor_author_commit', 'save',
+    )
     session.append('kersor/author-save-attempted', authorSaveAttempt)
 
     expect(session.events.filter(event => event.type.startsWith('kersor/author-')))
-      .toHaveLength(2)
+      .toHaveLength(3)
   })
 
-  it('rejects author seals without their exact preceding canonical Bash call', async () => {
+  it('binds producer and seal events to their first typed Host actions', async () => {
     const missing = await setupBaseline()
     expect(() => {
       missing.session.append('kersor/author-handoff-sealed', authorSeal)
-    }).toThrow(/author.*seal|preceding.*bash|canonical.*command/i)
+    }).toThrow(/author.*producer|foreground author/i)
 
     const forged = await setupBaseline()
-    appendAuthorBashCall(forged.session, authorSeal.seal_call_id, authorSealCommand)
+    appendAuthorProduced(forged.session)
+    appendAuthorActionCall(
+      forged.session, authorSeal.seal_call_id, 'kersor_author_commit', 'save',
+    )
     expect(() => {
-      forged.session.append('kersor/author-handoff-sealed', {
-        ...authorSeal,
-        seal_command: `${authorSealCommand} --force`,
-      })
-    }).toThrow(/author.*seal|canonical.*command|Host schema/i)
+      forged.session.append('kersor/author-handoff-sealed', authorSeal)
+    }).toThrow(/kersor_author_commit.*seal|call identity/i)
 
     const secondCall = await setupBaseline()
-    appendAuthorBashCall(secondCall.session, 'earlier-seal-call', authorSealCommand)
-    appendAuthorBashCall(secondCall.session, authorSeal.seal_call_id, authorSealCommand)
+    appendAuthorProduced(secondCall.session)
+    appendAuthorActionCall(
+      secondCall.session, 'earlier-seal-call', 'kersor_author_commit', 'seal',
+    )
+    appendAuthorActionCall(
+      secondCall.session, authorSeal.seal_call_id, 'kersor_author_commit', 'seal',
+    )
     expect(() => {
       secondCall.session.append('kersor/author-handoff-sealed', authorSeal)
-    }).toThrow(/first and only|canonical.*Bash|author.*seal/i)
-
-    for (const args of [
-      {
-        command: authorSealCommand.replace(
-          'seal-author-handoff.py', "seal-author-''handoff.py",
-        ),
-        override: {},
-      },
-      { command: authorSealCommand, override: { workdir: '/tmp' } },
-    ]) {
-      const noncanonical = await setupBaseline()
-      appendAuthorBashCall(
-        noncanonical.session,
-        authorSeal.seal_call_id,
-        args.command,
-        args.override,
-      )
-      expect(() => {
-        noncanonical.session.append('kersor/author-handoff-sealed', authorSeal)
-      }).toThrow(/first and only|canonical.*Bash|author.*seal/i)
-    }
+    }).toThrow(/first and only|kersor_author_commit.*seal/i)
   })
 
-  it('rejects save attempts before a seal, repeated attempts, and changed sealed bytes', async () => {
+  it('ignores precondition calls before their owner boundary', async () => {
+    const { session } = await setupBaseline()
+    appendAuthorActionCall(session, 'premature-seal', 'kersor_author_commit', 'seal')
+    appendAuthorProduced(session)
+    appendAuthorActionCall(session, 'premature-save', 'kersor_author_commit', 'save')
+    appendAuthorActionCall(
+      session, authorSeal.seal_call_id, 'kersor_author_commit', 'seal',
+    )
+    expect(() => session.append('kersor/author-handoff-sealed', authorSeal)).not.toThrow()
+    appendAuthorActionCall(
+      session, authorSaveAttempt.save_call_id, 'kersor_author_commit', 'save',
+    )
+    expect(() => session.append('kersor/author-save-attempted', authorSaveAttempt))
+      .not.toThrow()
+  })
+
+  it('rejects save before seal, repeats, changed receipt bytes, and author-child drift', async () => {
     const beforeSeal = await setupBaseline()
-    appendAuthorBashCall(
-      beforeSeal.session, authorSaveAttempt.save_call_id, authorSaveCommand,
+    appendAuthorProduced(beforeSeal.session)
+    appendAuthorActionCall(
+      beforeSeal.session, authorSaveAttempt.save_call_id, 'kersor_author_commit', 'save',
     )
     expect(() => {
       beforeSeal.session.append('kersor/author-save-attempted', authorSaveAttempt)
     }).toThrow(/author.*seal|save.*seal/i)
 
     const duplicate = await setupBaseline()
-    appendAuthorBashCall(duplicate.session, authorSeal.seal_call_id, authorSealCommand)
+    appendAuthorProduced(duplicate.session)
+    appendAuthorActionCall(
+      duplicate.session, authorSeal.seal_call_id, 'kersor_author_commit', 'seal',
+    )
     duplicate.session.append('kersor/author-handoff-sealed', authorSeal)
-    appendAuthorBashCall(
-      duplicate.session, authorSaveAttempt.save_call_id, authorSaveCommand,
+    appendAuthorActionCall(
+      duplicate.session, authorSaveAttempt.save_call_id, 'kersor_author_commit', 'save',
     )
     duplicate.session.append('kersor/author-save-attempted', authorSaveAttempt)
     expect(() => {
@@ -863,18 +869,30 @@ describe('KerSor authored Workflow custody invariants', () => {
     }).toThrow(/author.*save.*repeat|exact-once|consum/i)
 
     const changed = await setupBaseline()
-    appendAuthorBashCall(changed.session, authorSeal.seal_call_id, authorSealCommand)
+    appendAuthorProduced(changed.session)
+    appendAuthorActionCall(
+      changed.session, authorSeal.seal_call_id, 'kersor_author_commit', 'seal',
+    )
     changed.session.append('kersor/author-handoff-sealed', authorSeal)
-    appendAuthorBashCall(changed.session, authorSaveAttempt.save_call_id, authorSaveCommand)
+    appendAuthorActionCall(
+      changed.session, authorSaveAttempt.save_call_id, 'kersor_author_commit', 'save',
+    )
     expect(() => {
       changed.session.append('kersor/author-save-attempted', {
         ...authorSaveAttempt,
-        files: {
-          ...authorFiles,
-          'workflow.js': { ...authorFiles['workflow.js'], sha256: 'f'.repeat(64) },
-        },
+        handoff: { ...authorSaveAttempt.handoff, sha256: 'f'.repeat(64) },
       })
-    }).toThrow(/sealed.*bytes|author.*seal|files/i)
+    }).toThrow(/sealed.*bytes|author.*seal|handoff/i)
+
+    const wrongChild = await setupBaseline()
+    appendAuthorProduced(wrongChild.session)
+    appendAuthorActionCall(
+      wrongChild.session, authorSeal.seal_call_id, 'kersor_author_commit', 'seal',
+    )
+    expect(() => wrongChild.session.append('kersor/author-handoff-sealed', {
+      ...authorSeal,
+      author_session_id: SessionId('other-author'),
+    })).toThrow(/foreground author|author.*child/i)
   })
 })
 
@@ -886,6 +904,18 @@ describe('KerSor dispatch custody invariants', () => {
     session.append('kersor/dispatch-args-transformed', dispatchTransformation)
     expect(session.events.filter(event => event.type.startsWith('kersor/dispatch-args-')))
       .toHaveLength(2)
+  })
+
+  it('rejects a Host transformation with a different producer call identity', async () => {
+    const { session } = await setupBaseline()
+    appendVerifiedBaseline(session)
+    session.append('kersor/dispatch-args-produced', dispatchProducer)
+    expect(() => {
+      session.append('kersor/dispatch-args-transformed', {
+        ...dispatchTransformation,
+        transformation_call_id: 'separate-transform-call',
+      })
+    }).toThrow(/reuse its producer call identity/)
   })
 
   it('rejects transformation without producer and duplicate producer before commit', async () => {

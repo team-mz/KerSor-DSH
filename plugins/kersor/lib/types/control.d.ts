@@ -6,7 +6,7 @@
  * @module @deepseek-ai/dsh-kersor/control
  */
 import type { Context } from '@deepseek-ai/cordis';
-/** Required host services: tools, durable sessions, and continuable subagents. */
+/** Required Host services: tools, durable sessions, continuable subagents, and managed subprocesses. */
 export declare const name = "kersor-control";
 export declare const inject: string[];
 /** Register the start/resume tools and project child settlement into the parent log. */

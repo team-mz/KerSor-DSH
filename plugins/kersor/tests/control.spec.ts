@@ -9,8 +9,10 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { createHash } from 'node:crypto'
@@ -22,9 +24,10 @@ import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { CallId, type ContentBlock } from '@deepseek-ai/dsh-llm'
-import SessionStore, { SessionId, type JsonValue, type Session } from '@deepseek-ai/dsh-session'
+import SessionStore, { SessionId, type JsonValue, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
 import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
-import type { SubagentListEntry } from '@deepseek-ai/dsh-subagent'
+import type { SubagentListEntry, SubagentResult, SubagentRun } from '@deepseek-ai/dsh-subagent'
+import type { SubprocessHandle, SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 import { ShellExecutor } from '@deepseek-ai/dsh-shell'
 import type { ShellExecRequest, ShellExecSpec, ShellProcess, ShellRunResult } from '@deepseek-ai/dsh-shell'
 import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy'
@@ -40,6 +43,7 @@ const testKersorPython = realpathSync(execFileSync(
 const testKersorRoot = realpathSync.native(join(process.cwd(), '..', 'KerSor'))
 const testSetupAdapter = realpathSync.native(join(testKersorRoot, 'scripts', 'setup-session.sh'))
 const originalKersorPython = process.env.KERSOR_PYTHON
+const originalKersorRoot = process.env.KERSOR_ROOT
 const launchContract = {
   backend: 'python',
   language: 'python_reference',
@@ -69,7 +73,7 @@ interface MutableFileBinding {
 }
 
 interface BaselineWitnessFixture {
-  executions: Array<{
+  executions: Array<Record<string, unknown> & {
     kind: string
     command: string
     exit_code: number
@@ -110,11 +114,6 @@ interface MutableCompatibility {
   projected_meta_sha256: string
   model_policy: string
   child_tool_policy: { tools: string[] }
-}
-
-interface DispatchTransformationReceiptFixture extends Record<string, unknown> {
-  input: { dispatch_args: { sha256: string } }
-  output: { dispatch_args: { sha256: string } }
 }
 
 function readJsonFixture(path: string): unknown {
@@ -338,8 +337,122 @@ function writeValidSetupArtifacts(
   }))
 }
 
-function runtimeControlsCommand(runDir: string): string {
-  return `KERSOR_PYTHON='${testKersorPython}'; export KERSOR_PYTHON; bridge="\${DSH_HOME:-$HOME/.dsh}/.agent-presets/kersor/bin/kersor_bridge.py"; kersor_root="$("$KERSOR_PYTHON" "$bridge" root)"; "$KERSOR_PYTHON" "$kersor_root/scripts/inject-runtime-controls.py" '${runDir}'`
+function writeKersorProtocolContext(
+  sessionDir: string,
+  relativePath: string,
+  dispatch: Record<string, unknown> = {
+    description: 'Run one protocol child',
+    prompt: 'Complete the canonical KerSor handoff.',
+    run_in_background: false,
+  },
+  context: Record<string, unknown> = {},
+): string {
+  const path = join(sessionDir, relativePath)
+  mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(path, JSON.stringify({
+    schema_version: 99,
+    ...context,
+    session_dir: realpathSync.native(sessionDir),
+    dispatch: { future_dispatch_field: true, ...dispatch },
+    future_context_field: { accepted: true },
+  }))
+  return path
+}
+
+function writeKersorSelectionContext(
+  sessionDir: string,
+  disposition: 'stalled' | 'locked' | 'agent-advise' = 'agent-advise',
+): string {
+  const canonicalSession = realpathSync.native(sessionDir)
+  const selectionPath = join(canonicalSession, 'round-1-selection.json')
+  const catalogPath = join(canonicalSession, 'workflow-catalog.json')
+  const contextPath = join(
+    canonicalSession,
+    'selection-handoff',
+    'round-1-context.json',
+  )
+  mkdirSync(dirname(contextPath), { recursive: true })
+  writeFileSync(contextPath, JSON.stringify({
+    schema_version: 1,
+    session_dir: canonicalSession,
+    round: 1,
+    disposition,
+    selection: { path: selectionPath, sha256: fileSha256(selectionPath) },
+    catalog: { path: catalogPath, sha256: fileSha256(catalogPath) },
+    decision_path: join(canonicalSession, 'round-1-routing-decision.json'),
+    dispatch: disposition === 'agent-advise'
+      ? {
+        description: 'Choose KerSor workflow for round 1',
+        prompt: 'Read the Core strategy-selector role and write its decision.',
+        run_in_background: false,
+      }
+      : null,
+  }))
+  return contextPath
+}
+
+function writeProtocolSelection(
+  sessionDir: string,
+  disposition: 'stalled' | 'locked' | 'agent-advise',
+): void {
+  const canonicalSession = realpathSync.native(sessionDir)
+  const selected = disposition === 'stalled' ? 'STALLED' : 'alpha'
+  const decidedBy = disposition === 'agent-advise'
+    ? 'agent-advise-pending'
+    : disposition === 'locked' ? 'explore' : 'fallback'
+  writeFileSync(join(canonicalSession, 'round-1-selection.json'), JSON.stringify({
+    schema_version: 2,
+    round: 1,
+    session_dir: canonicalSession,
+    catalog_path: join(canonicalSession, 'workflow-catalog.json'),
+    selected_workflow: { name: selected },
+    routing: { decided_by: decidedBy, fallback_pick: selected },
+    attempt_plan: {
+      status: 'proposed',
+      commit: {
+        status: 'proposed',
+        workflow: selected,
+        decided_by: decidedBy,
+        rationale: '',
+      },
+    },
+    candidates: disposition === 'stalled' ? [] : [{ name: 'alpha' }],
+  }))
+}
+
+function configureSelectionProcesses(
+  harness: Harness,
+  sessionDir: string,
+  disposition: 'stalled' | 'locked' | 'agent-advise',
+): void {
+  harness.hostTransformSubprocess.onSpawn = (spec) => {
+    if (spec.argv.some(argument => argument.endsWith('select-workflow.sh'))) {
+      writeProtocolSelection(sessionDir, disposition)
+    }
+    if (spec.argv.includes('selection-handoff.py')) {
+      writeKersorSelectionContext(sessionDir, disposition)
+    }
+    if (spec.argv.some(argument => argument.endsWith('finalize-selection.sh'))) {
+      const path = join(realpathSync.native(sessionDir), 'round-1-selection.json')
+      const selection = readJsonFixture(path) as {
+        routing: { decided_by: string }
+        selected_workflow: { name: string }
+        attempt_plan: {
+          status: string
+          commit: { status: string; workflow: string; decided_by: string }
+        }
+      }
+      const decidedBy = disposition === 'locked'
+        ? 'explore'
+        : 'fallback'
+      selection.routing.decided_by = decidedBy
+      selection.attempt_plan.status = 'committed'
+      selection.attempt_plan.commit.status = 'committed'
+      selection.attempt_plan.commit.workflow = selection.selected_workflow.name
+      selection.attempt_plan.commit.decided_by = decidedBy
+      writeFileSync(path, JSON.stringify(selection))
+    }
+  }
 }
 
 function candidateOwnershipSealCommand(runDir: string): string {
@@ -351,26 +464,20 @@ function baselinePrefix(): string {
   return `KERSOR_PYTHON='${testKersorPython}'; export KERSOR_PYTHON; bridge="\${DSH_HOME:-$HOME/.dsh}/.agent-presets/kersor/bin/kersor_bridge.py"; kersor_root="$("$KERSOR_PYTHON" "$bridge" root)"; "$KERSOR_PYTHON" "$kersor_root/scripts/baseline-witness.py"`
 }
 
+function hostShellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`
+}
+
 function baselineInitCommand(sessionDir: string): string {
-  return `${baselinePrefix()} init --session '${realpathSync(sessionDir)}' --correctness-command '${launchContract.correctness_command}' --benchmark-command '${launchContract.benchmark_command}'`
+  return `${baselinePrefix()} init --session ${hostShellQuote(realpathSync(sessionDir))} --correctness-command ${hostShellQuote(launchContract.correctness_command)} --benchmark-command ${hostShellQuote(launchContract.benchmark_command)}`
 }
 
 function baselineRecordCommand(sessionDir: string, workspace: string): string {
-  return `${baselinePrefix()} record --session '${realpathSync(sessionDir)}' --project-root '${realpathSync(workspace)}'`
+  return `${baselinePrefix()} record --session ${hostShellQuote(realpathSync(sessionDir))} --project-root ${hostShellQuote(realpathSync(workspace))}`
 }
 
 function baselineVerifyCommand(sessionDir: string): string {
-  return `${baselinePrefix()} verify --session '${realpathSync(sessionDir)}'`
-}
-
-function authorSealCommand(sessionDir: string): string {
-  const canonicalSession = realpathSync.native(sessionDir)
-  return `KERSOR_PYTHON='${testKersorPython}'; export KERSOR_PYTHON; SESSION_DIR='${canonicalSession}'; bridge="\${DSH_HOME:-$HOME/.dsh}/.agent-presets/kersor/bin/kersor_bridge.py"; kersor_root="$("$KERSOR_PYTHON" "$bridge" root)"; KERSOR_PYTHON="\${KERSOR_PYTHON:-python3}" bash "$kersor_root/scripts/run-kersor-python.sh" seal-author-handoff.py --from "$SESSION_DIR/workflow-authoring/staging" --out "$SESSION_DIR/workflow-authoring/author-handoff.json"`
-}
-
-function authorSaveCommand(sessionDir: string): string {
-  const canonicalSession = realpathSync.native(sessionDir)
-  return `KERSOR_PYTHON='${testKersorPython}'; export KERSOR_PYTHON; SESSION_DIR='${canonicalSession}'; bridge="\${DSH_HOME:-$HOME/.dsh}/.agent-presets/kersor/bin/kersor_bridge.py"; kersor_root="$("$KERSOR_PYTHON" "$bridge" root)"; bash "$kersor_root/scripts/save-authored-workflow.sh" --from "$SESSION_DIR/workflow-authoring/staging" --store "$SESSION_DIR/workflow-authoring/proposals" --handoff "$SESSION_DIR/workflow-authoring/author-handoff.json"`
+  return `${baselinePrefix()} verify --session ${hostShellQuote(realpathSync(sessionDir))}`
 }
 
 function shellQuote(value: string | number): string {
@@ -464,6 +571,16 @@ function writeDispatchSelection(
     round: 1,
     session_dir: canonicalSessionDir,
     catalog_path: catalogPath,
+    routing: { decided_by: 'fallback' },
+    attempt_plan: {
+      status: 'committed',
+      commit: {
+        status: 'committed',
+        workflow: workflowName,
+        decided_by: 'fallback',
+        rationale: '',
+      },
+    },
     selected_workflow: {
       name: workflowName,
       directory: workflowDirectory,
@@ -526,18 +643,67 @@ function registerDispatchProducerProbe(
 
 beforeEach(() => {
   process.env.KERSOR_PYTHON = testKersorPython
+  process.env.KERSOR_ROOT = testKersorRoot
 })
 
 afterEach(() => {
   if (originalKersorPython === undefined) delete process.env.KERSOR_PYTHON
   else process.env.KERSOR_PYTHON = originalKersorPython
+  if (originalKersorRoot === undefined) delete process.env.KERSOR_ROOT
+  else process.env.KERSOR_ROOT = originalKersorRoot
 })
+
+class HostTransformSubprocess {
+  readonly specs: SubprocessSpawnSpec[] = []
+  exitCode = 0
+  signal: NodeJS.Signals | null = null
+  stdout = ''
+  stderr = ''
+  onSpawn: (spec: SubprocessSpawnSpec) => void = () => {}
+
+  spawn(spec: SubprocessSpawnSpec): SubprocessHandle {
+    this.specs.push(spec)
+    this.onSpawn(spec)
+    return {
+      pid: 4242,
+      stdin: undefined,
+      stdout: undefined,
+      stderr: undefined,
+      collected: {
+        stdout: {
+          readFrom: () => ({
+            text: this.stdout,
+            nextOffset: Buffer.byteLength(this.stdout),
+            lossy: false,
+          }),
+        },
+        stderr: {
+          readFrom: () => ({
+            text: this.stderr,
+            nextOffset: Buffer.byteLength(this.stderr),
+            lossy: false,
+          }),
+        },
+      },
+      done: Promise.resolve({ exitCode: this.exitCode, signal: this.signal }),
+      terminate: () => {},
+      waitForExit: () => Promise.resolve(true),
+    }
+  }
+}
 
 interface MockSubagents {
   readonly children: SubagentListEntry[]
   readonly starts: unknown[]
+  readonly oneShotStarts: unknown[]
+  readonly disposals: SessionId[]
   readonly followups: unknown[]
+  oneShotResult: SubagentResult
+  oneShotRun?: (id: SessionId) => Promise<SubagentResult>
+  oneShotResultError?: Error
+  disposalError?: Error
   listChildren(): Promise<SubagentListEntry[]>
+  start(provider: string, spec: unknown): Promise<SubagentRun>
   startContinuable(spec: { childId: SessionId }): Promise<{ childId: SessionId; messageId: string }>
   followup(...args: unknown[]): Promise<string>
 }
@@ -548,12 +714,14 @@ interface Harness {
   readonly agent: Agent
   readonly subagents: MockSubagents
   readonly order: string[]
+  readonly hostTransformSubprocess: HostTransformSubprocess
   readonly controlFiber: { dispose(): Promise<void> }
 }
 
 class SetupSandboxExecutor extends ShellExecutor {
   readonly calls: ShellExecSpec[] = []
   onRun: (spec: ShellExecSpec) => void = () => {}
+  resultFor?: (spec: ShellExecSpec) => ShellRunResult
 
   override get sandboxMode() {
     return 'workspace-write' as const
@@ -573,6 +741,8 @@ class SetupSandboxExecutor extends ShellExecutor {
   run(spec: ShellExecSpec): Promise<ShellRunResult> {
     this.calls.push(spec)
     this.onRun(spec)
+    const result = this.resultFor?.(spec)
+    if (result !== undefined) return Promise.resolve(result)
     return Promise.resolve({
       exitCode: 0,
       signal: null,
@@ -609,6 +779,8 @@ async function setup(
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(SessionStore)
   await ctx.plugin(ToolRuntime)
+  const hostTransformSubprocess = new HostTransformSubprocess()
+  ctx.provide('subprocess', hostTransformSubprocess as never)
   const order: string[] = []
   ctx.on('session/flush', () => { order.push('flush') })
   const children: SubagentListEntry[] = []
@@ -616,8 +788,31 @@ async function setup(
   const subagents: MockSubagents = {
     children,
     starts: [],
+    oneShotStarts: [],
+    disposals: [],
     followups: [],
+    oneShotResult: { output: [], stopReason: 'completed' },
     listChildren: () => Promise.resolve([...children]),
+    start(provider, spec) {
+      const id = SessionId(`kersor-protocol-child-${this.oneShotStarts.length + 1}`)
+      this.oneShotStarts.push({ provider, spec })
+      const result = this.oneShotRun !== undefined
+        ? this.oneShotRun(id)
+        : this.oneShotResultError === undefined
+          ? Promise.resolve(this.oneShotResult)
+          : Promise.reject(this.oneShotResultError)
+      return Promise.resolve({
+        id,
+        localAgent: undefined,
+        result,
+        dispose: () => {
+          this.disposals.push(id)
+          return this.disposalError === undefined
+            ? Promise.resolve()
+            : Promise.reject(this.disposalError)
+        },
+      })
+    },
     startContinuable(spec) {
       order.push('start-child')
       this.starts.push(spec)
@@ -648,7 +843,7 @@ async function setup(
   session.append('turn/start', { turn: 1 })
   session.append('step/start', { turn: 1, step: 1 })
   const agent = { id: session.id, session } as unknown as Agent
-  return { ctx, session, agent, subagents, order, controlFiber }
+  return { ctx, session, agent, subagents, order, hostTransformSubprocess, controlFiber }
 }
 
 let callSequence = 0
@@ -1039,7 +1234,7 @@ function writeWorkflowEnvelope(
     round,
     workflow_name: call.meta.name,
     controller_session_id: controller.id,
-    transformation_call_id: `transform-call-${round}`,
+    transformation_call_id: producerReceipt.producer_call_id,
     producer_receipt: {
       path: producerReceiptPath,
       sha256: sha256(producerReceiptBytes),
@@ -1062,13 +1257,6 @@ function writeWorkflowEnvelope(
     if (!controller.session.events.some(event =>
       event.type === 'kersor/dispatch-args-transformed'
       && event.data.run_dir === canonicalRunDir)) {
-      controller.session.append('tool/call', {
-        turn: 1,
-        step: 1,
-        callId: CallId(transformationReceipt.transformation_call_id),
-        name: 'bash',
-        arguments: JSON.stringify({ command: runtimeControlsCommand(canonicalRunDir) }),
-      })
       controller.session.append('kersor/dispatch-args-transformed', transformationReceipt)
     }
   }
@@ -1095,6 +1283,16 @@ function writeWorkflowEnvelope(
     round,
     session_dir: sessionDir,
     catalog_path: join(sessionDir, 'workflow-catalog.json'),
+    routing: { decided_by: 'fallback' },
+    attempt_plan: {
+      status: 'committed',
+      commit: {
+        status: 'committed',
+        workflow: workflowMeta.name,
+        decided_by: 'fallback',
+        rationale: '',
+      },
+    },
     selected_workflow: {
       name: workflowMeta.name,
       directory: proposalDirectory,
@@ -1307,6 +1505,39 @@ async function startController(harness: Harness): Promise<Agent> {
   await call(harness, 'kersor_start', { objective: 'Optimize', launch: launchContract })
   const controllerId = starts(harness.session)[0]!.data.childSessionId
   return descendantAgent(harness, harness.session, controllerId)
+}
+
+async function prepareTypedAuthor(
+  harness: Harness,
+  workspace: string,
+  controller: Agent,
+  name: string,
+): Promise<string> {
+  const sessionDir = join(workspace, '.kersor', name)
+  writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+  ensureSessionInitializationFixture(sessionDir, workspace, controller)
+  prepareAuthorStaging(sessionDir)
+  writeKersorProtocolContext(sessionDir, 'workflow-authoring/author-context.json')
+  const authored = await call(harness, 'kersor_protocol', { action: 'author' }, controller)
+  if (authored.isError) throw new Error(promptText(authored.content))
+  return realpathSync.native(sessionDir)
+}
+
+async function sealTypedAuthor(
+  harness: Harness,
+  controller: Agent,
+  sessionDir: string,
+): Promise<void> {
+  harness.hostTransformSubprocess.exitCode = 0
+  harness.hostTransformSubprocess.signal = null
+  harness.hostTransformSubprocess.stderr = ''
+  harness.hostTransformSubprocess.onSpawn = (spec) => {
+    if (basename(spec.argv[1] ?? '') !== 'seal-author-handoff.py') return
+    writeAuthorHandoff(sessionDir)
+    harness.hostTransformSubprocess.stdout = `AUTHOR_HANDOFF=${join(sessionDir, 'workflow-authoring', 'author-handoff.json')}\n`
+  }
+  const result = await call(harness, 'kersor_author_commit', { action: 'seal' }, controller)
+  if (result.isError) throw new Error(promptText(result.content))
 }
 
 let originSequence = 0
@@ -1538,13 +1769,15 @@ function writeValidBaselineAuthority(sessionDir: string, workspace: string): voi
     executions: [
       {
         kind: 'correctness', command: launchContract.correctness_command,
-        shell: '/bin/sh', started_at: '2026-08-22T00:00:01Z',
+        execution_mode: 'direct_argv', argv: [realpathSync.native(testKersorPython)],
+        cwd: canonicalWorkspace, started_at: '2026-08-22T00:00:01Z',
         finished_at: '2026-08-22T00:00:02Z', exit_code: 0, timed_out: false,
         stdout: 'correct\n', stderr: '', stdout_truncated: false, stderr_truncated: false,
       },
       {
         kind: 'benchmark', command: launchContract.benchmark_command,
-        shell: '/bin/sh', started_at: '2026-08-22T00:00:02Z',
+        execution_mode: 'direct_argv', argv: [realpathSync.native(testKersorPython)],
+        cwd: canonicalWorkspace, started_at: '2026-08-22T00:00:02Z',
         finished_at: '2026-08-22T00:00:03Z', exit_code: 1, timed_out: false,
         stdout: 'baseline=1.0\n', stderr: '', stdout_truncated: false,
         stderr_truncated: false,
@@ -1683,14 +1916,127 @@ function writeAuthorContextFixture(sessionDir: string): void {
 function writeAuthorHandoff(sessionDir: string): string {
   const staging = realpathSync.native(join(sessionDir, 'workflow-authoring', 'staging'))
   const handoff = join(sessionDir, 'workflow-authoring', 'author-handoff.json')
+  const authorContext = join(sessionDir, 'workflow-authoring', 'author-context.json')
+  if (!existsSync(authorContext)) writeAuthorContextFixture(sessionDir)
   writeFileSync(handoff, `${JSON.stringify({
     schema_version: 1,
     staging,
     files: Object.fromEntries([
       'workflow.js', 'metadata.json', 'rationale.md',
     ].map(name => [name, `sha256:${fileSha256(join(staging, name))}`])),
+    author_context: {
+      path: authorContext,
+      sha256: `sha256:${fileSha256(authorContext)}`,
+    },
+    future_core_field: { accepted_by_content_hash: true },
   }, null, 2)}\n`)
   return handoff
+}
+
+function appendAuthorProducedFixture(controller: Agent, sessionDir: string): void {
+  const canonicalSession = realpathSync.native(sessionDir)
+  const context = join(canonicalSession, 'workflow-authoring', 'author-context.json')
+  if (!existsSync(context)) writeAuthorContextFixture(sessionDir)
+  controller.session.append('tool/call', {
+    turn: 1, step: 1, callId: CallId('fixture-author-call'),
+    name: 'kersor_protocol', arguments: JSON.stringify({ action: 'author' }),
+  })
+  controller.session.append('kersor/author-produced', {
+    schema_version: 1,
+    contract: 'dsh_author_producer_v1',
+    authority: 'dsh_host',
+    session_dir: canonicalSession,
+    controller_session_id: controller.id,
+    author_call_id: CallId('fixture-author-call'),
+    author_session_id: SessionId('fixture-author-child'),
+    author_context: { path: context, sha256: fileSha256(context) },
+  })
+}
+
+function appendAuthorSealFixture(controller: Agent, sessionDir: string): void {
+  appendAuthorProducedFixture(controller, sessionDir)
+  const handoff = realpathSync.native(writeAuthorHandoff(sessionDir))
+  controller.session.append('tool/call', {
+    turn: 1, step: 1, callId: CallId('fixture-seal-call'),
+    name: 'kersor_author_commit', arguments: JSON.stringify({ action: 'seal' }),
+  })
+  controller.session.append('kersor/author-handoff-sealed', {
+    schema_version: 1,
+    contract: 'dsh_author_handoff_seal_v2',
+    authority: 'dsh_host',
+    session_dir: realpathSync.native(sessionDir),
+    controller_session_id: controller.id,
+    author_call_id: CallId('fixture-author-call'),
+    author_session_id: SessionId('fixture-author-child'),
+    seal_call_id: CallId('fixture-seal-call'),
+    handoff: { path: handoff, sha256: fileSha256(handoff) },
+  })
+}
+
+function appendAuthorSaveFixture(controller: Agent, sessionDir: string): void {
+  const seal = controller.session.events.find(
+    (event): event is Extract<SessionEvent, { type: 'kersor/author-handoff-sealed' }> =>
+      event.type === 'kersor/author-handoff-sealed',
+  )
+  if (seal === undefined) throw new Error('test author seal is missing')
+  controller.session.append('tool/call', {
+    turn: 1, step: 1, callId: CallId('fixture-save-call'),
+    name: 'kersor_author_commit', arguments: JSON.stringify({ action: 'save' }),
+  })
+  controller.session.append('kersor/author-save-attempted', {
+    schema_version: 1,
+    contract: 'dsh_author_save_attempt_v2',
+    authority: 'dsh_host',
+    session_dir: realpathSync.native(sessionDir),
+    controller_session_id: controller.id,
+    save_call_id: CallId('fixture-save-call'),
+    seal_call_id: seal.data.seal_call_id,
+    handoff: seal.data.handoff,
+  })
+}
+
+function writeSavedAuthorProposal(sessionDir: string, name = 'authored-test'): string {
+  const directory = join(
+    realpathSync.native(sessionDir), 'workflow-authoring', 'proposals', name,
+  )
+  mkdirSync(directory, { recursive: true })
+  const workflowPath = join(directory, 'workflow.js')
+  writeFileSync(workflowPath, 'export const meta = {}\nreturn {}\n')
+  writeFileSync(join(directory, 'metadata.json'), '{}\n')
+  writeFileSync(join(directory, 'proposal.json'), JSON.stringify({
+    schema_version: 1,
+    workflow_name: name,
+    origin: 'authored',
+    status: 'probation',
+    evidence_binding: {
+      workflow_hash: `sha256:${fileSha256(workflowPath)}`,
+      binding_hash: `sha256:${'b'.repeat(64)}`,
+    },
+  }))
+  return [
+    `PROPOSAL_NAME=${name}`,
+    `PROPOSAL_DIR=${directory}`,
+    'ORIGIN=authored',
+    'STATUS=probation',
+    `METADATA=${join(directory, 'metadata.json')}`,
+    `RECORD=${join(directory, 'proposal.json')}`,
+    '',
+  ].join('\n')
+}
+
+function writeAuthorCatalog(sessionDir: string, name = 'authored-test'): void {
+  const canonicalSession = realpathSync.native(sessionDir)
+  writeFileSync(join(canonicalSession, 'workflow-catalog.json'), JSON.stringify({
+    workflows: [{
+      name,
+      js_path: join(
+        canonicalSession, 'workflow-authoring', 'proposals', name, 'workflow.js',
+      ),
+      probation: true,
+      proposal_status: 'probation',
+      proposal_binding_hash: `sha256:${'b'.repeat(64)}`,
+    }],
+  }))
 }
 
 function appendValidBaselineCustody(
@@ -1824,15 +2170,21 @@ describe('KerSor conversation controls', () => {
     expect(startedPrompt(harness)).toContain(`correctness_command = ${JSON.stringify(launchContract.correctness_command)} (copy and execute verbatim`)
     expect(startedPrompt(harness)).toContain(`benchmark_command = ${JSON.stringify(launchContract.benchmark_command)} (copy and execute verbatim`)
     expect(startedPrompt(harness)).toContain('selected_workflow.name is STALLED is a recoverable routing gap')
+    expect(startedPrompt(harness)).toContain('Use kersor_protocol for profile, select_workflow, and author')
+    expect(startedPrompt(harness)).toContain('the Host owns each complete protocol handoff')
     expect(startedPrompt(harness)).toContain('complete Phase 3.6 and the full same-round selection sequence')
     expect(startedPrompt(harness)).toContain('kersor_workflow({exp_dir: <exact absolute run-N directory>})')
     expect(startedPrompt(harness)).toContain('never call workflow directly')
     expect(startedPrompt(harness)).toContain('first kersor_workflow call permanently consumes that run')
     expect(startedPrompt(harness)).toContain('session-synthesizer is the sole writer')
-    expect(startedPrompt(harness)).toContain('KERSOR_DISPATCH_TRANSFORM_COMMAND_V1')
-    expect(startedPrompt(harness)).toContain('Copy that returned command verbatim')
-    expect(startedPrompt(harness)).toContain('Do not add flags')
-    expect(startedPrompt(harness)).toContain('inspect the injector, probe alternate syntax, or retry')
+    expect(startedPrompt(harness)).not.toContain('KERSOR_DISPATCH_TRANSFORM_COMMAND_V1')
+    expect(startedPrompt(harness)).toContain(
+      'After the foreground dispatch producer succeeds, the Host applies runtime controls',
+    )
+    expect(startedPrompt(harness)).toContain(
+      'call kersor_author_commit with action seal',
+    )
+    expect(startedPrompt(harness)).toContain('The Host owns both executions, receipt custody, and exact-once consumption')
     expect(startedPrompt(harness)).toContain('Never call kersor-state.sh set current_round')
     expect(startedPrompt(harness)).toContain('branch only on PHASE_COMMITTED=complete, advanced, or stalled')
 
@@ -1843,9 +2195,562 @@ describe('KerSor conversation controls', () => {
     expect(resumedPrompt(harness)).toContain(`Typed launch contract (canonical JSON): ${canonical}`)
     expect(resumedPrompt(harness)).toContain('target_speedup = 8 (JSON number only')
     expect(resumedPrompt(harness)).toContain('selected_workflow.name is STALLED is a recoverable routing gap')
+    expect(resumedPrompt(harness)).toContain('Use kersor_protocol for profile, select_workflow, and author')
     expect(resumedPrompt(harness)).toContain('dispatch any non-STALLED commit before synthesizing a terminal STALLED decision')
     expect(resumedPrompt(harness)).toContain('end this controller turn at the unchanged canonical round and resume later')
     expect(starts(harness.session)).toHaveLength(1)
+  })
+
+  it('runs the complete profile handoff with one exact foreground child and Host-held provenance', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-protocol-profile-'))
+    try {
+      const harness = await setup(workspace)
+      const controller = await startController(harness)
+      const sessionDir = join(workspace, '.kersor', 'protocol-profile')
+      writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+      appendValidBaselineCustody(
+        realpathSync.native(sessionDir), realpathSync.native(workspace), controller,
+      )
+      writeKersorProtocolContext(
+        sessionDir,
+        'profile-handoff/context.json',
+        {
+          description: 'Profile one KerSor Session',
+          prompt: 'Write the canonical kernel profile.',
+          run_in_background: false,
+        },
+      )
+      harness.hostTransformSubprocess.stdout = 'helper complete\n'
+      const bashCallsBefore = controller.session.events.filter(event =>
+        event.type === 'tool/call' && event.data.name === 'bash').length
+
+      const result = await call(harness, 'kersor_protocol', {
+        action: 'profile',
+      }, controller)
+
+      expect(result.isError, JSON.stringify(result.content)).toBe(false)
+      expect(result.value).toEqual({
+        action: 'profile',
+        stdout: 'helper complete\nhelper complete\nhelper complete\n',
+        stderr: '',
+      })
+      expect(controller.session.events.filter(event =>
+        event.type === 'tool/call' && event.data.name === 'bash')).toHaveLength(bashCallsBefore)
+      const canonicalSession = realpathSync.native(sessionDir)
+      const script = join(testKersorRoot, 'scripts', 'profile-handoff.py')
+      expect(harness.hostTransformSubprocess.specs.map(spec => spec.argv)).toEqual([
+        [testKersorPython, script, 'context', '--session', canonicalSession],
+        [
+          testKersorPython, script, 'seal', '--session', canonicalSession,
+          '--producer-session-id', 'kersor-protocol-child-1',
+        ],
+        [testKersorPython, script, 'verify', '--session', canonicalSession],
+      ])
+      expect(harness.hostTransformSubprocess.specs[0]).toMatchObject({
+        cwd: realpathSync.native(workspace),
+        env: { KERSOR_PYTHON: testKersorPython, KERSOR_ROOT: testKersorRoot },
+        stdio: {
+          stdin: 'ignore',
+          stdout: { maxBytes: 64 * 1024 },
+          stderr: { maxBytes: 64 * 1024 },
+        },
+        graceMs: 1_000,
+        signal,
+      })
+      const started = harness.subagents.oneShotStarts[0] as {
+        provider: string
+        spec: { label: string; prompt: ContentBlock[]; parent: Agent; signal: AbortSignal }
+      }
+      expect(started).toEqual({
+        provider: 'spawn',
+        spec: {
+          label: 'Profile one KerSor Session',
+          prompt: [{ type: 'text', text: 'Write the canonical kernel profile.' }],
+          parent: controller,
+          signal,
+        },
+      })
+      expect(harness.subagents.disposals).toEqual([SessionId('kersor-protocol-child-1')])
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('ignores a premature profile call and consumes only the first post-baseline call', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-protocol-profile-baseline-'))
+    try {
+      const harness = await setup(workspace)
+      const controller = await startController(harness)
+      const sessionDir = join(workspace, '.kersor', 'protocol-profile-baseline')
+      writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+      writeValidBaselineAuthority(sessionDir, workspace)
+      ensureSessionInitializationFixture(sessionDir, workspace, controller)
+      writeKersorProtocolContext(sessionDir, 'profile-handoff/context.json')
+
+      const premature = await call(harness, 'kersor_protocol', {
+        action: 'profile',
+      }, controller)
+      expect(premature.isError).toBe(true)
+      expect(promptText(premature.content)).toMatch(/baseline|receipt/i)
+      expect(harness.hostTransformSubprocess.specs).toHaveLength(0)
+      expect(harness.subagents.oneShotStarts).toHaveLength(0)
+
+      appendValidBaselineCustody(
+        realpathSync.native(sessionDir), realpathSync.native(workspace), controller,
+      )
+      writeValidSessionState(sessionDir, 1, controller.id)
+      const completed = await call(harness, 'kersor_protocol', {
+        action: 'profile',
+      }, controller)
+      expect(completed.isError, JSON.stringify(completed.content)).toBe(false)
+      expect(harness.hostTransformSubprocess.specs).toHaveLength(3)
+      expect(harness.subagents.oneShotStarts).toHaveLength(1)
+
+      const retry = await call(harness, 'kersor_protocol', {
+        action: 'profile',
+      }, controller)
+      expect(retry.isError).toBe(true)
+      expect(promptText(retry.content)).toMatch(/already consumed|first durable/i)
+      expect(harness.hostTransformSubprocess.specs).toHaveLength(3)
+      expect(harness.subagents.oneShotStarts).toHaveLength(1)
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('derives selection argv and the complete author handoff from durable Session authority', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-protocol-actions-'))
+    try {
+      const harness = await setup(workspace)
+      const controller = await startController(harness)
+      const sessionDir = join(workspace, '.kersor', 'protocol-actions')
+      writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+      ensureSessionInitializationFixture(sessionDir, workspace, controller)
+      writeKersorProtocolContext(
+        sessionDir,
+        'workflow-authoring/author-context.json',
+        {
+          description: 'Author one KerSor workflow proposal',
+          prompt: 'Write the three direct author files.',
+          run_in_background: false,
+          future_dispatch_key: ['accepted'],
+        },
+        { future_owner: { accepted: true } },
+      )
+      const canonicalSession = realpathSync.native(sessionDir)
+      configureSelectionProcesses(harness, sessionDir, 'agent-advise')
+      harness.ctx.tools.register(defineTool({
+        name: 'write',
+        description: 'Write the strategy-selector decision.',
+        parameters: {
+          file_path: { type: 'string', required: true },
+          content: { type: 'string', required: true },
+        },
+        output: {
+          schema: { type: 'string' },
+          render: (_args, value) => [{ type: 'text', text: value }],
+        },
+        execute: (args) => {
+          writeFileSync(args.file_path, args.content)
+          return Promise.resolve(args.file_path)
+        },
+      }))
+      harness.subagents.oneShotRun = async (id) => {
+        if (id === SessionId('kersor-protocol-child-1')) {
+          await new Promise(resolveTimer => setTimeout(resolveTimer, 0))
+          const child = descendantAgent(harness, controller.session, id)
+          const decision = await call(harness, 'write', {
+            file_path: join(canonicalSession, 'round-1-routing-decision.json'),
+            content: JSON.stringify({
+              schema_version: 2,
+              round: 1,
+              chosen_workflow: 'alpha',
+              phase_intent: 'optimize',
+              rationale: 'kernel-profile.md matches alpha',
+              considered: [{
+                name: 'alpha', verdict: 'chosen', rank: 1,
+                confidence_bucket: 'high', why: 'profile fit',
+              }],
+            }),
+          }, child)
+          if (decision.isError) throw new Error(promptText(decision.content))
+        }
+        return { output: [], stopReason: 'completed' }
+      }
+
+      const selection = await call(harness, 'kersor_protocol', {
+        action: 'select_workflow',
+      }, controller)
+      const author = await call(harness, 'kersor_protocol', {
+        action: 'author',
+      }, controller)
+
+      expect(selection.isError, JSON.stringify(selection.content)).toBe(false)
+      expect(author.isError, JSON.stringify(author.content)).toBe(false)
+      const scripts = join(testKersorRoot, 'scripts')
+      expect(harness.hostTransformSubprocess.specs.map(spec => spec.argv)).toEqual([
+        [
+          'bash', join(scripts, 'select-workflow.sh'), canonicalSession, '1',
+          join(canonicalSession, 'workflow-catalog.json'),
+        ],
+        [
+          'bash', join(scripts, 'run-kersor-python.sh'),
+          'selection-handoff.py', '--session', canonicalSession,
+          '--round', '1',
+        ],
+        [
+          'bash', join(scripts, 'finalize-selection.sh'), canonicalSession, '1',
+        ],
+        [
+          'bash', join(scripts, 'run-kersor-python.sh'),
+          'author-workflow-context.py', '--session', canonicalSession,
+          '--out', join(canonicalSession, 'workflow-authoring', 'author-context.json'),
+        ],
+      ])
+      const started = harness.subagents.oneShotStarts[1] as {
+        provider: string
+        spec: { label: string; prompt: ContentBlock[] }
+      }
+      expect(started).toMatchObject({
+        provider: 'spawn',
+        spec: {
+          label: 'Author one KerSor workflow proposal',
+          prompt: [{ type: 'text', text: 'Write the three direct author files.' }],
+        },
+      })
+      expect(harness.subagents.oneShotStarts[0]).toMatchObject({
+        provider: 'spawn',
+        spec: {
+          label: 'Choose KerSor workflow for round 1',
+          prompt: [{
+            type: 'text',
+            text: 'Read the Core strategy-selector role and write its decision.',
+          }],
+          toolFilter: { allow: ['read', 'glob', 'grep', 'write'] },
+        },
+      })
+      expect(harness.subagents.disposals).toEqual([
+        SessionId('kersor-protocol-child-1'),
+        SessionId('kersor-protocol-child-2'),
+      ])
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it.each(['stalled', 'locked'] as const)(
+    'finalizes a %s selection without starting a strategy-selector child',
+    async (disposition) => {
+      const workspace = mkdtempSync(join(tmpdir(), `dsh-kersor-selection-${disposition}-`))
+      try {
+        const harness = await setup(workspace)
+        const controller = await startController(harness)
+        const sessionDir = join(workspace, '.kersor', `selection-${disposition}`)
+        writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+        ensureSessionInitializationFixture(sessionDir, workspace, controller)
+        configureSelectionProcesses(harness, sessionDir, disposition)
+
+        const result = await call(
+          harness,
+          'kersor_protocol',
+          { action: 'select_workflow' },
+          controller,
+        )
+
+        expect(result.isError, JSON.stringify(result.content)).toBe(false)
+        expect(harness.subagents.oneShotStarts).toHaveLength(0)
+        expect(harness.hostTransformSubprocess.specs).toHaveLength(3)
+        expect(harness.hostTransformSubprocess.specs[2]?.argv[1]).toMatch(
+          /finalize-selection\.sh$/,
+        )
+        const selection = readJsonFixture(
+          join(realpathSync.native(sessionDir), 'round-1-selection.json'),
+        ) as { attempt_plan: { status: string; commit: { status: string } } }
+        expect(selection.attempt_plan.status).toBe('committed')
+        expect(selection.attempt_plan.commit.status).toBe('committed')
+      } finally {
+        rmSync(workspace, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it('rejects a strategy-selector that completes with externally written bytes but no accepted Write', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-selection-unobserved-write-'))
+    try {
+      const harness = await setup(workspace)
+      const controller = await startController(harness)
+      const sessionDir = join(workspace, '.kersor', 'selection-unobserved-write')
+      writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+      ensureSessionInitializationFixture(sessionDir, workspace, controller)
+      configureSelectionProcesses(harness, sessionDir, 'agent-advise')
+      harness.subagents.oneShotRun = async () => {
+        await new Promise(resolveTimer => setTimeout(resolveTimer, 0))
+        writeFileSync(
+          join(realpathSync.native(sessionDir), 'round-1-routing-decision.json'),
+          JSON.stringify({ chosen_workflow: 'alpha', rationale: 'external write' }),
+        )
+        return { output: [], stopReason: 'completed' }
+      }
+
+      const result = await call(
+        harness, 'kersor_protocol', { action: 'select_workflow' }, controller,
+      )
+
+      expect(result.isError).toBe(true)
+      expect(promptText(result.content)).toMatch(/Host-observed.*write/i)
+      expect(harness.hostTransformSubprocess.specs).toHaveLength(2)
+      expect(harness.subagents.disposals).toEqual([
+        SessionId('kersor-protocol-child-1'),
+      ])
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a repeated same-catalog selection but permits a changed-catalog re-selection', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-selection-catalog-boundary-'))
+    try {
+      const harness = await setup(workspace)
+      const controller = await startController(harness)
+      const sessionDir = join(workspace, '.kersor', 'selection-catalog-boundary')
+      writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+      ensureSessionInitializationFixture(sessionDir, workspace, controller)
+      configureSelectionProcesses(harness, sessionDir, 'locked')
+
+      const first = await call(
+        harness, 'kersor_protocol', { action: 'select_workflow' }, controller,
+      )
+      const repeated = await call(
+        harness, 'kersor_protocol', { action: 'select_workflow' }, controller,
+      )
+
+      expect(first.isError, JSON.stringify(first.content)).toBe(false)
+      expect(repeated.isError).toBe(true)
+      expect(promptText(repeated.content)).toMatch(/already consumed|unchanged workflow catalog/i)
+      expect(harness.hostTransformSubprocess.specs).toHaveLength(3)
+
+      writeFileSync(join(realpathSync.native(sessionDir), 'workflow-catalog.json'), JSON.stringify({
+        schema_version: 1,
+        workflows: [{ name: 'new-proposal' }],
+      }))
+      const reselection = await call(
+        harness, 'kersor_protocol', { action: 'select_workflow' }, controller,
+      )
+
+      expect(reselection.isError, JSON.stringify(reselection.content)).toBe(false)
+      expect(harness.hostTransformSubprocess.specs).toHaveLength(6)
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects environment-only paired routing before selection starts', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-selection-paired-'))
+    const originalPair = process.env.KERSOR_PAIR_ID
+    try {
+      const harness = await setup(workspace)
+      const controller = await startController(harness)
+      const sessionDir = join(workspace, '.kersor', 'selection-paired')
+      writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+      ensureSessionInitializationFixture(sessionDir, workspace, controller)
+      process.env.KERSOR_PAIR_ID = 'pair-1'
+
+      const result = await call(
+        harness, 'kersor_protocol', { action: 'select_workflow' }, controller,
+      )
+
+      expect(result.isError).toBe(true)
+      expect(promptText(result.content)).toMatch(/paired routing|durable Session authority/i)
+      expect(harness.hostTransformSubprocess.specs).toHaveLength(0)
+      expect(harness.subagents.oneShotStarts).toHaveLength(0)
+    } finally {
+      if (originalPair === undefined) delete process.env.KERSOR_PAIR_ID
+      else process.env.KERSOR_PAIR_ID = originalPair
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    [{ action: 'profile', producer_session_id: 'unexpected-child' }],
+    [{ action: 'profile_context' }],
+    [{ action: 'author', session_dir: '/tmp/guess' }],
+    [{ action: 'unknown' }],
+  ])('rejects non-canonical typed protocol arguments %j before subprocess dispatch', async (args) => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-protocol-arguments-'))
+    try {
+      const harness = await setup(workspace)
+      const controller = await startController(harness)
+      const sessionDir = join(workspace, '.kersor', 'protocol-arguments')
+      writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+      ensureSessionInitializationFixture(sessionDir, workspace, controller)
+
+      const result = await call(harness, 'kersor_protocol', args, controller)
+
+      expect(result.isError).toBe(true)
+      expect(harness.hostTransformSubprocess.specs).toHaveLength(0)
+      expect(harness.subagents.oneShotStarts).toHaveLength(0)
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it.each(['session', 'description', 'prompt', 'background'])(
+    'rejects an invalid %s field in the Host-read author dispatch',
+    async (field) => {
+      const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-protocol-context-'))
+      try {
+        const harness = await setup(workspace)
+        const controller = await startController(harness)
+        const sessionDir = join(workspace, '.kersor', 'protocol-context')
+        writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+        ensureSessionInitializationFixture(sessionDir, workspace, controller)
+        const path = writeKersorProtocolContext(
+          sessionDir, 'workflow-authoring/author-context.json',
+        )
+        const context = readJsonFixture(path) as Record<string, unknown>
+        const dispatch = context.dispatch as Record<string, unknown>
+        if (field === 'session') context.session_dir = `${sessionDir}-other`
+        else if (field === 'description') dispatch.description = '  '
+        else if (field === 'prompt') dispatch.prompt = ''
+        else dispatch.run_in_background = true
+        writeFileSync(path, JSON.stringify(context))
+
+        const result = await call(harness, 'kersor_protocol', {
+          action: 'author',
+        }, controller)
+
+        expect(result.isError).toBe(true)
+        expect(harness.hostTransformSubprocess.specs).toHaveLength(1)
+        expect(harness.subagents.oneShotStarts).toHaveLength(0)
+      } finally {
+        rmSync(workspace, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it('durably consumes profile after a child failure and never launches a retry', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-protocol-child-failure-'))
+    try {
+      const harness = await setup(workspace)
+      const controller = await startController(harness)
+      const sessionDir = join(workspace, '.kersor', 'protocol-child-failure')
+      writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+      appendValidBaselineCustody(
+        realpathSync.native(sessionDir), realpathSync.native(workspace), controller,
+      )
+      writeKersorProtocolContext(sessionDir, 'profile-handoff/context.json')
+      harness.subagents.oneShotResult = {
+        output: [{ type: 'text', text: 'partial profile' }],
+        stopReason: 'error',
+        diagnostic: 'profiler failed',
+      }
+
+      const result = await call(harness, 'kersor_protocol', {
+        action: 'profile',
+      }, controller)
+
+      expect(result.isError).toBe(true)
+      expect(promptText(result.content)).toContain('profiler failed')
+      expect(harness.hostTransformSubprocess.specs).toHaveLength(1)
+      expect(harness.subagents.oneShotStarts).toHaveLength(1)
+      expect(harness.subagents.disposals).toEqual([SessionId('kersor-protocol-child-1')])
+
+      const retry = await call(harness, 'kersor_protocol', {
+        action: 'profile',
+      }, controller)
+      expect(retry.isError).toBe(true)
+      expect(promptText(retry.content)).toMatch(/already consumed|first durable/i)
+      expect(harness.hostTransformSubprocess.specs).toHaveLength(1)
+      expect(harness.subagents.oneShotStarts).toHaveLength(1)
+      expect(harness.subagents.disposals).toEqual([SessionId('kersor-protocol-child-1')])
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects typed protocol calls from descendants, attached controllers, and closed Experiments', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-protocol-authority-'))
+    try {
+      const descendantHarness = await setup(workspace)
+      const controller = await startController(descendantHarness)
+      const sessionDir = join(workspace, '.kersor', 'protocol-authority')
+      writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+      ensureSessionInitializationFixture(sessionDir, workspace, controller)
+      const descendant = descendantAgent(descendantHarness, controller.session, 'protocol-descendant')
+      const descendantResult = await call(descendantHarness, 'kersor_protocol', {
+        action: 'profile',
+      }, descendant)
+      expect(descendantResult.isError).toBe(true)
+
+      const closedStart = starts(descendantHarness.session)[0]!
+      descendantHarness.session.append('kersor/experiment-checkpoint', {
+        experimentId: closedStart.data.experimentId,
+        childSessionId: controller.id,
+        revision: 2,
+        status: 'completed',
+        steps: [],
+      } as never)
+      const closedResult = await call(descendantHarness, 'kersor_protocol', {
+        action: 'profile',
+      }, controller)
+      expect(closedResult.isError).toBe(true)
+      expect(promptText(closedResult.content)).toMatch(/closed|terminal|completed/i)
+
+      const attachedHarness = await setup(workspace)
+      const origin = appendDurableOrigin(attachedHarness)
+      const attachedResult = await call(
+        attachedHarness, 'kersor_attach', attachArguments(origin),
+      )
+      expect(attachedResult.isError, JSON.stringify(attachedResult.content)).toBe(false)
+      const attachedStart = starts(attachedHarness.session)[0]!
+      const attachedController = descendantAgent(
+        attachedHarness, attachedHarness.session, attachedStart.data.childSessionId,
+      )
+      const protocolResult = await call(attachedHarness, 'kersor_protocol', {
+        action: 'profile',
+      }, attachedController)
+      expect(protocolResult.isError).toBe(true)
+      expect(promptText(protocolResult.content)).toMatch(/created Session|attached/i)
+      expect(attachedHarness.hostTransformSubprocess.specs).toHaveLength(0)
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('does not report typed protocol success when its subprocess exits nonzero', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-protocol-failure-'))
+    try {
+      const harness = await setup(workspace)
+      const controller = await startController(harness)
+      const sessionDir = join(workspace, '.kersor', 'protocol-failure')
+      writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+      appendValidBaselineCustody(
+        realpathSync.native(sessionDir), realpathSync.native(workspace), controller,
+      )
+      harness.hostTransformSubprocess.exitCode = 7
+      harness.hostTransformSubprocess.stdout = 'misleading success\n'
+      harness.hostTransformSubprocess.stderr = 'profile context failed\n'
+
+      const result = await call(harness, 'kersor_protocol', {
+        action: 'profile',
+      }, controller)
+
+      expect(result.isError).toBe(true)
+      expect(promptText(result.content)).toContain('exit 7')
+      expect(promptText(result.content)).toContain('profile context failed')
+      expect(harness.hostTransformSubprocess.specs).toHaveLength(1)
+      expect(harness.subagents.oneShotStarts).toHaveLength(0)
+
+      const retry = await call(harness, 'kersor_protocol', {
+        action: 'profile',
+      }, controller)
+      expect(retry.isError).toBe(true)
+      expect(promptText(retry.content)).toMatch(/already consumed|first durable/i)
+      expect(harness.hostTransformSubprocess.specs).toHaveLength(1)
+      expect(harness.subagents.oneShotStarts).toHaveLength(0)
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
   })
 
   it('requires a typed launch before creating a fresh Experiment binding', async () => {
@@ -3076,6 +3981,125 @@ describe('KerSor conversation controls', () => {
     }
   })
 
+  it('returns the current Session next exact baseline command after equivalent shell quoting is denied', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-baseline-command-hint-'))
+    try {
+      const harness = await setup(workspace)
+      const controller = await startController(harness)
+      writeFileSync(join(workspace, 'kernel.py'), 'VALUE = 1\n')
+      const sessionDir = join(workspace, '.kersor', "quoted'baseline")
+      mkdirSync(sessionDir, { recursive: true })
+      appendValidBaselineCustody(
+        realpathSync.native(sessionDir), realpathSync.native(workspace), controller, 1,
+      )
+      const exact = baselineRecordCommand(sessionDir, workspace)
+      const equivalent = exact.replaceAll("'\\''", "'\"'\"'")
+      expect(exact).toContain("'\\''")
+      expect(equivalent).toContain("'\"'\"'")
+      expect(equivalent).not.toBe(exact)
+      const calls: string[] = []
+      registerBashProbe(harness, calls)
+
+      const result = await call(harness, 'bash', { command: equivalent }, controller)
+
+      expect(result.isError).toBe(true)
+      expect(promptText(result.content)).toContain(
+        `Current Session next baseline phase is record. Required exact command: ${exact}`,
+      )
+      expect(calls).toEqual([])
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    {
+      name: 'nonzero exit', exitCode: 23, signal: null,
+      timedOut: false, aborted: false, expectedStatus: 'exit code 23',
+    },
+    {
+      name: 'signal termination', exitCode: null, signal: 'SIGTERM',
+      timedOut: false, aborted: false, expectedStatus: 'signal SIGTERM',
+    },
+    {
+      name: 'timeout', exitCode: null, signal: null,
+      timedOut: true, aborted: false, expectedStatus: 'timed out',
+    },
+    {
+      name: 'missing exit status', exitCode: null, signal: null,
+      timedOut: false, aborted: false, expectedStatus: 'exit code unavailable',
+    },
+  ] as const)('preserves a foreground baseline Bash $name instead of finishing missing custody artifacts', async ({
+    name, exitCode, signal: exitSignal, timedOut, aborted, expectedStatus,
+  }) => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-baseline-bash-failure-'))
+    let shell: SetupSandboxExecutor | undefined
+    try {
+      const harness = await setup(workspace, async (ctx) => {
+        await ctx.plugin(SandboxPolicyService, {
+          mode: 'workspace-write',
+          workspaceRoot: workspace,
+        })
+        await ctx.plugin(SetupSandboxExecutor)
+        shell = ctx.shell as SetupSandboxExecutor
+        await ctx.plugin(BashEnv)
+        await ctx.plugin(ToolBash)
+      })
+      const controller = await startController(harness)
+      writeFileSync(join(workspace, 'kernel.py'), 'VALUE = 1\n')
+      const sessionDir = join(workspace, '.kersor', 'baseline-bash-failure')
+      mkdirSync(sessionDir, { recursive: true })
+      writeValidBaselineAuthority(sessionDir, workspace)
+      ensureSessionInitializationFixture(sessionDir, workspace, controller)
+      rmSync(join(sessionDir, 'test-method.md'))
+      rmSync(join(sessionDir, 'baseline-witness.json'))
+      shell!.resultFor = spec => ({
+        exitCode,
+        signal: exitSignal,
+        timedOut,
+        aborted,
+        timeoutMs: spec.timeoutMs,
+        stdout: { text: '', truncated: false },
+        stderr: { text: `baseline helper ${name}\n`, truncated: false },
+        sandbox: {
+          mode: spec.sandboxPolicy?.mode ?? 'workspace-write',
+          denied: false,
+          enforcement: 'full',
+          runnerFailed: false,
+        },
+      })
+      const command = baselineInitCommand(sessionDir)
+
+      const result = await call(harness, 'bash', {
+        command,
+        description: 'Initialize the baseline witness',
+        run_in_background: false,
+      }, controller)
+
+      expect(result.isError).toBe(true)
+      const feedback = promptText(result.content)
+      expect(feedback).toContain(`baseline helper ${name}`)
+      expect(feedback).toContain(expectedStatus)
+      expect(feedback).toContain('exact-once baseline phase is consumed')
+      expect(feedback).not.toMatch(/test method|baseline witness.*(?:missing|ENOENT)/i)
+      expect(shell!.calls).toHaveLength(1)
+      expect(existsSync(join(sessionDir, 'baseline-initialization-receipt.json'))).toBe(false)
+      expect(controller.session.events.some(event =>
+        event.type === 'kersor/baseline-initialized')).toBe(false)
+
+      const retry = await call(harness, 'bash', {
+        command,
+        description: 'Retry the baseline witness initialization',
+        run_in_background: false,
+      }, controller)
+      expect(retry.isError).toBe(true)
+      expect(promptText(retry.content)).toContain('exact-once')
+      expect(shell!.calls).toHaveLength(1)
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
   it('denies the exact canonical setup command from a controller descendant pre-execution', async () => {
     const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-descendant-setup-'))
     try {
@@ -3312,6 +4336,41 @@ describe('KerSor conversation controls', () => {
     }
   })
 
+  it('rejects a sealed Workflow envelope when its selected Workflow reverted to pending', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-envelope-pending-selection-'))
+    try {
+      const calls: string[] = []
+      const harness = await setup(workspace)
+      registerWorkflowProbe(harness, {
+        runId: 'workflow-pending-selection', agentsStarted: 1, result: { bypass: true },
+      }, calls)
+      const controller = await startController(harness)
+      const runDir = makeRunDirectory(workspace)
+      writeWorkflowEnvelope(runDir, controller)
+      const selectionPath = join(dirname(runDir), 'round-1-selection.json')
+      const selection = readJsonFixture(selectionPath) as {
+        routing: { decided_by: string }
+        attempt_plan: {
+          status: string
+          commit: { status: string; workflow: string }
+        }
+      }
+      selection.routing.decided_by = 'agent-advise-pending'
+      selection.attempt_plan.status = 'proposed'
+      selection.attempt_plan.commit.status = 'proposed'
+      writeFileSync(selectionPath, JSON.stringify(selection))
+
+      const result = await call(harness, 'kersor_workflow', { exp_dir: runDir }, controller)
+
+      expect(result.isError).toBe(true)
+      expect(promptText(result.content)).toMatch(/committed selection|selection.*commit/i)
+      expect(calls).toEqual([])
+      expect(existsSync(join(runDir, 'output.json'))).toBe(false)
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
   it('loads and executes a sealed Workflow envelope Host-side from exp_dir only', async () => {
     const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-sealed-workflow-'))
     try {
@@ -3458,7 +4517,7 @@ describe('KerSor conversation controls', () => {
     }
   })
 
-  it('denies direct controller writes to dispatch semantic artifacts and Host receipts', async () => {
+  it('denies direct controller writes to routing, dispatch semantic artifacts, and Host receipts', async () => {
     const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-dispatch-write-'))
     try {
       const harness = await setup(workspace)
@@ -3467,6 +4526,13 @@ describe('KerSor conversation controls', () => {
       registerFileProbe(harness, 'edit', fileCalls)
       const controller = await startController(harness)
       const runDir = makeRunDirectory(workspace)
+      const routingDecision = join(dirname(runDir), 'round-1-routing-decision.json')
+      expect((await call(
+        harness, 'write', { file_path: routingDecision }, controller,
+      )).isError).toBe(true)
+      expect((await call(
+        harness, 'edit', { file_path: routingDecision }, controller,
+      )).isError).toBe(true)
       for (const name of [
         'dispatch-args.json',
         'dispatch-args-provenance.json',
@@ -3509,6 +4575,31 @@ describe('KerSor conversation controls', () => {
         },
       )
       const producerArgs = dispatchProducerArguments(sessionDir, runDir, workflowName)
+      harness.ctx.on('tools/execute', async (exec, next) => {
+        const result = await next()
+        if (exec.name === 'subagent') {
+          process.env.KERSOR_PYTHON = join(canonicalWorkspace, 'reconfigured-python')
+          process.env.KERSOR_ROOT = join(canonicalWorkspace, 'reconfigured-root')
+        }
+        return result
+      })
+      harness.hostTransformSubprocess.onSpawn = () => {
+        expect(existsSync(join(runDir, 'dispatch-args-producer-receipt.json'))).toBe(true)
+        expect(controller.session.events.some(event =>
+          event.type === 'kersor/dispatch-args-produced')).toBe(true)
+        const argsPath = join(runDir, 'dispatch-args.json')
+        const provenancePath = join(runDir, 'dispatch-args-provenance.json')
+        const dispatchArgs = JSON.parse(readFileSync(argsPath, 'utf8')) as Record<string, unknown>
+        const provenance = JSON.parse(readFileSync(provenancePath, 'utf8')) as Record<string, unknown>
+        dispatchArgs.termination_file = join(sessionDir, 'terminate')
+        provenance.runtime_controls = {
+          termination_file: {
+            source: 'campaign_environment', value: dispatchArgs.termination_file,
+          },
+        }
+        writeFileSync(argsPath, JSON.stringify(dispatchArgs))
+        writeFileSync(provenancePath, JSON.stringify(provenance))
+      }
 
       const first = await call(harness, 'subagent', producerArgs, controller)
 
@@ -3524,18 +4615,30 @@ describe('KerSor conversation controls', () => {
       const produced = controller.session.events.filter(event =>
         event.type === 'kersor/dispatch-args-produced')
       expect(produced).toHaveLength(1)
-      const producerEvent = produced[0]
-      if (producerEvent?.type !== 'kersor/dispatch-args-produced') {
-        throw new Error('missing durable dispatch producer event')
-      }
-      expect(first.additionalContexts).toHaveLength(1)
-      expect(promptText(first.additionalContexts?.[0]?.content ?? [])).toBe([
-        'KERSOR_DISPATCH_TRANSFORM_COMMAND_V1',
-        `Host durable producer binding: run_dir=${runDir}; producer_call_id=${producerEvent.data.producer_call_id}.`,
-        'Execute the following exact single Bash command once, verbatim:',
-        runtimeControlsCommand(runDir),
-        'Do not add flags, variables, redirections, prefixes, or suffixes. Do not inspect the injector, probe alternate syntax, or retry after any rejection or failure.',
-      ].join('\n'))
+      expect(first.additionalContexts).toBeUndefined()
+      expect(harness.hostTransformSubprocess.specs).toHaveLength(1)
+      expect(harness.hostTransformSubprocess.specs[0]).toMatchObject({
+        argv: [
+          testKersorPython,
+          join(testKersorRoot, 'scripts', 'inject-runtime-controls.py'),
+          runDir,
+        ],
+        cwd: canonicalWorkspace,
+        signal,
+      })
+      const transformed = controller.session.events.filter(event =>
+        event.type === 'kersor/dispatch-args-transformed')
+      expect(transformed).toHaveLength(1)
+      expect(transformed[0]?.data).toMatchObject({
+        transformation_call_id: produced[0]?.data.producer_call_id,
+        changed: true,
+        authorized_fields: {
+          dispatch_args: ['termination_file'],
+          dispatch_args_provenance: ['runtime_controls'],
+        },
+      })
+      process.env.KERSOR_PYTHON = testKersorPython
+      process.env.KERSOR_ROOT = testKersorRoot
 
       const retry = await call(harness, 'subagent', producerArgs, controller)
       expect(retry.isError).toBe(true)
@@ -3546,7 +4649,79 @@ describe('KerSor conversation controls', () => {
     }
   })
 
-  it('publishes no producer custody when the Host cannot mint its transform context', async () => {
+  it.each([
+    'pending-plan',
+    'pending-commit',
+    'mismatched-workflow',
+    'pending-routing',
+  ] as const)(
+    'rejects a foreground dispatch producer when the selected Workflow has %s',
+    async (failure) => {
+      const workspace = mkdtempSync(join(tmpdir(), `dsh-kersor-selection-${failure}-`))
+      try {
+        const canonicalWorkspace = realpathSync(workspace)
+        const harness = await setup(canonicalWorkspace)
+        const controller = await startController(harness)
+        const runDir = makeRunDirectory(canonicalWorkspace)
+        const sessionDir = dirname(runDir)
+        writeFileSync(join(canonicalWorkspace, 'kernel.py'), 'VALUE = 1\n')
+        appendValidBaselineCustody(sessionDir, canonicalWorkspace, controller)
+        writeDispatchSelection(sessionDir)
+        const selectionPath = join(sessionDir, 'round-1-selection.json')
+        const selection = readJsonFixture(selectionPath) as {
+          routing: { decided_by: string }
+          attempt_plan: {
+            status: string
+            commit: { status: string; workflow: string }
+          }
+        }
+        if (failure === 'pending-plan') {
+          selection.attempt_plan.status = 'proposed'
+        } else if (failure === 'pending-commit') {
+          selection.attempt_plan.commit.status = 'proposed'
+        } else if (failure === 'mismatched-workflow') {
+          selection.attempt_plan.commit.workflow = 'other-workflow'
+        } else {
+          selection.routing.decided_by = 'agent-advise-pending-demoted'
+        }
+        writeFileSync(selectionPath, JSON.stringify(selection))
+        const calls: string[] = []
+        const producer = descendantAgent(
+          harness, controller.session, `dispatch-producer-${failure}`,
+        )
+        registerDispatchProducerProbe(
+          harness,
+          producer,
+          runDir,
+          { exp_dir: runDir, kernel_path: '/tmp/kernel.py' },
+          {
+            schema_version: 1,
+            source: 'dispatch-arg-synthesizer',
+            workflow_name: workflowMeta.name,
+            missing_required: [],
+            unmet_note_requirements: [],
+          },
+          calls,
+        )
+
+        const result = await call(
+          harness,
+          'subagent',
+          dispatchProducerArguments(sessionDir, runDir),
+          controller,
+        )
+
+        expect(result.isError).toBe(true)
+        expect(promptText(result.content)).toMatch(/committed selection|selection.*commit/i)
+        expect(calls).toEqual([])
+        expect(existsSync(join(runDir, 'dispatch-args-producer-receipt.json'))).toBe(false)
+      } finally {
+        rmSync(workspace, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it('keeps durable producer custody when the Host runtime-control subprocess fails', async () => {
     const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-producer-context-fail-'))
     try {
       const canonicalWorkspace = realpathSync(workspace)
@@ -3571,13 +4746,8 @@ describe('KerSor conversation controls', () => {
           unmet_note_requirements: [],
         },
       )
-      harness.ctx.on('tools/execute', async (exec, next) => {
-        const result = await next()
-        if (exec.name === 'subagent') {
-          process.env.KERSOR_PYTHON = join(canonicalWorkspace, 'missing-python')
-        }
-        return result
-      })
+      harness.hostTransformSubprocess.exitCode = 23
+      harness.hostTransformSubprocess.stderr = 'runtime controls failed\n'
 
       const result = await call(
         harness,
@@ -3585,14 +4755,15 @@ describe('KerSor conversation controls', () => {
         dispatchProducerArguments(sessionDir, runDir),
         controller,
       )
-      process.env.KERSOR_PYTHON = testKersorPython
-
       expect(result.isError).toBe(true)
-      expect(promptText(result.content)).toMatch(/producer custody failed|Host KERSOR_PYTHON/i)
+      expect(promptText(result.content)).toMatch(/producer custody failed|runtime controls failed/i)
       expect(result.additionalContexts).toBeUndefined()
-      expect(existsSync(join(runDir, 'dispatch-args-producer-receipt.json'))).toBe(false)
+      expect(existsSync(join(runDir, 'dispatch-args-producer-receipt.json'))).toBe(true)
       expect(controller.session.events.filter(event =>
-        event.type === 'kersor/dispatch-args-produced')).toHaveLength(0)
+        event.type === 'kersor/dispatch-args-produced')).toHaveLength(1)
+      expect(existsSync(join(runDir, 'dispatch-args-transformation-receipt.json'))).toBe(false)
+      expect(controller.session.events.filter(event =>
+        event.type === 'kersor/dispatch-args-transformed')).toHaveLength(0)
     } finally {
       process.env.KERSOR_PYTHON = testKersorPython
       rmSync(workspace, { recursive: true, force: true })
@@ -3783,260 +4954,7 @@ describe('KerSor conversation controls', () => {
     }
   })
 
-  it('links one authorized runtime-control transformation from producer input to current bytes', async () => {
-    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-dispatch-transform-'))
-    try {
-      const canonicalWorkspace = realpathSync(workspace)
-      const harness = await setup(canonicalWorkspace)
-      const controller = await startController(harness)
-      const runDir = makeRunDirectory(canonicalWorkspace)
-      writeWorkflowEnvelope(runDir, controller, workflowArguments(runDir), {
-        appendTransformation: false,
-        writeCandidateSeal: false,
-      })
-      harness.ctx.tools.register(defineTool({
-        name: 'bash',
-        description: 'Apply the deterministic runtime-control probe.',
-        parameters: { command: { type: 'string', required: true } },
-        output: {
-          schema: { type: 'string' },
-          render: (_args, value) => [{ type: 'text', text: value }],
-        },
-        execute: (args) => {
-          const argsPath = join(runDir, 'dispatch-args.json')
-          const provenancePath = join(runDir, 'dispatch-args-provenance.json')
-          const dispatchArgs = JSON.parse(readFileSync(argsPath, 'utf8')) as Record<string, unknown>
-          const provenance = JSON.parse(readFileSync(provenancePath, 'utf8')) as Record<string, unknown>
-          dispatchArgs.termination_file = join(dirname(runDir), 'terminate')
-          provenance.runtime_controls = {
-            termination_file: {
-              source: 'campaign_environment', value: dispatchArgs.termination_file,
-            },
-          }
-          writeFileSync(argsPath, JSON.stringify(dispatchArgs))
-          writeFileSync(provenancePath, JSON.stringify(provenance))
-          return Promise.resolve(args.command)
-        },
-      }))
-
-      const transformed = await call(harness, 'bash', {
-        command: runtimeControlsCommand(runDir),
-      }, controller)
-
-      expect(transformed.isError, JSON.stringify(transformed.content)).toBe(false)
-      const receipt = readJsonFixture(
-        join(runDir, 'dispatch-args-transformation-receipt.json'),
-      ) as DispatchTransformationReceiptFixture
-      expect(receipt).toMatchObject({
-        contract: 'dsh_dispatch_args_transformation_v1',
-        authority: 'dsh_host',
-        transformer: 'inject-runtime-controls',
-        changed: true,
-        authorized_fields: {
-          dispatch_args: ['termination_file'],
-          dispatch_args_provenance: ['runtime_controls'],
-        },
-      })
-      expect(receipt.input.dispatch_args.sha256).not.toBe(receipt.output.dispatch_args.sha256)
-      expect(controller.session.events.filter(event =>
-        event.type === 'kersor/dispatch-args-transformed')).toHaveLength(1)
-    } finally {
-      rmSync(workspace, { recursive: true, force: true })
-    }
-  })
-
-  it('mints a durable changed=false receipt when the canonical runtime-control pass is a no-op', async () => {
-    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-dispatch-transform-noop-'))
-    try {
-      const canonicalWorkspace = realpathSync(workspace)
-      const harness = await setup(canonicalWorkspace)
-      const controller = await startController(harness)
-      const runDir = makeRunDirectory(canonicalWorkspace)
-      writeWorkflowEnvelope(runDir, controller, workflowArguments(runDir), {
-        appendTransformation: false,
-        writeCandidateSeal: false,
-      })
-      registerBashProbe(harness, [])
-
-      const transformed = await call(harness, 'bash', {
-        command: runtimeControlsCommand(runDir),
-      }, controller)
-
-      expect(transformed.isError, JSON.stringify(transformed.content)).toBe(false)
-      expect(JSON.parse(readFileSync(
-        join(runDir, 'dispatch-args-transformation-receipt.json'), 'utf8',
-      ))).toMatchObject({
-        contract: 'dsh_dispatch_args_transformation_v1',
-        changed: false,
-        authorized_fields: { dispatch_args: [], dispatch_args_provenance: [] },
-      })
-      expect(controller.session.events.filter(event =>
-        event.type === 'kersor/dispatch-args-transformed')).toHaveLength(1)
-    } finally {
-      rmSync(workspace, { recursive: true, force: true })
-    }
-  })
-
-  it('parses run-1 and run-10 exactly when authorizing runtime-control transformation', async () => {
-    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-transform-round-prefix-'))
-    try {
-      const canonicalWorkspace = realpathSync(workspace)
-      const harness = await setup(canonicalWorkspace)
-      const controller = await startController(harness)
-      const run1 = makeRunDirectory(canonicalWorkspace, 'run-1')
-      writeWorkflowEnvelope(run1, controller, workflowArguments(run1), {
-        appendTransformation: false,
-        writeCandidateSeal: false,
-      })
-      const run10 = makeRunDirectory(canonicalWorkspace, 'run-10')
-      writeWorkflowEnvelope(run10, controller, workflowArguments(run10), {
-        appendTransformation: false,
-        writeCandidateSeal: false,
-      })
-      const calls: string[] = []
-      registerBashProbe(harness, calls)
-      const command = runtimeControlsCommand(run10)
-
-      const result = await call(harness, 'bash', { command }, controller)
-
-      expect(result.isError, JSON.stringify(result.content)).toBe(false)
-      expect(calls).toEqual([command])
-      expect(controller.session.events.filter(event =>
-        event.type === 'kersor/dispatch-args-transformed'
-        && event.data.run_dir === realpathSync(run10))).toHaveLength(1)
-    } finally {
-      rmSync(workspace, { recursive: true, force: true })
-    }
-  })
-
-  it('ignores historical non-canonical injector-shaped calls for exact-once custody', async () => {
-    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-transform-history-'))
-    try {
-      const canonicalWorkspace = realpathSync(workspace)
-      const harness = await setup(canonicalWorkspace)
-      const controller = await startController(harness)
-      const runDir = makeRunDirectory(canonicalWorkspace)
-      writeWorkflowEnvelope(runDir, controller, workflowArguments(runDir), {
-        appendTransformation: false,
-        writeCandidateSeal: false,
-      })
-      const canonical = runtimeControlsCommand(runDir)
-      controller.session.append('tool/call', {
-        turn: 1,
-        step: 1,
-        callId: CallId('historical-unrelated-injector'),
-        name: 'bash',
-        arguments: JSON.stringify({ command: `printf ignored && ${canonical} --dry-run` }),
-      })
-      const calls: string[] = []
-      registerBashProbe(harness, calls)
-
-      const result = await call(harness, 'bash', { command: canonical }, controller)
-
-      expect(result.isError, JSON.stringify(result.content)).toBe(false)
-      expect(calls).toEqual([canonical])
-      expect(controller.session.events.filter(event =>
-        event.type === 'kersor/dispatch-args-transformed')).toHaveLength(1)
-    } finally {
-      rmSync(workspace, { recursive: true, force: true })
-    }
-  })
-
-  it('denies a non-canonical compound injector command before execution', async () => {
-    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-transform-parser-'))
-    try {
-      const canonicalWorkspace = realpathSync(workspace)
-      const harness = await setup(canonicalWorkspace)
-      const controller = await startController(harness)
-      const runDir = makeRunDirectory(canonicalWorkspace)
-      writeWorkflowEnvelope(runDir, controller, workflowArguments(runDir), {
-        appendTransformation: false,
-        writeCandidateSeal: false,
-      })
-      const calls: string[] = []
-      registerBashProbe(harness, calls)
-      const canonical = runtimeControlsCommand(runDir)
-
-      const result = await call(harness, 'bash', {
-        command: `true && ${canonical}`,
-      }, controller)
-
-      expect(result.isError).toBe(true)
-      expect(promptText(result.content)).toContain(`Required exact command: ${canonical}`)
-      expect(promptText(result.content)).toContain('Do not retry this transform call')
-      expect(calls).toEqual([])
-    } finally {
-      rmSync(workspace, { recursive: true, force: true })
-    }
-  })
-
-  it('denies an exact canonical injector command from a controller descendant', async () => {
-    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-transform-descendant-'))
-    try {
-      const canonicalWorkspace = realpathSync(workspace)
-      const harness = await setup(canonicalWorkspace)
-      const controller = await startController(harness)
-      const runDir = makeRunDirectory(canonicalWorkspace)
-      writeWorkflowEnvelope(runDir, controller, workflowArguments(runDir), {
-        appendTransformation: false,
-        writeCandidateSeal: false,
-      })
-      const descendant = descendantAgent(harness, controller.session, 'injector-descendant')
-      const calls: string[] = []
-      registerBashProbe(harness, calls)
-
-      const result = await call(harness, 'bash', {
-        command: runtimeControlsCommand(runDir),
-      }, descendant)
-
-      expect(result.isError).toBe(true)
-      expect(promptText(result.content)).toMatch(/direct KerSor controller|Host-authorized/i)
-      expect(calls).toEqual([])
-      expect(existsSync(join(runDir, 'dispatch-args-transformation-receipt.json'))).toBe(false)
-    } finally {
-      rmSync(workspace, { recursive: true, force: true })
-    }
-  })
-
-  it('does not mint successful transformation custody for a failed canonical injector call', async () => {
-    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-dispatch-transform-failed-'))
-    try {
-      const canonicalWorkspace = realpathSync(workspace)
-      const harness = await setup(canonicalWorkspace)
-      const controller = await startController(harness)
-      const runDir = makeRunDirectory(canonicalWorkspace)
-      writeWorkflowEnvelope(runDir, controller, workflowArguments(runDir), {
-        appendTransformation: false,
-        writeCandidateSeal: false,
-      })
-      harness.ctx.tools.register(defineTool({
-        name: 'bash',
-        description: 'Fail one deterministic runtime-control probe.',
-        parameters: { command: { type: 'string', required: true } },
-        output: {
-          schema: { type: 'string' },
-          render: (_args, value) => [{ type: 'text', text: value }],
-        },
-        execute: () => { throw new Error('injector failed') },
-      }))
-      const command = runtimeControlsCommand(runDir)
-
-      const failed = await call(harness, 'bash', { command }, controller)
-
-      expect(failed.isError).toBe(true)
-      expect(existsSync(join(runDir, 'dispatch-args-transformation-receipt.json'))).toBe(false)
-      expect(controller.session.events.filter(event =>
-        event.type === 'kersor/dispatch-args-transformed')).toHaveLength(0)
-      const retry = await call(harness, 'bash', { command }, controller)
-      expect(retry.isError).toBe(true)
-      expect(retry.content.some(block => block.type === 'text'
-        && block.text.includes('exact-once'))).toBe(true)
-    } finally {
-      rmSync(workspace, { recursive: true, force: true })
-    }
-  })
-
-  it('rejects sealed Workflow dispatch when the canonical runtime-control pass was skipped', async () => {
+  it('rejects sealed Workflow dispatch when the Host runtime-control pass was skipped', async () => {
     const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-transform-required-'))
     try {
       const calls: string[] = []
@@ -4652,6 +5570,434 @@ describe('KerSor conversation controls', () => {
     }
   })
 
+  it('runs typed author seal and save with direct Host argv and opaque Core receipt custody', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-author-commit-'))
+    try {
+      const harness = await setup(workspace)
+      const controller = await startController(harness)
+      const sessionDir = join(workspace, '.kersor', 'author-commit')
+      writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+      ensureSessionInitializationFixture(sessionDir, workspace, controller)
+      prepareAuthorStaging(sessionDir)
+      writeKersorProtocolContext(sessionDir, 'workflow-authoring/author-context.json')
+
+      const prematureSeal = await call(harness, 'kersor_author_commit', { action: 'seal' }, controller)
+      expect(prematureSeal.isError).toBe(true)
+      expect(harness.hostTransformSubprocess.specs).toHaveLength(0)
+
+      const authored = await call(harness, 'kersor_protocol', { action: 'author' }, controller)
+      expect(authored.isError, JSON.stringify(authored.content)).toBe(false)
+      const prematureSave = await call(harness, 'kersor_author_commit', { action: 'save' }, controller)
+      expect(prematureSave.isError).toBe(true)
+      expect(harness.hostTransformSubprocess.specs).toHaveLength(1)
+
+      harness.hostTransformSubprocess.onSpawn = (spec) => {
+        if (basename(spec.argv[1] ?? '') === 'seal-author-handoff.py') {
+          writeAuthorHandoff(sessionDir)
+          harness.hostTransformSubprocess.stdout = `AUTHOR_HANDOFF=${join(sessionDir, 'workflow-authoring', 'author-handoff.json')}\n`
+          return
+        }
+        if (basename(spec.argv[1] ?? '') === 'save-authored-workflow.sh') {
+          harness.hostTransformSubprocess.stdout = writeSavedAuthorProposal(sessionDir)
+          return
+        }
+        if (basename(spec.argv[1] ?? '') === 'generate-catalog.sh') {
+          writeAuthorCatalog(sessionDir)
+          harness.hostTransformSubprocess.stdout = 'CATALOG_REFRESHED=true\n'
+        }
+      }
+      const sealed = await call(harness, 'kersor_author_commit', { action: 'seal' }, controller)
+      expect(sealed.isError, JSON.stringify(sealed.content)).toBe(false)
+      const sealSpec = harness.hostTransformSubprocess.specs[1]!
+      const canonicalSession = realpathSync.native(sessionDir)
+      expect(sealSpec.argv).toEqual([
+        testKersorPython, join(testKersorRoot, 'scripts', 'seal-author-handoff.py'),
+        '--from', join(canonicalSession, 'workflow-authoring', 'staging'),
+        '--out', join(canonicalSession, 'workflow-authoring', 'author-handoff.json'),
+      ])
+      const sealEvent = controller.session.events.find(event =>
+        event.type === 'kersor/author-handoff-sealed')
+      expect(sealEvent?.data).toMatchObject({
+        contract: 'dsh_author_handoff_seal_v2',
+        author_session_id: 'kersor-protocol-child-1',
+        handoff: { sha256: fileSha256(join(canonicalSession, 'workflow-authoring', 'author-handoff.json')) },
+      })
+      expect(Object.keys(sealEvent?.data ?? {}).sort()).toEqual([
+        'author_call_id', 'author_session_id', 'authority', 'contract', 'controller_session_id',
+        'handoff', 'schema_version', 'seal_call_id', 'session_dir',
+      ])
+
+      const saved = await call(harness, 'kersor_author_commit', { action: 'save' }, controller)
+      expect(saved.isError, JSON.stringify(saved.content)).toBe(false)
+      expect(promptText(saved.content)).toContain('PROPOSAL_NAME=authored-test')
+      expect(promptText(saved.content)).toContain('CATALOG_REFRESHED=true')
+      expect(harness.hostTransformSubprocess.specs[2]?.argv).toEqual([
+        'bash', join(testKersorRoot, 'scripts', 'save-authored-workflow.sh'),
+        '--from', join(canonicalSession, 'workflow-authoring', 'staging'),
+        '--store', join(canonicalSession, 'workflow-authoring', 'proposals'),
+        '--handoff', join(canonicalSession, 'workflow-authoring', 'author-handoff.json'),
+      ])
+      expect(harness.hostTransformSubprocess.specs[3]).toMatchObject({
+        argv: [
+          'bash', join(testKersorRoot, 'scripts', 'generate-catalog.sh'),
+          realpathSync.native(join(testKersorRoot, 'workflows', 'Awesome-Kernel-Workflows')),
+          join(canonicalSession, 'workflow-catalog.json'),
+        ],
+        env: {
+          KERSOR_PYTHON: testKersorPython,
+          KERSOR_ROOT: testKersorRoot,
+          KERSOR_PROPOSALS_DIR: join(
+            canonicalSession, 'workflow-authoring', 'proposals',
+          ),
+        },
+      })
+      expect(controller.session.events.filter(event =>
+        event.type === 'kersor/author-save-attempted')).toHaveLength(1)
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('durably consumes typed seal and save process failures across cold reload', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-author-commit-failure-'))
+    try {
+      const harness = await setup(workspace)
+      const controller = await startController(harness)
+      await prepareTypedAuthor(
+        harness, workspace, controller, 'author-commit-failure',
+      )
+      harness.hostTransformSubprocess.exitCode = 17
+      harness.hostTransformSubprocess.stderr = 'seal failed\n'
+      const failedSeal = await call(
+        harness, 'kersor_author_commit', { action: 'seal' }, controller,
+      )
+      expect(failedSeal.isError).toBe(true)
+      expect(controller.session.events.some(event =>
+        event.type === 'kersor/author-handoff-sealed')).toBe(false)
+      const callsAfterSealFailure = harness.hostTransformSubprocess.specs.length
+      const sealRetry = await call(
+        harness, 'kersor_author_commit', { action: 'seal' }, controller,
+      )
+      expect(sealRetry.isError).toBe(true)
+      expect(harness.hostTransformSubprocess.specs).toHaveLength(callsAfterSealFailure)
+
+      // A fresh Session proves save's distinct pre-execution durable commit point.
+      const saveHarness = await setup(workspace)
+      const saveController = await startController(saveHarness)
+      const saveSession = await prepareTypedAuthor(
+        saveHarness, workspace, saveController, 'author-save-failure',
+      )
+      await sealTypedAuthor(saveHarness, saveController, saveSession)
+      let durableBeforeProcess = false
+      saveHarness.hostTransformSubprocess.exitCode = 19
+      saveHarness.hostTransformSubprocess.stderr = 'save failed\n'
+      saveHarness.hostTransformSubprocess.onSpawn = () => {
+        durableBeforeProcess = saveController.session.events.some(event =>
+          event.type === 'kersor/author-save-attempted')
+      }
+      const failedSave = await call(
+        saveHarness, 'kersor_author_commit', { action: 'save' }, saveController,
+      )
+      expect(failedSave.isError).toBe(true)
+      expect(promptText(failedSave.content)).toMatch(/consumed.*needs_revision.*do not retry/i)
+      expect(durableBeforeProcess).toBe(true)
+      expect(saveController.session.events.filter(event =>
+        event.type === 'kersor/author-save-attempted')).toHaveLength(1)
+      const callsAfterSaveFailure = saveHarness.hostTransformSubprocess.specs.length
+      await saveHarness.controlFiber.dispose()
+      const reloaded = await saveHarness.ctx.plugin(control)
+      try {
+        const retry = await call(
+          saveHarness, 'kersor_author_commit', { action: 'save' }, saveController,
+        )
+        expect(retry.isError).toBe(true)
+      } finally {
+        await reloaded.dispose()
+      }
+      expect(saveHarness.hostTransformSubprocess.specs).toHaveLength(callsAfterSaveFailure)
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    'malformed-output', 'missing-record', 'noncanonical-record-name',
+    'catalog-process', 'catalog-missing-proposal',
+  ] as const)(
+    'does not complete typed save for %s',
+    async (failure) => {
+      const workspace = mkdtempSync(join(tmpdir(), `dsh-kersor-author-${failure}-`))
+      try {
+        const harness = await setup(workspace)
+        const controller = await startController(harness)
+        const sessionDir = await prepareTypedAuthor(harness, workspace, controller, failure)
+        await sealTypedAuthor(harness, controller, sessionDir)
+        harness.hostTransformSubprocess.onSpawn = (spec) => {
+          const script = basename(spec.argv[1] ?? '')
+          if (script === 'save-authored-workflow.sh') {
+            harness.hostTransformSubprocess.exitCode = 0
+            if (failure === 'malformed-output') {
+              harness.hostTransformSubprocess.stdout = 'saved\n'
+              return
+            }
+            harness.hostTransformSubprocess.stdout = writeSavedAuthorProposal(sessionDir)
+            if (failure === 'missing-record') {
+              rmSync(join(
+                sessionDir, 'workflow-authoring', 'proposals', 'authored-test', 'proposal.json',
+              ))
+            }
+            if (failure === 'noncanonical-record-name') {
+              const recordPath = join(
+                sessionDir, 'workflow-authoring', 'proposals', 'authored-test', 'proposal.json',
+              )
+              const proposal = readJsonFixture(recordPath) as Record<string, JsonValue>
+              proposal.name = 'authored-test'
+              delete proposal.workflow_name
+              writeFileSync(recordPath, JSON.stringify(proposal))
+            }
+            return
+          }
+          if (script !== 'generate-catalog.sh') return
+          if (failure === 'catalog-process') {
+            harness.hostTransformSubprocess.exitCode = 29
+            harness.hostTransformSubprocess.stderr = 'catalog refresh failed\n'
+            return
+          }
+          harness.hostTransformSubprocess.exitCode = 0
+          writeFileSync(join(sessionDir, 'workflow-catalog.json'), JSON.stringify({ workflows: [] }))
+          harness.hostTransformSubprocess.stdout = 'CATALOG_REFRESHED=true\n'
+        }
+
+        const result = await call(
+          harness, 'kersor_author_commit', { action: 'save' }, controller,
+        )
+        expect(result.isError).toBe(true)
+        expect(promptText(result.content)).toMatch(/consumed.*needs_revision/i)
+        expect(controller.session.events.filter(event =>
+          event.type === 'kersor/author-save-attempted')).toHaveLength(1)
+      } finally {
+        rmSync(workspace, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it.each(['authoring-parent', 'proposal-store'] as const)(
+    'rejects a symlinked %s before the typed seal process can write externally',
+    async (target) => {
+      const workspace = mkdtempSync(join(tmpdir(), `dsh-kersor-author-${target}-`))
+      try {
+        const harness = await setup(workspace)
+        const controller = await startController(harness)
+        const sessionDir = join(workspace, '.kersor', target)
+        writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+        ensureSessionInitializationFixture(sessionDir, workspace, controller)
+        prepareAuthorStaging(sessionDir)
+        writeAuthorContextFixture(sessionDir)
+        appendAuthorProducedFixture(controller, sessionDir)
+        const authoring = join(sessionDir, 'workflow-authoring')
+        const external = join(workspace, `external-${target}`)
+        if (target === 'authoring-parent') {
+          renameSync(authoring, external)
+          symlinkSync(external, authoring, 'dir')
+        } else {
+          mkdirSync(external)
+          symlinkSync(external, join(authoring, 'proposals'), 'dir')
+        }
+        const before = harness.hostTransformSubprocess.specs.length
+
+        const result = await call(
+          harness, 'kersor_author_commit', { action: 'seal' }, controller,
+        )
+        expect(result.isError).toBe(true)
+        expect(harness.hostTransformSubprocess.specs).toHaveLength(before)
+        expect(existsSync(join(external, 'author-handoff.json'))).toBe(false)
+      } finally {
+        rmSync(workspace, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it('denies a Host-authorized Python gate whose Bash workdir enters author staging', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-author-host-gate-workdir-'))
+    try {
+      const harness = await setup(workspace)
+      const controller = await startController(harness)
+      const sessionDir = join(workspace, '.kersor', 'author-host-gate-workdir')
+      writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+      ensureSessionInitializationFixture(sessionDir, workspace, controller)
+      const staging = prepareAuthorStaging(sessionDir)
+      const command = baselineInitCommand(sessionDir)
+      const calls: string[] = []
+      registerBashProbe(harness, calls)
+
+      const result = await call(harness, 'bash', {
+        command,
+        description: 'Attempt a Host-authorized Python gate from author staging',
+        workdir: staging,
+      }, controller)
+
+      expect(result.isError).toBe(true)
+      expect(promptText(result.content)).toMatch(/author|staging|seal|custody/i)
+      expect(calls).toEqual([])
+      expect(controller.session.events.some(event =>
+        event.type === 'kersor/baseline-initialized')).toBe(false)
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('allows an exact Host-authorized baseline command outside author staging', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-author-host-gate-safe-'))
+    try {
+      const harness = await setup(workspace)
+      const controller = await startController(harness)
+      writeFileSync(join(workspace, 'kernel.py'), 'VALUE = 1\n')
+      const sessionDir = join(workspace, '.kersor', 'author-host-gate-safe')
+      mkdirSync(sessionDir, { recursive: true })
+      writeValidBaselineAuthority(sessionDir, workspace)
+      ensureSessionInitializationFixture(sessionDir, workspace, controller)
+      prepareAuthorStaging(sessionDir)
+      const methodPath = join(sessionDir, 'test-method.md')
+      const witnessPath = join(sessionDir, 'baseline-witness.json')
+      const methodBytes = readFileSync(methodPath)
+      rmSync(methodPath)
+      rmSync(witnessPath)
+      const command = baselineInitCommand(sessionDir)
+      const calls: string[] = []
+      registerBashProbe(harness, calls, (candidate) => {
+        if (candidate === command) writeFileSync(methodPath, methodBytes)
+        return candidate
+      })
+
+      const result = await call(harness, 'bash', { command }, controller)
+
+      expect(result.isError, JSON.stringify(result.content)).toBe(false)
+      expect(calls).toEqual([command])
+      expect(controller.session.events.filter(event =>
+        event.type === 'kersor/baseline-initialized')).toHaveLength(1)
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    'profile context',
+    'Session state read',
+    'integration preflight',
+  ] as const)(
+    'allows trusted direct KerSor helper %s with the Session root but rejects a trailing staging read',
+    async (helper) => {
+      const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-author-trusted-helper-'))
+      try {
+        const harness = await setup(workspace)
+        const controller = await startController(harness)
+        const sessionDir = join(workspace, '.kersor', 'author-trusted-helper')
+        writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+        ensureSessionInitializationFixture(sessionDir, workspace, controller)
+        const staging = prepareAuthorStaging(sessionDir)
+        const canonicalSession = realpathSync.native(sessionDir)
+        const prefix = `KERSOR_PYTHON=${hostShellQuote(testKersorPython)}; export KERSOR_PYTHON;`
+        const invocation = helper === 'profile context'
+          ? `"$KERSOR_PYTHON" ${hostShellQuote(join(testKersorRoot, 'scripts', 'profile-handoff.py'))} context --session ${hostShellQuote(canonicalSession)}`
+          : helper === 'Session state read'
+            ? `bash ${hostShellQuote(join(testKersorRoot, 'scripts', 'kersor-state.sh'))} ${hostShellQuote(canonicalSession)} get phase`
+            : `bash ${hostShellQuote(join(testKersorRoot, 'scripts', 'integration-preflight.sh'))} ${hostShellQuote(canonicalSession)}`
+        const command = `${prefix} ${invocation}`
+        const calls: string[] = []
+        registerBashProbe(harness, calls)
+
+        const accepted = await call(harness, 'bash', {
+          command,
+          workdir: dirname(staging),
+        }, controller)
+        const rejected = await call(harness, 'bash', {
+          command: `${command}; cat staging/workflow.js`,
+          workdir: dirname(staging),
+        }, controller)
+
+        expect(accepted.isError, JSON.stringify(accepted.content)).toBe(false)
+        expect(rejected.isError).toBe(true)
+        expect(promptText(rejected.content)).toMatch(/author|staging|seal|custody/i)
+        expect(calls).toEqual([command])
+      } finally {
+        rmSync(workspace, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it('denies direct selection helpers because the typed Host action owns the sequence', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-selection-helper-denied-'))
+    try {
+      const harness = await setup(workspace)
+      const controller = await startController(harness)
+      const sessionDir = join(workspace, '.kersor', 'selection-helper-denied')
+      writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+      ensureSessionInitializationFixture(sessionDir, workspace, controller)
+      const canonicalSession = realpathSync.native(sessionDir)
+      const command = [
+        `KERSOR_PYTHON=${hostShellQuote(testKersorPython)}; export KERSOR_PYTHON;`,
+        'bash', hostShellQuote(join(testKersorRoot, 'scripts', 'select-workflow.sh')),
+        hostShellQuote(canonicalSession), '1',
+        hostShellQuote(join(canonicalSession, 'workflow-catalog.json')),
+      ].join(' ')
+      const calls: string[] = []
+      registerBashProbe(harness, calls)
+
+      const result = await call(harness, 'bash', { command }, controller)
+
+      expect(result.isError).toBe(true)
+      expect(promptText(result.content)).toMatch(/selection|select_workflow|Host/i)
+      expect(calls).toEqual([])
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it.each(['seal helper', 'Proposal CLI'] as const)(
+    'denies a Host-frozen versioned Python direct %s call that targets author staging',
+    async (entrypoint) => {
+      const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-author-direct-python-'))
+      try {
+        const harness = await setup(workspace)
+        const controller = await startController(harness)
+        const sessionDir = join(workspace, '.kersor', 'author-direct-python')
+        writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+        ensureSessionInitializationFixture(sessionDir, workspace, controller)
+        const staging = prepareAuthorStaging(sessionDir)
+        const authoring = dirname(staging)
+        const command = entrypoint === 'seal helper'
+          ? [
+            `KERSOR_PYTHON=${hostShellQuote(testKersorPython)}; export KERSOR_PYTHON;`,
+            '"$KERSOR_PYTHON"',
+            hostShellQuote(join(testKersorRoot, 'scripts', 'seal-author-handoff.py')),
+            '--from', hostShellQuote(staging),
+            '--out', hostShellQuote(join(authoring, 'author-handoff.json')),
+          ].join(' ')
+          : [
+            `KERSOR_PYTHON=${hostShellQuote(testKersorPython)}; export KERSOR_PYTHON;`,
+            '"$KERSOR_PYTHON"',
+            hostShellQuote(join(testKersorRoot, 'scripts', 'kersor-proposals.py')),
+            'save --origin authored --from', hostShellQuote(staging),
+            '--store', hostShellQuote(join(authoring, 'proposals')),
+            '--handoff', hostShellQuote(join(authoring, 'author-handoff.json')),
+          ].join(' ')
+        const calls: string[] = []
+        registerBashProbe(harness, calls)
+
+        const result = await call(harness, 'bash', { command }, controller)
+
+        expect(result.isError).toBe(true)
+        expect(promptText(result.content)).toMatch(/author|staging|seal|custody/i)
+        expect(calls).toEqual([])
+        expect(controller.session.events.some(event =>
+          event.type === 'kersor/author-handoff-sealed'
+          || event.type === 'kersor/author-save-attempted')).toBe(false)
+      } finally {
+        rmSync(workspace, { recursive: true, force: true })
+      }
+    },
+  )
+
   it('denies pre-seal controller directory inspection resolved from a changed shell cwd', async () => {
     const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-author-preseal-cwd-'))
     try {
@@ -5150,7 +6496,7 @@ describe('KerSor conversation controls', () => {
     },
   )
 
-  it('permanently denies staging reads and mutations after the canonical author seal', async () => {
+  it('allows only exact direct-controller reads between author seal and save', async () => {
     const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-author-sealed-'))
     try {
       const harness = await setup(workspace)
@@ -5162,23 +6508,18 @@ describe('KerSor conversation controls', () => {
       const author = descendantAgent(harness, controller.session, 'workflow-author-sealed')
       const bashCalls: string[] = []
       const pathCalls: string[] = []
-      const sealCommand = authorSealCommand(sessionDir)
-      registerBashProbe(harness, bashCalls, (command) => {
-        if (command === sealCommand) writeAuthorHandoff(sessionDir)
-        return command
-      })
+      registerBashProbe(harness, bashCalls)
       registerPathProbe(harness, 'read', pathCalls)
       registerFileProbe(harness, 'edit', pathCalls)
       registerPathProbe(harness, 'multi_edit', pathCalls)
 
-      const sealed = await call(harness, 'bash', { command: sealCommand }, controller)
-      expect(sealed.isError, JSON.stringify(sealed.content)).toBe(false)
+      appendAuthorSealFixture(controller, sessionDir)
       expect(controller.session.events.filter(event =>
         event.type === 'kersor/author-handoff-sealed')).toHaveLength(1)
 
       const workflowPath = join(staging, 'workflow.js')
+      const reviewed = await call(harness, 'read', { file_path: workflowPath }, controller)
       const denied = [
-        await call(harness, 'read', { file_path: workflowPath }, controller),
         await call(harness, 'edit', { file_path: workflowPath }, controller),
         await call(harness, 'multi_edit', { file_path: workflowPath }, controller),
         await call(harness, 'bash', { command: `sed -n '1,20p' '${workflowPath}'` }, controller),
@@ -5186,12 +6527,44 @@ describe('KerSor conversation controls', () => {
         await call(harness, 'bash', { command: `node --check '${workflowPath}'` }, author),
       ]
 
+      expect(reviewed.isError).toBe(false)
       for (const result of denied) {
         expect(result.isError).toBe(true)
         expect(promptText(result.content)).toMatch(/author|staging|seal|custody/i)
       }
-      expect(pathCalls).toEqual([])
-      expect(bashCalls).toEqual([sealCommand])
+      appendAuthorSaveFixture(controller, sessionDir)
+      const postSaveRead = await call(harness, 'read', { file_path: workflowPath }, controller)
+      expect(postSaveRead.isError).toBe(true)
+      expect(pathCalls).toEqual([`read:${workflowPath}`])
+      expect(bashCalls).toEqual([])
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('denies an exact sealed Read when a canonical author file changes identity', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-author-read-toctou-'))
+    try {
+      const harness = await setup(workspace)
+      const controller = await startController(harness)
+      const sessionDir = join(workspace, '.kersor', 'author-read-toctou')
+      writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
+      ensureSessionInitializationFixture(sessionDir, workspace, controller)
+      const staging = prepareAuthorStaging(sessionDir)
+      appendAuthorSealFixture(controller, sessionDir)
+      const workflow = join(staging, 'workflow.js')
+      const external = join(workspace, 'external-workflow.js')
+      writeFileSync(external, 'return { forged: true }\n')
+      unlinkSync(workflow)
+      symlinkSync(external, workflow)
+      const calls: string[] = []
+      registerPathProbe(harness, 'read', calls)
+
+      const result = await call(harness, 'read', { file_path: workflow }, controller)
+
+      expect(result.isError).toBe(true)
+      expect(promptText(result.content)).toMatch(/sealed|immutable|author/i)
+      expect(calls).toEqual([])
     } finally {
       rmSync(workspace, { recursive: true, force: true })
     }
@@ -5213,19 +6586,14 @@ describe('KerSor conversation controls', () => {
       symlinkSync(staging, stageAlias, 'dir')
       const bashCalls: string[] = []
       const pathCalls: string[] = []
-      const sealCommand = authorSealCommand(sessionDir)
-      registerBashProbe(harness, bashCalls, (command) => {
-        if (command === sealCommand) writeAuthorHandoff(sessionDir)
-        return command
-      })
+      registerBashProbe(harness, bashCalls)
       registerPathProbe(harness, 'read', pathCalls)
       registerFileProbe(harness, 'edit', pathCalls)
       registerNestedMultiEditProbe(harness, pathCalls)
       registerSearchPathProbe(harness, 'glob', pathCalls)
       registerSearchPathProbe(harness, 'grep', pathCalls)
 
-      expect((await call(harness, 'bash', { command: sealCommand }, controller)).isError)
-        .toBe(false)
+      appendAuthorSealFixture(controller, sessionDir)
       const aliasedWorkflow = join(stageAlias, 'workflow.js')
       const denied = [
         await call(harness, 'read', { file_path: aliasedWorkflow }, controller),
@@ -5250,270 +6618,7 @@ describe('KerSor conversation controls', () => {
         expect(promptText(result.content)).toMatch(/author|staging|seal|custody/i)
       }
       expect(pathCalls).toEqual([])
-      expect(bashCalls).toEqual([sealCommand])
-    } finally {
-      rmSync(workspace, { recursive: true, force: true })
-    }
-  })
-
-  it.each([false, true])(
-    'consumes the first canonical author save before execution when failure=%s',
-    async (fails) => {
-      const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-author-save-'))
-      try {
-        const harness = await setup(workspace)
-        const controller = await startController(harness)
-        const sessionDir = join(workspace, '.kersor', 'author-save')
-        writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
-        ensureSessionInitializationFixture(sessionDir, workspace, controller)
-        const staging = prepareAuthorStaging(sessionDir)
-        const sealCommand = authorSealCommand(sessionDir)
-        const saveCommand = authorSaveCommand(sessionDir)
-        const bashCalls: string[] = []
-        const editCalls: string[] = []
-        let saveRuns = 0
-        let durableBeforeExecution = false
-        registerBashProbe(harness, bashCalls, (command) => {
-          if (command === sealCommand) {
-            writeAuthorHandoff(sessionDir)
-            return 'sealed'
-          }
-          if (command === saveCommand) {
-            saveRuns += 1
-            durableBeforeExecution = controller.session.events.some(event =>
-              event.type === 'kersor/author-save-attempted')
-            if (fails) throw new Error('public save gate rejected the authored workflow')
-            return 'saved'
-          }
-          return command
-        })
-        registerFileProbe(harness, 'edit', editCalls)
-
-        expect((await call(harness, 'bash', { command: sealCommand }, controller)).isError)
-          .toBe(false)
-        const forged = await call(harness, 'bash', {
-          command: `${saveCommand} --force`,
-        }, controller)
-        expect(forged.isError).toBe(true)
-        const forgedSandbox = await call(harness, 'bash', {
-          command: saveCommand,
-          sandbox_permissions: 'danger-full-access',
-          justification: 'Attempt to widen the authored Proposal save gate.',
-        }, controller)
-        expect(forgedSandbox.isError).toBe(true)
-
-        const first = await call(harness, 'bash', { command: saveCommand }, controller)
-        expect(first.isError).toBe(fails)
-        expect(durableBeforeExecution).toBe(true)
-        expect(controller.session.events.filter(event =>
-          event.type === 'kersor/author-save-attempted')).toHaveLength(1)
-
-        const postFailureEdit = await call(harness, 'edit', {
-          file_path: join(staging, 'workflow.js'),
-        }, controller)
-        expect(postFailureEdit.isError).toBe(true)
-        expect(editCalls).toEqual([])
-
-        await harness.controlFiber.dispose()
-        const reloaded = await harness.ctx.plugin(control)
-        try {
-          const retry = await call(harness, 'bash', { command: saveCommand }, controller)
-          expect(retry.isError).toBe(true)
-          expect(promptText(retry.content)).toMatch(/exact-once|consum/i)
-        } finally {
-          await reloaded.dispose()
-        }
-        expect(saveRuns).toBe(1)
-        expect(bashCalls).toEqual([sealCommand, saveCommand])
-      } finally {
-        rmSync(workspace, { recursive: true, force: true })
-      }
-    },
-  )
-
-  it.each(['seal', 'save'] as const)(
-    'denies quoted nested-shell %s aliases before a public author script executes',
-    async (phase) => {
-      const workspace = mkdtempSync(join(tmpdir(), `dsh-kersor-author-${phase}-alias-`))
-      try {
-        const harness = await setup(workspace)
-        const controller = await startController(harness)
-        const sessionDir = join(workspace, '.kersor', `author-${phase}-alias`)
-        writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
-        ensureSessionInitializationFixture(sessionDir, workspace, controller)
-        const staging = prepareAuthorStaging(sessionDir)
-        writeFileSync(join(staging, 'workflow.js'), [
-          "export const meta = { name: 'authored-test' }",
-          'return { overall_speedup: null, best_kernel_code: null }',
-          '',
-        ].join('\n'))
-        const aliasDir = join(workspace, 'author-alias')
-        mkdirSync(aliasDir)
-        const stageAlias = join(aliasDir, 'staging')
-        symlinkSync(staging, stageAlias, 'dir')
-        const handoff = join(sessionDir, 'workflow-authoring', 'author-handoff.json')
-        const handoffAlias = join(aliasDir, 'author-handoff.json')
-        const proposals = join(sessionDir, 'workflow-authoring', 'proposals')
-        if (phase === 'save') {
-          writeAuthorContextFixture(sessionDir)
-          execFileSync(testKersorPython, [
-            join(testKersorRoot, 'scripts', 'seal-author-handoff.py'),
-            '--from', staging,
-            '--out', handoff,
-          ])
-          symlinkSync(handoff, handoffAlias)
-        }
-        const inner = phase === 'seal'
-          ? [
-            `KERSOR_PYTHON=${shellQuote(testKersorPython)}`,
-            `bash ${shellQuote(join(testKersorRoot, 'scripts', 'run-kersor-python.sh'))}`,
-            'seal-author-\'\'handoff.py',
-            `--from ${shellQuote(stageAlias)}`,
-            `--out ${shellQuote(handoff)}`,
-          ].join(' ')
-          : [
-            `KERSOR_PYTHON=${shellQuote(testKersorPython)}`,
-            `${shellQuote(join(testKersorRoot, 'scripts'))}/save-authored-''workflow.sh`,
-            `--from ${shellQuote(stageAlias)}`,
-            `--store ${shellQuote(proposals)}`,
-            `--handoff ${shellQuote(handoffAlias)}`,
-          ].join(' ')
-        const command = `KERSOR_PYTHON=${shellQuote(testKersorPython)}; export KERSOR_PYTHON; bash -c ${shellQuote(inner)}`
-        const calls: string[] = []
-        registerBashProbe(harness, calls, candidate => execFileSync(
-          'bash', ['-c', candidate], {
-            cwd: workspace,
-            encoding: 'utf8',
-            env: { ...process.env, KERSOR_PYTHON: testKersorPython },
-          },
-        ))
-
-        const result = await call(harness, 'bash', { command }, controller)
-
-        expect(result.isError).toBe(true)
-        expect(promptText(result.content)).toMatch(/author|staging|seal|custody/i)
-        expect(calls).toEqual([])
-        expect(controller.session.events.some(event => event.type === (
-          phase === 'seal' ? 'kersor/author-handoff-sealed' : 'kersor/author-save-attempted'
-        ))).toBe(false)
-        if (phase === 'seal') expect(existsSync(handoff)).toBe(false)
-        else expect(existsSync(join(proposals, 'authored-test'))).toBe(false)
-      } finally {
-        rmSync(workspace, { recursive: true, force: true })
-      }
-    },
-  )
-
-  it('denies a quoted public save alias before the real ToolBash executor runs it', async () => {
-    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-author-real-tool-bash-'))
-    let shell: SetupSandboxExecutor | undefined
-    try {
-      const harness = await setup(workspace, async (ctx) => {
-        await ctx.plugin(SandboxPolicyService, {
-          mode: 'workspace-write',
-          workspaceRoot: workspace,
-        })
-        await ctx.plugin(SetupSandboxExecutor)
-        shell = ctx.shell as SetupSandboxExecutor
-        await ctx.plugin(BashEnv)
-        await ctx.plugin(ToolBash)
-      })
-      const controller = await startController(harness)
-      const sessionDir = join(workspace, '.kersor', 'author-real-tool-bash')
-      writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
-      ensureSessionInitializationFixture(sessionDir, workspace, controller)
-      const staging = prepareAuthorStaging(sessionDir)
-      writeFileSync(join(staging, 'workflow.js'), [
-        "export const meta = { name: 'real-tool-bash-test' }",
-        'return { overall_speedup: null, best_kernel_code: null }',
-        '',
-      ].join('\n'))
-      const aliasDir = join(workspace, 'real-tool-bash-aliases')
-      mkdirSync(aliasDir)
-      const stageAlias = join(aliasDir, 'stage')
-      symlinkSync(staging, stageAlias, 'dir')
-      const handoff = join(sessionDir, 'workflow-authoring', 'author-handoff.json')
-      writeAuthorContextFixture(sessionDir)
-      execFileSync(testKersorPython, [
-        join(testKersorRoot, 'scripts', 'seal-author-handoff.py'),
-        '--from', staging,
-        '--out', handoff,
-      ])
-      const proposals = join(sessionDir, 'workflow-authoring', 'proposals')
-      const command = [
-        `KERSOR_PYTHON=${shellQuote(testKersorPython)}; export KERSOR_PYTHON;`,
-        `${shellQuote(join(testKersorRoot, 'scripts'))}/save-authored-''workflow.sh`,
-        `--from ${shellQuote(stageAlias)}`,
-        `--store ${shellQuote(proposals)}`,
-        `--handoff ${shellQuote(handoff)}`,
-      ].join(' ')
-      shell!.onRun = (spec) => {
-        execFileSync('bash', ['-c', spec.command], {
-          cwd: spec.workdir,
-          env: { ...process.env, KERSOR_PYTHON: testKersorPython },
-        })
-      }
-
-      const result = await call(harness, 'bash', {
-        command,
-        description: 'Attempt a noncanonical authored Proposal save alias',
-      }, controller)
-
-      expect(result.isError).toBe(true)
-      expect(shell!.calls).toHaveLength(0)
-      expect(existsSync(join(proposals, 'real-tool-bash-test'))).toBe(false)
-      expect(controller.session.events.some(event =>
-        event.type === 'kersor/author-save-attempted')).toBe(false)
-    } finally {
-      rmSync(workspace, { recursive: true, force: true })
-    }
-  })
-
-  it('denies save-script symlink, variable, glob, source, and Bash-interpreter aliases across fresh call IDs and a cold control reload', async () => {
-    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-author-save-alias-matrix-'))
-    try {
-      const harness = await setup(workspace)
-      const controller = await startController(harness)
-      const sessionDir = join(workspace, '.kersor', 'author-save-alias-matrix')
-      writeValidSetupArtifacts(workspace, sessionDir, launchContract, controller.id)
-      ensureSessionInitializationFixture(sessionDir, workspace, controller)
-      prepareAuthorStaging(sessionDir)
-      const aliasDir = join(workspace, 'author-script-aliases')
-      mkdirSync(aliasDir)
-      const saveAlias = join(aliasDir, 'save-gate')
-      symlinkSync(join(testKersorRoot, 'scripts', 'save-authored-workflow.sh'), saveAlias)
-      const commands = [
-        `GATE='${saveAlias}'; "$GATE" --help`,
-        `'${aliasDir}/save-'* --help`,
-        `source '${saveAlias}' --help`,
-        `bash '${saveAlias}' --help`,
-        `env '${saveAlias}' --help`,
-        `command '${saveAlias}' --help`,
-        `exec '${saveAlias}' --help`,
-        `nohup '${saveAlias}' --help`,
-      ]
-      const calls: string[] = []
-      registerBashProbe(harness, calls)
-
-      for (const command of commands) {
-        const result = await call(harness, 'bash', { command }, controller)
-        expect(result.isError, command).toBe(true)
-      }
-
-      await harness.controlFiber.dispose()
-      const reloaded = await harness.ctx.plugin(control)
-      try {
-        for (const command of commands) {
-          const result = await call(harness, 'bash', { command }, controller)
-          expect(result.isError, `cold reload: ${command}`).toBe(true)
-        }
-      } finally {
-        await reloaded.dispose()
-      }
-
-      expect(calls).toEqual([])
-      expect(controller.session.events.some(event =>
-        event.type === 'kersor/author-save-attempted')).toBe(false)
+      expect(bashCalls).toEqual([])
     } finally {
       rmSync(workspace, { recursive: true, force: true })
     }
@@ -5634,6 +6739,105 @@ describe('KerSor conversation controls', () => {
     }
   })
 
+  it.each([
+    {
+      name: 'legacy shell schema',
+      mutate: (execution: Record<string, unknown>) => {
+        delete execution.execution_mode
+        delete execution.argv
+        delete execution.cwd
+        execution.shell = '/bin/sh'
+      },
+    },
+    {
+      name: 'wrong execution mode',
+      mutate: (execution: Record<string, unknown>) => {
+        execution.execution_mode = 'shell'
+      },
+    },
+    {
+      name: 'non-authority cwd',
+      mutate: (execution: Record<string, unknown>) => {
+        execution.cwd = '/tmp'
+      },
+    },
+    {
+      name: 'empty argv',
+      mutate: (execution: Record<string, unknown>) => {
+        execution.argv = []
+      },
+    },
+    {
+      name: 'non-string argv member',
+      mutate: (execution: Record<string, unknown>) => {
+        execution.argv = [realpathSync.native(testKersorPython), 1]
+      },
+    },
+    {
+      name: 'relative argv executable',
+      mutate: (execution: Record<string, unknown>) => {
+        execution.argv = ['python3']
+      },
+    },
+    {
+      name: 'extra execution field',
+      mutate: (execution: Record<string, unknown>) => {
+        execution.extra = true
+      },
+    },
+  ])('rejects baseline witness $name', async ({ mutate }) => {
+    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-baseline-execution-schema-'))
+    try {
+      const harness = await setup(workspace)
+      const controller = await startController(harness)
+      writeFileSync(join(workspace, 'kernel.py'), 'VALUE = 1\n')
+      const sessionDir = dirname(makeRunDirectory(workspace))
+      writeValidBaselineAuthority(sessionDir, workspace)
+      ensureSessionInitializationFixture(sessionDir, workspace, controller)
+      const methodPath = join(sessionDir, 'test-method.md')
+      const witnessPath = join(sessionDir, 'baseline-witness.json')
+      const methodBytes = readFileSync(methodPath, 'utf8')
+      const witness = readJsonFixture(witnessPath) as BaselineWitnessFixture
+      mutate(witness.executions[0]!)
+      rmSync(methodPath)
+      rmSync(witnessPath)
+      harness.ctx.tools.register(defineTool({
+        name: 'bash',
+        description: 'Run one invalid baseline execution evidence probe.',
+        parameters: { command: { type: 'string', required: true } },
+        output: {
+          schema: { type: 'string' },
+          render: (_args, value) => [{ type: 'text', text: value }],
+        },
+        execute: (args) => {
+          if (args.command.includes('baseline-witness.py" init ')) {
+            writeFileSync(methodPath, methodBytes)
+          } else if (args.command.includes('baseline-witness.py" record ')) {
+            writeFileSync(witnessPath, JSON.stringify(witness))
+          }
+          return Promise.resolve(args.command)
+        },
+      }))
+
+      const initialized = await call(harness, 'bash', {
+        command: baselineInitCommand(sessionDir),
+      }, controller)
+      expect(initialized.isError, JSON.stringify(initialized.content)).toBe(false)
+      const recorded = await call(harness, 'bash', {
+        command: baselineRecordCommand(sessionDir, workspace),
+      }, controller)
+
+      expect(recorded.isError).toBe(true)
+      expect(promptText(recorded.content)).toContain(
+        'baseline correctness execution evidence is invalid',
+      )
+      expect(controller.session.events.some(event =>
+        event.type === 'kersor/baseline-recorded')).toBe(false)
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
+  })
+
   it('denies canonical baseline custody when Session config differs from typed launch', async () => {
     const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-baseline-launch-mismatch-'))
     try {
@@ -5712,36 +6916,6 @@ describe('KerSor conversation controls', () => {
     } finally {
       rmSync(workspace, { recursive: true, force: true })
       rmSync(alternate, { recursive: true, force: true })
-    }
-  })
-
-  it('rejects a replayed canonical injector call even with an unchanged valid receipt', async () => {
-    const workspace = mkdtempSync(join(tmpdir(), 'dsh-kersor-transform-call-replay-'))
-    try {
-      const calls: string[] = []
-      const harness = await setup(workspace)
-      registerWorkflowProbe(harness, {
-        runId: 'workflow-transform-call-replay', agentsStarted: 1, result: { bypass: true },
-      }, calls)
-      const controller = await startController(harness)
-      const runDir = makeRunDirectory(workspace)
-      writeWorkflowEnvelope(runDir, controller)
-      controller.session.append('tool/call', {
-        turn: 1,
-        step: 1,
-        callId: CallId('transform-call-replay'),
-        name: 'bash',
-        arguments: JSON.stringify({ command: runtimeControlsCommand(realpathSync(runDir)) }),
-      })
-
-      const result = await call(harness, 'kersor_workflow', { exp_dir: runDir }, controller)
-
-      expect(result.isError).toBe(true)
-      expect(result.content.some(block => block.type === 'text'
-        && block.text.includes('exact durable canonical Bash call'))).toBe(true)
-      expect(calls).toEqual([])
-    } finally {
-      rmSync(workspace, { recursive: true, force: true })
     }
   })
 

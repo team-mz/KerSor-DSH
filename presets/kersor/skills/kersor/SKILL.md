@@ -292,94 +292,6 @@ For a fresh task-native authoring run the expected values are respectively
 durable launch is written; conflicting request prose is not authority. A
 mismatch is a hard stop; do not repair raw Session JSON.
 
-After the baseline witness passes and before selection, build the canonical
-Phase 2 profiler handoff:
-
-```bash
-"${KERSOR_PYTHON:-python3}" "$kersor_root/scripts/profile-handoff.py" context \
-  --session "$SESSION_DIR"
-```
-
-Read `profile-handoff/context.json`. Pass its exact `description`,
-`run_in_background`, and `prompt` fields unchanged to exactly one DSH
-`subagent` call in the foreground. The parent must not write/edit
-`kernel-profile.md`, create a second profiler prompt, poll the child, inspect
-the profile while it runs, or use prompt constants as profile evidence. The
-blocking subagent result is the only completion notification.
-
-The first parent action after that result must seal the exact profile bytes,
-using the returned child Session id, before reading the file:
-
-```bash
-"${KERSOR_PYTHON:-python3}" "$kersor_root/scripts/profile-handoff.py" seal \
-  --session "$SESSION_DIR" \
-  --producer-session-id "$PROFILER_CHILD_SESSION_ID"
-"${KERSOR_PYTHON:-python3}" "$kersor_root/scripts/profile-handoff.py" verify \
-  --session "$SESSION_DIR"
-```
-
-The seal binds the profiler context, child owner, parseable fields, immutable
-Session integration pattern, and profile hash. A missing/invalid seal or any
-parent/post-seal edit is a hard stop: record the Profile gate failure, set the
-Session to canonical `stalled`, and do not select, author, dispatch, or mutate
-the candidate. `select-workflow.sh` and `author-workflow-context.py` both
-re-verify this boundary for fresh Sessions; never create or patch their outputs
-by hand.
-
-In DSH Workspace Write, Phase 3.6 must keep the Proposal Registry below the
-Session: save with `--store "$SESSION_DIR/workflow-authoring/proposals"` and
-regenerate the Catalog with the same path in `KERSOR_PROPOSALS_DIR`. Do not fall
-back to the checkout-level Proposal store, which is outside the task boundary.
-
-Before dispatch, perform the semantic output-ownership review required by the
-current optimize protocol. Structural Proposal gates do not make an in-place
-checkpoint write safe: the authored workflow must return candidate code or
-evaluate a Session-local copy, while outer optimize alone installs a winner
-after correctness and objective proof. On a KILL/needs-revision stop, use
-KerSor's state tool to transition the Session to `stalled`, then confirm the
-terminal state with `kersor_status`; a Markdown summary is not a state change.
-The review must also prove candidate binding: importing a candidate is
-insufficient when the invoked harness still resolves the canonical
-implementation. Correctness and benchmark evidence must name and execute the
-same Session-local candidate. Keep authoring provenance equally strict.
-Read `CURRENT_ROUND` from canonical Session state. Build that round's only
-author context through the shell wrapper exactly; the wrapper selects the
-configured Python internally and is not itself a Python file:
-
-```bash
-KERSOR_PYTHON="${KERSOR_PYTHON:-python3}" \
-  bash "$kersor_root/scripts/run-kersor-python.sh" author-workflow-context.py \
-  --session "$SESSION_DIR" \
-  --out "$SESSION_DIR/workflow-authoring/attempts/round-$CURRENT_ROUND/author-context.json"
-```
-
-If this wrapper call fails, transition to `stalled` and stop. Never execute
-`run-kersor-python.sh` with a Python interpreter or bypass it by invoking
-`author-workflow-context.py` directly.
-The round-scoped `author-context.json.dispatch` is the only DSH subagent
-envelope: pass its
-`description`, `run_in_background`, and `prompt` fields unchanged instead of
-synthesizing a task summary or metadata template. The envelope launches one
-workflow-author in the foreground; its blocking result is the completion
-notification. Never call `list_agents`, a job tool, or inspect staging progress
-while it runs.
-
-The first parent action after that result must be
-`scripts/seal-author-handoff.py`, writing
-`workflow-authoring/attempts/round-$CURRENT_ROUND/author-handoff.json` beside
-that round's staging directory. Do not read or edit staging first, and never
-replace an existing seal. The parent may read and reject the sealed three files,
-but must never repair them. Save exactly once with `--handoff` pointing to that
-seal; any hash, syntax, metadata, taxonomy, or semantic failure means
-`needs_revision` and canonical `stalled`, not a patch or retry. Any extra staging
-file or directory is mixed provenance. Proposal persistence remains shared at
-`workflow-authoring/proposals`; never reuse a sibling round's attempt owners.
-The authored saver resolves both paths and requires that `--handoff` be exactly
-`dirname(--from)/author-handoff.json`. A missing handoff, a newly sealed sibling
-path, any post-seal hash mismatch, or `--force` is terminal: never re-seal,
-omit/change the handoff argument, retry with `--force`, or overwrite an existing
-Proposal to recover from that authoring attempt.
-
 Do not accept a prose-only baseline. After Session creation and before
 selection or authoring, create the minimal task-native test method through the
 deterministic initializer when the exact commands are already known, then
@@ -397,11 +309,10 @@ durable event; never abbreviate these commands to a direct Python invocation.
 initializer atomically writes both commands and `Baseline Status: present`,
 rejects blank/multiline input, and never overwrites an existing owner. Do not
 hand-format a minimal `test-method.md` or wrap its command values in Markdown
-code spans. The
-immutable witness binds their post-Session execution to the Session config and
-kernel hash. Output produced before Session creation, or a historical cycle
-count copied into Markdown, is not execution evidence. A failed witness is a
-hard stop; do not select, author, dispatch, or mutate the candidate.
+code spans. The immutable witness binds their post-Session execution to the
+Session config and kernel hash. Output produced before Session creation, or a
+historical cycle count copied into Markdown, is not execution evidence. A failed
+witness is a hard stop; do not select, author, dispatch, or mutate the candidate.
 
 Resolve and version-check `kersor_python` before `init`, and use that exact
 executable inside every Python correctness or benchmark command passed to the
@@ -415,6 +326,83 @@ If initialization, recording, or verification fails, never delete, rename, or
 recreate `test-method.md`, the initialization receipt, or
 `baseline-witness.json`; transition the Session to `stalled` and create a new
 fresh Session after fixing the launch contract.
+
+After the baseline witness passes and before selection, run the canonical
+Phase 2 profiler handoff as one Host action:
+
+```text
+kersor_protocol({"action":"profile"})
+```
+
+The Host builds and reads `profile-handoff/context.json` without a model-visible
+line projection, passes its complete dispatch unchanged to exactly one
+foreground DSH child, retains that child Session id, and seals plus verifies
+`kernel-profile.md` before returning. The controller must not read or copy the
+long prompt, call `subagent`, pass a producer id, write/edit the profile, or
+split the handoff across several calls.
+
+The seal binds the profiler context, child owner, parseable fields, immutable
+Session integration pattern, and profile hash. A missing/invalid seal or any
+parent/post-seal edit is a hard stop: record the Profile gate failure, set the
+Session to canonical `stalled`, and do not select, author, dispatch, or mutate
+the candidate. Call `kersor_protocol({"action":"select_workflow"})` when the
+current optimize protocol reaches selection, and never invoke
+`select-workflow.sh` directly. This one typed action owns filtering, the
+Core-authored selection handoff, any required foreground strategy-selector,
+and deterministic finalization. Never call `subagent` for selection, write or
+edit `round-N-routing-decision.json`, or invoke `selection-handoff.py` or
+`finalize-selection.sh`. A second call in the same round is allowed only after
+the Host-owned author save changes the bound workflow Catalog; repeating an
+unchanged Catalog is consumed and rejected. Selection and author context both
+re-verify the Profile boundary for fresh Sessions; never create or patch their
+outputs by hand.
+
+In DSH Workspace Write, Phase 3.6 must keep the Proposal Registry below the
+Session: save with `--store "$SESSION_DIR/workflow-authoring/proposals"` and
+regenerate the Catalog with the same path in `KERSOR_PROPOSALS_DIR`. Do not fall
+back to the checkout-level Proposal store, which is outside the task boundary.
+
+Before dispatch, perform the semantic output-ownership review required by the
+current optimize protocol. Structural Proposal gates do not make an in-place
+checkpoint write safe: the authored workflow must return candidate code or
+evaluate a Session-local copy, while outer optimize alone installs a winner
+after correctness and objective proof. On a KILL/needs-revision stop, use
+KerSor's state tool to transition the Session to `stalled`, then confirm the
+terminal state with `kersor_status`; a Markdown summary is not a state change.
+The review must also prove candidate binding: importing a candidate is
+insufficient when the invoked harness still resolves the canonical
+implementation. Correctness and benchmark evidence must name and execute the
+same Session-local candidate. Keep authoring provenance equally strict.
+Build the Session's only author context and launch its exact foreground author
+with `kersor_protocol({"action":"author"})`. The Host derives the frozen Python,
+KerSor root, Session, and output path, reads the complete
+`author-context.json.dispatch` without model copying, and returns only after the
+child settles. Never invoke the wrapper or `author-workflow-context.py` through
+Bash, call `subagent`, copy the prompt, call `list_agents` or a job tool, or
+inspect staging progress while it runs. If the typed action fails, transition
+to `stalled` and stop.
+
+The first controller action after that result must be
+`kersor_author_commit({"action":"seal"})`. The Host derives the canonical
+staging and handoff paths, binds the foreground author identity, runs Core's
+exclusive seal, and records only the whole receipt path and hash rather than
+duplicating Core's internal schema. Do not read staging before this action or
+invoke/reconstruct a seal command through Bash.
+
+After the typed seal succeeds, read and semantically review only the three
+sealed direct author files. They are permanently immutable; the controller may
+reject them but must never repair them. Any extra staging file or directory is
+mixed provenance and means `needs_revision` plus canonical `stalled`.
+
+If review passes, call `kersor_author_commit({"action":"save"})` exactly once.
+The Host durably consumes the attempt before starting Core's saver and requires
+the whole handoff receipt to remain unchanged. A hash, syntax, metadata,
+taxonomy, or semantic failure is terminal, not permission to re-seal, retry, or
+overwrite a Proposal. Proposal persistence remains Session-local at
+`workflow-authoring/proposals`. On success the same typed action rebuilds and
+verifies `workflow-catalog.json` from that store. Do not invoke
+`generate-catalog.sh`; call `kersor_protocol({"action":"select_workflow"})`
+again for the same round.
 
 After KerSor's dispatch-args, harness-binding, and output-ownership gates pass,
 convert the sealed Proposal to the one portable DSH wire contract before

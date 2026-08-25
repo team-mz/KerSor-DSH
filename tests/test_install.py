@@ -1737,33 +1737,25 @@ class InstallTests(unittest.TestCase):
         self.assertIn("foreground `session-synthesizer` is the sole writer", skill)
         self.assertIn("Only\n`normalize-transfer.py` may atomically advance", skill)
         self.assertIn("Never\ncall `kersor-state.sh ... set current_round ...`", skill)
-        self.assertIn("workflow-author in the foreground", skill)
+        self.assertIn("exact foreground author", skill)
         self.assertIn("`author-context.json.dispatch`", skill)
-        self.assertIn("`description`, `run_in_background`, and `prompt`", skill)
-        self.assertIn("blocking result is the completion\nnotification", skill)
-        self.assertIn("Never call `list_agents`", skill)
-        self.assertIn("`scripts/seal-author-handoff.py`", skill)
+        self.assertIn("without model copying", skill)
+        self.assertIn("call `list_agents` or a job tool", skill)
+        self.assertIn('kersor_author_commit({"action":"seal"})', skill)
+        self.assertIn('kersor_author_commit({"action":"save"})', skill)
+        self.assertIn('kersor_protocol({"action":"author"})', skill)
         self.assertIn(
-            "`workflow-authoring/attempts/round-$CURRENT_ROUND/author-handoff.json`",
-            skill,
-        )
-        self.assertIn(
-            '--out "$SESSION_DIR/workflow-authoring/attempts/round-$CURRENT_ROUND/author-context.json"',
-            skill,
-        )
-        self.assertIn(
-            "Proposal persistence remains shared at\n"
+            "Proposal persistence remains Session-local at\n"
             "`workflow-authoring/proposals`",
             skill,
         )
-        self.assertIn("never reuse a sibling round's attempt owners", skill)
-        self.assertIn("Save exactly once with `--handoff`", skill)
-        self.assertIn("`dirname(--from)/author-handoff.json`", skill)
-        self.assertIn("retry with `--force`", skill)
-        self.assertIn("overwrite an existing\nProposal", skill)
+        self.assertIn("whole handoff receipt to remain unchanged", skill)
+        self.assertIn("same typed action rebuilds and\nverifies `workflow-catalog.json`", skill)
+        self.assertIn("Do not invoke\n`generate-catalog.sh`", skill)
+        self.assertIn("not permission to re-seal, retry, or\noverwrite a Proposal", skill)
         self.assertIn("must never repair them", skill)
-        self.assertIn("file or directory is mixed provenance", skill)
-        self.assertIn("canonical `stalled`, not a patch or retry", skill)
+        self.assertIn("extra staging file or directory is\nmixed provenance", skill)
+        self.assertIn("means `needs_revision` plus canonical `stalled`", skill)
         self.assertIn("Do not accept a prose-only baseline", skill)
         self.assertIn("`baseline-witness.py init`, then `record`, then", skill)
         self.assertIn("controller prompt's literal", skill)
@@ -1772,22 +1764,31 @@ class InstallTests(unittest.TestCase):
         self.assertIn("never abbreviate these commands", skill)
         self.assertIn("Output produced before Session creation", skill)
         self.assertIn("Never parse `session-config.json` directly", skill)
-        self.assertIn("scripts/profile-handoff.py\" context", skill)
-        self.assertIn("exact `description`,\n`run_in_background`, and `prompt`", skill)
-        self.assertIn("exactly one DSH\n`subagent` call in the foreground", skill)
-        self.assertIn("must not write/edit\n`kernel-profile.md`", skill)
-        self.assertIn("scripts/profile-handoff.py\" seal", skill)
-        self.assertIn('--producer-session-id "$PROFILER_CHILD_SESSION_ID"', skill)
-        self.assertIn("scripts/profile-handoff.py\" verify", skill)
-        self.assertIn("The first parent action after that result", skill)
-        self.assertIn("both\nre-verify this boundary", skill)
+        self.assertIn('kersor_protocol({"action":"profile"})', skill)
+        self.assertLess(
+            skill.index("Do not accept a prose-only baseline"),
+            skill.index('kersor_protocol({"action":"profile"})'),
+        )
+        self.assertIn("without a model-visible\nline projection", skill)
+        self.assertIn("exactly one\nforeground DSH child", skill)
+        self.assertIn("must not read or copy the\nlong prompt", skill)
+        self.assertNotIn('"action":"profile_context"', skill)
+        self.assertNotIn('"action":"profile_seal"', skill)
+        self.assertNotIn('"action":"profile_verify"', skill)
+        self.assertNotIn('producer_session_id', skill)
+        self.assertIn('kersor_protocol({"action":"select_workflow"})', skill)
+        self.assertIn("owns filtering, the\nCore-authored selection handoff", skill)
+        self.assertIn("Never call `subagent` for selection", skill)
+        self.assertIn("`round-N-routing-decision.json`", skill)
+        self.assertIn("repeating an\nunchanged Catalog is consumed and rejected", skill)
+        self.assertIn("Selection and author context both\nre-verify the Profile boundary", skill)
         self.assertNotIn(
             'python3 "$kersor_root/scripts/profile-handoff.py"', skill
         )
         self.assertNotIn(
             'python3 "$kersor_root/scripts/baseline-witness.py"', skill
         )
-        self.assertIn(
+        self.assertNotIn(
             '"${KERSOR_PYTHON:-python3}" '
             '"$kersor_root/scripts/profile-handoff.py"',
             skill,
@@ -1807,15 +1808,12 @@ class InstallTests(unittest.TestCase):
             "stdout execution evidence",
             skill,
         )
-        self.assertIn(
+        self.assertNotIn(
             'bash "$kersor_root/scripts/run-kersor-python.sh" '
             'author-workflow-context.py',
             skill,
         )
-        self.assertIn(
-            "Never execute\n`run-kersor-python.sh` with a Python interpreter",
-            skill,
-        )
+        self.assertIn("Never invoke the wrapper", skill)
         self.assertIn(
             "After any successful `kersor_start`, `kersor_attach`, or "
             "`kersor_resume` call,\nend the parent turn immediately.",

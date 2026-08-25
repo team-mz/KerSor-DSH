@@ -4,6 +4,7 @@
  * @module @deepseek-ai/dsh-kersor/types
  */
 import type { Branded } from '@deepseek-ai/dsh-brand';
+import type { CallId } from '@deepseek-ai/dsh-llm';
 import type { SessionId } from '@deepseek-ai/dsh-session/types';
 /** Opaque identity of one Mission registered in the plugin config. */
 export type KersorTaskId = Branded<'KersorTaskId'>;
@@ -204,44 +205,48 @@ export interface KersorSessionAuthorityImportedEventData {
         readonly sha256: string;
     };
 }
-/** Host seal of the exact three files returned by one foreground Workflow author. */
-export interface KersorAuthorHandoffSealedEventData {
+/** Host binding from one author protocol call to its completed foreground child. */
+export interface KersorAuthorProducedEventData {
     readonly schema_version: 1;
-    readonly contract: 'dsh_author_handoff_seal_v1';
+    readonly contract: 'dsh_author_producer_v1';
     readonly authority: 'dsh_host';
     readonly session_dir: string;
-    readonly controller_session_id: string;
-    readonly seal_call_id: string;
-    readonly seal_command: string;
-    readonly staging_dir: string;
+    readonly controller_session_id: SessionId;
+    readonly author_call_id: CallId;
+    readonly author_session_id: SessionId;
+    readonly author_context: {
+        readonly path: string;
+        readonly sha256: string;
+    };
+}
+/** Host seal of the opaque KerSor Core handoff receipt. */
+export interface KersorAuthorHandoffSealedEventData {
+    readonly schema_version: 1;
+    readonly contract: 'dsh_author_handoff_seal_v2';
+    readonly authority: 'dsh_host';
+    readonly session_dir: string;
+    readonly controller_session_id: SessionId;
+    readonly author_call_id: CallId;
+    readonly author_session_id: SessionId;
+    readonly seal_call_id: CallId;
     readonly handoff: {
         readonly path: string;
         readonly sha256: string;
     };
-    readonly files: Readonly<Record<'workflow.js' | 'metadata.json' | 'rationale.md', {
-        readonly path: string;
-        readonly sha256: string;
-    }>>;
 }
 /** Durable pre-execution consumption of the sole canonical authored Proposal save. */
 export interface KersorAuthorSaveAttemptedEventData {
     readonly schema_version: 1;
-    readonly contract: 'dsh_author_save_attempt_v1';
+    readonly contract: 'dsh_author_save_attempt_v2';
     readonly authority: 'dsh_host';
     readonly session_dir: string;
-    readonly controller_session_id: string;
-    readonly save_call_id: string;
-    readonly save_command: string;
-    readonly seal_call_id: string;
-    readonly staging_dir: string;
+    readonly controller_session_id: SessionId;
+    readonly save_call_id: CallId;
+    readonly seal_call_id: CallId;
     readonly handoff: {
         readonly path: string;
         readonly sha256: string;
     };
-    readonly files: Readonly<Record<'workflow.js' | 'metadata.json' | 'rationale.md', {
-        readonly path: string;
-        readonly sha256: string;
-    }>>;
 }
 /** One Host-minted binding from a foreground dispatch synthesizer to its exact bytes. */
 export interface KersorDispatchArgsProducedEventData {
@@ -264,7 +269,7 @@ export interface KersorDispatchArgsProducedEventData {
         readonly sha256: string;
     };
 }
-/** Host-minted second custody link for the deterministic runtime-control pass. */
+/** Host-minted second custody link for the producer-triggered runtime-control pass. */
 export interface KersorDispatchArgsTransformedEventData {
     readonly schema_version: 1;
     readonly contract: 'dsh_dispatch_args_transformation_v1';
@@ -275,6 +280,7 @@ export interface KersorDispatchArgsTransformedEventData {
     readonly round: number;
     readonly workflow_name: string;
     readonly controller_session_id: string;
+    /** Producer call whose durable success triggered the Host-owned transformation. */
     readonly transformation_call_id: string;
     readonly producer_receipt: {
         readonly path: string;
@@ -442,7 +448,9 @@ declare module '@deepseek-ai/dsh-session/types' {
         'kersor/session-authority-transferred': KersorSessionAuthorityTransferredEventData;
         /** Durable Host authority imported into one attached controller. */
         'kersor/session-authority-imported': KersorSessionAuthorityImportedEventData;
-        /** Host seal of one foreground Workflow author's exact returned files. */
+        /** Host binding from one author protocol call to its foreground child. */
+        'kersor/author-produced': KersorAuthorProducedEventData;
+        /** Host seal of the opaque KerSor Core handoff receipt. */
         'kersor/author-handoff-sealed': KersorAuthorHandoffSealedEventData;
         /** Durable consumption of the sole canonical authored Proposal save attempt. */
         'kersor/author-save-attempted': KersorAuthorSaveAttemptedEventData;
