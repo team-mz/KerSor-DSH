@@ -1322,8 +1322,8 @@ window.__ModuleLoader__.load({
 			}, [refresh]);
 			(0, react.useEffect)(() => {
 				if (store.selectionIntent !== "follow") return;
-				const currentRows = rows.filter((row) => belongsToWorkspace(row.sessionDir, currentWorkspace));
-				const target = currentRows.find((row) => row.discovery === "active") ?? [...currentRows].sort((left, right) => right.runId.localeCompare(left.runId))[0] ?? rows.find((row) => row.discovery === "active") ?? [...rows].sort((left, right) => right.runId.localeCompare(left.runId))[0];
+				const eligibleRows = currentWorkspace === void 0 || currentWorkspace.length === 0 ? rows : rows.filter((row) => belongsToWorkspace(row.sessionDir, currentWorkspace));
+				const target = eligibleRows.find((row) => row.discovery === "active") ?? [...eligibleRows].sort((left, right) => right.runId.localeCompare(left.runId))[0];
 				if (target === void 0 || !store.followDiscoveredRun(target.runDir)) return;
 				loadRun(target.runDir);
 			}, [

@@ -1114,11 +1114,11 @@ export function KersorView({
 
   useEffect(() => {
     if (store.selectionIntent !== 'follow') return
-    const currentRows = rows.filter(row => belongsToWorkspace(row.sessionDir, currentWorkspace))
-    const target = currentRows.find(row => row.discovery === 'active')
-      ?? [...currentRows].sort((left, right) => right.runId.localeCompare(left.runId))[0]
-      ?? rows.find(row => row.discovery === 'active')
-      ?? [...rows].sort((left, right) => right.runId.localeCompare(left.runId))[0]
+    const eligibleRows = currentWorkspace === undefined || currentWorkspace.length === 0
+      ? rows
+      : rows.filter(row => belongsToWorkspace(row.sessionDir, currentWorkspace))
+    const target = eligibleRows.find(row => row.discovery === 'active')
+      ?? [...eligibleRows].sort((left, right) => right.runId.localeCompare(left.runId))[0]
     if (target === undefined || !store.followDiscoveredRun(target.runDir)) return
     void loadRun(target.runDir)
   }, [currentWorkspace, loadRun, rows, store])

@@ -182,6 +182,37 @@ describe('KerSor conversation view registration', () => {
     expect(selected.getAttribute('aria-pressed')).toBe('true')
   })
 
+  it('does not auto-select a run from another Workspace when the current Workspace has none', async () => {
+    const store = new KersorViewerStore()
+    const unrelatedRun = '/work/other/.kersor/20260821-134926/run-1'
+    store.setSnapshot({
+      ...EMPTY_SNAPSHOT,
+      runs: [{
+        runId: 'run-1', runDir: unrelatedRun,
+        sessionDir: '/work/other/.kersor/20260821-134926', root: '/work/other/.kersor',
+        kind: 'classic-round', round: 1, discovery: 'completed',
+      }],
+    })
+    const loadRun = vi.fn(() => Promise.resolve())
+    const props = {
+      t: makeTranslate(zh, commonZh), store,
+      currentWorkspace: '/work/current',
+      refresh: vi.fn(() => Promise.resolve()),
+      loadRun,
+      loadCallDetail: vi.fn(() => Promise.resolve()),
+      loadClassic: vi.fn(() => Promise.resolve()),
+      start: vi.fn(() => Promise.resolve()),
+      stop: vi.fn(() => Promise.resolve()),
+    } as unknown as Parameters<typeof KersorView>[0]
+
+    render(<KersorView {...props} />)
+    await waitFor(() => { expect(screen.getByRole('button', { name: /run-1/ })).toBeTruthy() })
+
+    expect(store.selectionIntent).toBe('follow')
+    expect(store.selectedRunDir).toBeUndefined()
+    expect(loadRun).not.toHaveBeenCalled()
+  })
+
   it('follows each late current-Workspace active run once until the user selects manually', async () => {
     const store = new KersorViewerStore()
     const firstRun = '/work/current/.kersor/20260825T050000Z-general-evolve'
