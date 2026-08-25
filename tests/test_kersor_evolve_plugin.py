@@ -319,7 +319,7 @@ const terminalStepQuotaAfterMeteredProgressEvents = withSeq([
         source: {
           kind: 'model',
           provider: 'deepseek-official',
-          model: 'deepseek-v4-flash',
+          model: 'kimi-k2.7-code',
         },
       },
     },
@@ -371,7 +371,7 @@ const terminalStepQuotaAfterMeteredProgressEvents = withSeq([
         source: {
           kind: 'model',
           provider: 'deepseek-official',
-          model: 'deepseek-v4-flash',
+          model: 'kimi-k2.7-code',
         },
       },
     },
@@ -909,6 +909,9 @@ const ctx = {
         glob_outside: {name: 'glob', arguments: {pattern: '*', path: request.outside_directory}},
         grep_symlink_escape: {name: 'grep', arguments: {pattern: 'secret', path: request.escape_symlink}},
         glob_parent_pattern: {name: 'glob', arguments: {pattern: '../*'}},
+        read_control: {name: 'read', arguments: {file_path: '.kersor/control.json'}},
+        glob_control: {name: 'glob', arguments: {pattern: '*', path: '.kersor'}},
+        grep_control: {name: 'grep', arguments: {pattern: 'secret', path: '.kersor'}},
       }
       for (const [probe, execution] of Object.entries(guardProbes)) {
         if (Object.values(execution.arguments).includes(undefined)) continue
@@ -1004,6 +1007,9 @@ const ctx = {
 }
 plugin.apply(ctx)
 if (registeredTool === undefined) throw new Error('kersor_evolve tool was not registered')
+if (request.timeout_ms !== undefined) {
+  registeredTool = plugin.createTool({ctx, timeoutMs: request.timeout_ms})
+}
 const controller = new AbortController()
 if (request.abort_after_ms !== undefined) {
   setTimeout(() => controller.abort(new Error('test DSH cancellation')), request.abort_after_ms).unref()
@@ -1175,7 +1181,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
                     "nonce_env": "KERSOR_DSH_RPC_NONCE",
                     "max_frame_bytes": 16 * 1024 * 1024,
                     "provider": "deepseek-official",
-                    "model": "deepseek-v4-flash",
+                    "model": "kimi-k2.7-code",
                     "timeout_seconds": 900,
                 },
             }),
@@ -1215,10 +1221,12 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             "}\n"
             "if 'activation_model_role' in contract_value:\n"
             "  request['activation']['model_role'] = contract_value['activation_model_role']\n"
-            "if contract_value.get('probe_mode') == 'sequential-65':\n"
+            "if contract_value.get('probe_mode') in ('sequential-65', 'two-delayed'):\n"
+            "  activation_count = 65 if contract_value['probe_mode'] == 'sequential-65' else 2\n"
             "  last = None\n"
-            "  for index in range(65):\n"
+            "  for index in range(activation_count):\n"
             "    request['request_id'] = f'route-probe-{index}'\n"
+            "    request['activation']['call_id'] = f'route-probe/inspect/{index + 1}'\n"
             "    payload = json.dumps(request, separators=(',', ':')).encode()\n"
             "    sequential = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
             "    sequential.connect(os.environ['KERSOR_DSH_RPC_SOCKET'])\n"
@@ -1232,7 +1240,9 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             "    last = json.loads(chunks)\n"
             "    if last.get('ok') is not True:\n"
             "      raise RuntimeError(last)\n"
-            "  print(json.dumps({'status': 'completed', 'activation_count': 65, 'dsh_result': last['result']}))\n"
+            "    if contract_value['probe_mode'] == 'two-delayed':\n"
+            "      time.sleep(0.08)\n"
+            "  print(json.dumps({'status': 'completed', 'activation_count': activation_count, 'dsh_result': last['result']}))\n"
             "  raise SystemExit(0)\n"
             "payload = json.dumps(request, separators=(',', ':')).encode()\n"
             "sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
@@ -1290,6 +1300,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self,
         contract: Path,
         *,
+        runtime: str | None = None,
         abort_after_ms: int | None = None,
         child_mode: str | None = None,
         guard_probe: bool = False,
@@ -1298,11 +1309,15 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         transaction_alias: str | None = None,
         cwd: Path | None = None,
         swap_workspace_to: Path | None = None,
+        timeout_ms: int | None = None,
     ) -> dict[str, object]:
         request: dict[str, object] = {
             "module": str(self.module),
             "cwd": str(self.workspace if cwd is None else cwd),
-            "args": {"contract": str(contract)},
+            "args": {
+                "contract": str(contract),
+                **({} if runtime is None else {"runtime": runtime}),
+            },
             "outside_file": str(self.outside_secret),
             "outside_directory": str(self.home),
             "escape_symlink": str(self.escape_symlink),
@@ -1321,6 +1336,8 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             request["transaction_alias"] = transaction_alias
         if swap_workspace_to is not None:
             request["swap_workspace_to"] = str(swap_workspace_to)
+        if timeout_ms is not None:
+            request["timeout_ms"] = timeout_ms
         completed = subprocess.run(
             [NODE, "--input-type=module", "-e", DSH_NODE_DRIVER],
             input=json.dumps(request),
@@ -1331,6 +1348,127 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         return json.loads(completed.stdout)
+
+    def test_public_host_runs_fixed_task_through_dsh_transaction(self) -> None:
+        self.prepare_dsh_native_core()
+        primary = self.workspace / "candidate.py"
+        secondary = self.workspace / "semver.py"
+        primary.write_text("baseline = True\n", encoding="utf-8")
+        secondary.write_text("baseline = True\n", encoding="utf-8")
+        contract = self.root / "task.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-task-v1",
+                "workspace": "workspace",
+                "runtime": "codex",
+                "objective": "repair both declared artifacts",
+                "max_rounds": 2,
+                "native_subagents": 0,
+                "activation_phase": "Evolve 1",
+                "activation_label": "evolve-1",
+                "activation_options": {"transaction": {
+                    "artifacts": [primary.name, secondary.name],
+                }},
+                "verifier": {
+                    "argv": ["python3", "../verifier/verify.py"],
+                    "cwd": ".",
+                    "artifacts": [primary.name, secondary.name],
+                    "feedback": "status",
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        result = self.invoke_dsh_native(
+            contract,
+            runtime="dsh",
+            transaction_artifact=primary,
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "completed", result)
+        self.assertEqual(result["value"]["dsh_result"]["model_role"], "worker")
+        self.assertEqual(len(result["telemetry"]["starts"]), 1)
+        self.assertEqual(
+            result["telemetry"]["starts"][0]["tool_filter"],
+            {"allow": ["read", "glob", "grep", "edit", "write"]},
+        )
+        self.assertIsNone(result["telemetry"]["guards"]["edit"])
+        self.assertIsNone(result["telemetry"]["guards"]["write"])
+
+    def test_dsh_outer_host_does_not_time_out_a_later_bounded_activation(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        contract = self.root / "task.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-task-v1",
+                "workspace": "workspace",
+                "runtime": "codex",
+                "objective": "exercise two sequential bounded activations",
+                "max_rounds": 2,
+                "native_subagents": 0,
+                "probe_mode": "two-delayed",
+                "activation_phase": "Evolve 1",
+                "activation_options": {"transaction": {
+                    "artifacts": [candidate.name],
+                }},
+                "verifier": {
+                    "argv": ["python3", "../verifier/verify.py"],
+                    "cwd": ".",
+                    "artifacts": [candidate.name],
+                    "feedback": "status",
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        result = self.invoke_dsh_native(
+            contract,
+            runtime="dsh",
+            transaction_artifact=candidate,
+            # The deterministic Core probe takes >160ms across two RPC
+            # activations. A process-wide 50ms watchdog would kill round 1 or
+            # round 2 even though each owned operation is bounded.
+            timeout_ms=50,
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "completed", result)
+        self.assertEqual(result["value"]["activation_count"], 2)
+
+    def test_public_host_rejects_fixed_task_phase_drift_before_child_start(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        contract = self.root / "task.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-task-v1",
+                "workspace": "workspace",
+                "runtime": "codex",
+                "objective": "reject Mission phase aliases",
+                "max_rounds": 1,
+                "native_subagents": 0,
+                "activation_phase": "Execute revision 1",
+                "activation_options": {"transaction": {"artifacts": [candidate.name]}},
+                "verifier": {
+                    "argv": ["python3", "../verifier/verify.py"],
+                    "cwd": ".",
+                    "artifacts": [candidate.name],
+                    "feedback": "status",
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        result = self.invoke_dsh_native(contract, runtime="dsh")
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "failed")
+        self.assertIn('must match "Evolve <positive integer>"', result["value"]["error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
 
     def write_dsh_failure_contract(self, mission_id: str) -> Path:
         return self.write_contract(
@@ -1435,7 +1573,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self.assertTrue(start["parent_is_caller"])
         self.assertEqual(start["agent_options"], {
             "provider": "deepseek-official",
-            "model": "deepseek-v4-flash",
+            "model": "kimi-k2.7-code",
         })
         self.assertEqual(start["tool_filter"], {"allow": ["read", "glob", "grep"]})
         self.assertEqual(telemetry["dispose_count"], 1)
@@ -1445,12 +1583,16 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self.assertEqual(len(telemetry["same_turn_nested_denials"]), 1)
         self.assertIn("owns the rest", telemetry["same_turn_nested_denials"][0])
         self.assertEqual(telemetry["next_turn_denials"], [])
-        for allowed in ("read", "glob", "grep", "structured_output"):
+        for allowed in ("read", "structured_output"):
             self.assertIsNone(telemetry["guards"][allowed])
+        for broad_search in ("glob", "grep"):
+            self.assertIn("proper non-control", telemetry["guards"][broad_search])
         for forbidden in ("edit", "write", "bash", "subagent", "workflow", "kersor_evolve"):
             self.assertIn("read-only", telemetry["guards"][forbidden])
         for escaped in ("read_outside", "glob_outside", "grep_symlink_escape", "glob_parent_pattern"):
             self.assertIsNotNone(telemetry["guards"][escaped])
+        for control in ("read_control", "glob_control", "grep_control"):
+            self.assertIn("runtime-control", telemetry["guards"][control])
         self.assertNotIn("outside-secret-must-not-leak", json.dumps(result))
         terminal = result["value"]
         self.assertEqual(terminal["rpc_probe"], {
@@ -1460,7 +1602,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         })
         receipt = terminal["dsh_result"]
         self.assertEqual(receipt["provider"], "deepseek-official")
-        self.assertEqual(receipt["model"], "deepseek-v4-flash")
+        self.assertEqual(receipt["model"], "kimi-k2.7-code")
         self.assertEqual(receipt["model_role"], "planner")
         self.assertTrue(receipt["usage_observed"])
         self.assertTrue(receipt["usage_complete"])
@@ -1497,7 +1639,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         receipt = result["value"]["dsh_result"]
         self.assertEqual(receipt["model_role"], "worker")
         self.assertEqual(receipt["provider"], "deepseek-official")
-        self.assertEqual(receipt["model"], "deepseek-v4-flash")
+        self.assertEqual(receipt["model"], "kimi-k2.7-code")
 
     def test_public_host_reports_exact_pre_usage_quota_as_complete_zero_receipt(self) -> None:
         self.prepare_dsh_native_core()
@@ -1529,7 +1671,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             "usage_complete": True,
             "thread_id": "dsh-child-route-probe",
             "provider": "deepseek-official",
-            "model": "deepseek-v4-flash",
+            "model": "kimi-k2.7-code",
             "model_role": "planner",
             "isolation": "fresh-dsh-subagent",
             "artifacts": [],
@@ -1980,7 +2122,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         receipt = result["value"]["dsh_result"]
         self.assertEqual(receipt["model_role"], "planner")
         self.assertEqual(receipt["provider"], "deepseek-official")
-        self.assertEqual(receipt["model"], "deepseek-v4-flash")
+        self.assertEqual(receipt["model"], "kimi-k2.7-code")
 
     def test_cancellation_aborts_and_disposes_the_dsh_child(self) -> None:
         self.prepare_dsh_native_core()
@@ -2094,8 +2236,12 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             result["telemetry"]["starts"][0]["tool_filter"],
             {"allow": ["read", "glob", "grep", "edit", "write"]},
         )
-        for allowed in ("read", "glob", "grep", "structured_output", "edit", "write"):
+        for allowed in ("read", "structured_output", "edit", "write"):
             self.assertIsNone(result["telemetry"]["guards"][allowed])
+        for broad_search in ("glob", "grep"):
+            self.assertIn("proper non-control", result["telemetry"]["guards"][broad_search])
+        for control in ("read_control", "glob_control", "grep_control"):
+            self.assertIn("runtime-control", result["telemetry"]["guards"][control])
         for forbidden in ("edit_undeclared", "write_undeclared", "edit_alias", "write_alias"):
             self.assertIn("declared transaction artifact", result["telemetry"]["guards"][forbidden])
         self.assertEqual(candidate.read_text(encoding="utf-8"), "baseline = True\n")

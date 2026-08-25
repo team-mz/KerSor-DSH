@@ -60,7 +60,8 @@ export class KersorViewerStore {
             this.selectedClassic = undefined;
         }
         else {
-            this.selectedClassic = this.state.snapshot?.runs.find(ref => ref.runDir === runDir)?.sessionDir;
+            const ref = this.state.snapshot?.runs.find(candidate => candidate.runDir === runDir);
+            this.selectedClassic = ref?.kind === 'general-task' ? undefined : ref?.sessionDir;
         }
         this.state = { ...this.state };
         this.emit();

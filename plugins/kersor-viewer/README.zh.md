@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-在 dsh Web UI 中查看 [KerSor](https://github.com/qhy991/KerSor) 活动。它刻意分开两种投影：最近的优化 Session（包括现有经典 `state.md` 格式），以及实时 autonomous-workflow 运行。本 host 包通过已安装 KerSor preset 的 bridge 获取有上限的 Session 摘要，发现 autonomous run 目录，并 tail 每个活跃 run 的 `.runtime/events.jsonl`。一个生成的 `snapshot` Remote 与一个替换事件原子地携带两份清单及其来源健康状态；`runBacklog` 与 `runResult` 携带选中 run 的折叠进度和候选结果，`runCallDetail` 懒加载一个已知调用保留的消息与活动名称，`classicSessionDetail` 则按需读取一个已经发现的经典 Session。browser 半位于 [`@deepseek-ai/dsh-client-ui-kersor-viewer`](../ui-kersor-viewer/README.md)。
+在 dsh Web UI 中查看 [KerSor](https://github.com/qhy991/KerSor) 活动。它刻意分开两种投影：最近的优化 Session（包括现有经典 `state.md` 格式），以及可执行 Workflow run。本 host 包通过已安装 KerSor preset 的 bridge 获取有上限的 Session 摘要，发现 Session 自有 autonomous、`run-N` 以及直接 general Task run，并 tail 每个活跃 run 的 `.runtime/events.jsonl`。一个生成的 `snapshot` Remote 与一个替换事件原子地携带两份清单及其来源健康状态；`runBacklog` 与 `runResult` 携带选中 run 的折叠进度和候选结果，`runCallDetail` 懒加载一个已知调用保留的消息与活动名称，`classicSessionDetail` 则按需读取一个已经发现的经典 Session。browser 半位于 [`@deepseek-ai/dsh-client-ui-kersor-viewer`](../ui-kersor-viewer/README.md)。
 
 KerSor 始终是唯一状态所有者。bridge 导入 KerSor 规范的 `SessionStore` 与 `AttemptResultStore`；TypeScript 包不重新实现 legacy frontmatter 解析。viewer 会扫描每个已登记 Workspace，并合并规范 Session persistence 中所有合法的绝对 cwd，因此由 API 创建或作为 continuable child 创建的 Session 即使没有 `workspaceRegistry` 记录也保持可见。若 persistence 枚举失败，discovery 会保留最近一次成功读取的持久 cwd 集合及当前已登记 Workspace，并只把最终来源快照标为 degraded，不发布中间 replacement。若 preset 未安装，快照会记录 `not_installed`，autonomous run 发现仍继续工作。
 
@@ -24,13 +24,13 @@ KerSor 始终是唯一状态所有者。bridge 导入 KerSor 规范的 `SessionS
     classicStaleAfterSeconds: 1800
 ```
 
-- `roots` — 其直接子目录为 KerSor Session 的额外根；它们会与已登记 DSH Workspace、持久 Session cwd 及默认根一起扫描。
+- `roots` — 其直接子目录为 KerSor Session 或直接 general Task run 的额外 `.kersor` 根；它们会与已登记 DSH Workspace、持久 Session cwd 及默认根一起扫描。
 - `noDefaultRoots` — 关闭内置根：`~/.local/share/kersor`、`~/Agent4Kernel/KerSor/.kersor`，以及已安装 `kersor` preset 记录的 checkout（或 `KERSOR_ROOT`）追加 `/.kersor` 后的路径。已登记 Workspace 与持久 Session cwd 根仍保持可见，因为它们是任务状态，不是回退默认值。
 - `scanIntervalMs` — run 发现重扫间隔（最小 500 ms）。
 - `classicSessionLimit` — 通过已安装 preset bridge 返回的最近优化 Session 数（`0` 关闭，最大 `100`，默认 `20`）。
 - `classicStaleAfterSeconds` — 未结束 Session 的建议性无活动阈值（默认 `1800`，最大一天），与 KerSor TUI/doctor 默认值一致。
 
-若 summary 提供 `workflow_status`，它拥有 Workflow 的显示生命周期并覆盖 legacy `status`。因此，即使事件流以 `workflow.completed` 结束，`{ "status": "completed", "workflow_status": "waiting" }` 仍显示为「等待恢复」：summary 写入后 ingestion 与 backfill 已收敛，而 `waiting` 在语义上仍可恢复。规范 task-v1 的 `succeeded` 同样投影为完成；`blocked`、`stagnated`、`exhausted`、`failed` 或 `error` 则保持失败语义，不会被 Host invocation 的 `workflow.completed` 事件重新涂成 Mission 已完成。显式恢复同一个 run 时，旧 waiting summary 仍是显示边界；只有它的原子 generation 发生变化后，service 才从完整事件账本重建 phase、总量与有界结果，因此既不会折叠尚未写完的追加事件，也不会重复计算前缀。Workflow 完成不会让其父优化 Session 进入终态；browser 会把 run 与规范 Session 投影关联，并单独显示尚未完成的 Host measurement 或 decision 阶段。
+若 summary 提供 `workflow_status`，它拥有 Workflow 的显示生命周期并覆盖 legacy `status`。因此，即使事件流以 `workflow.completed` 结束，`{ "status": "completed", "workflow_status": "waiting" }` 仍显示为「等待恢复」：summary 写入后 ingestion 与 backfill 已收敛，而 `waiting` 在语义上仍可恢复。规范 task-v1 的 `succeeded` 同样投影为完成；`blocked`、`stagnated`、`exhausted`、`failed` 或 `error` 则保持失败语义，不会被 Host invocation 的 `workflow.completed` 事件重新涂成 Mission 已完成。若不存在合法 summary，事件账本最后一个完整的 `workflow.completed` 或 `workflow.failed` 会提供终态 fallback，因此被中断的直接 Task run 不会无限保持 active。显式恢复同一个 run 时，旧 waiting summary 仍是显示边界；只有它的原子 generation 发生变化后，service 才从完整事件账本重建 phase、总量与有界结果，因此既不会折叠尚未写完的追加事件，也不会重复计算前缀。Workflow 完成不会让其父优化 Session 进入终态；browser 会把 run 与规范 Session 投影关联，并单独显示尚未完成的 Host measurement 或 decision 阶段。
 
 经典 Session 卡片把 KerSor 的规范 phase 与建议性 health 分开：阈值内存在稳定 artifact 活动是 `active`；陈旧的干净 `CONTINUE` 边界是 `needs_resume`；其他未结束的陈旧工作是 `stale`；终态是 `terminal`。经过时间绝不改写 phase。有界摘要还携带 language/backend、integration pattern、Workflow 创作已用／总预算、严格 fresh-Session isolation、Session 自有 baseline witness 与 profile evidence 状态及其有界规范 blocker、DSH Workflow compatibility、Host 自有 candidate-output ownership、selector 结果、终态停止原因与 Host 验证的 cycles 血缘。展开卡片会按需读取有序且有界的 Round 历史，以及 artifact 派生的阶段时间线、selector 拒绝数、authoring／seal／save 状态、Proposal validation checks、dispatch lifecycle 与有上限的 Workflow 设计文本。每个 Round 会区分可复用 Workflow 与本轮唯一候选，并且只有 Host review 通过后才携带 measurement；错误候选可以保留明确标记的估算值，但永远不能贡献 Session best。通过 portable dispatch 门禁后，只有所选 released／Proposal Workflow 的名称与内容 hash 同时匹配 compatibility 和 catalog owner，bridge 才会公开其声明 phase 与 topology；Session 自创 Workflow 仍须等三文件 author handoff 存在且全部密封 hash 匹配后才会公开。投影同时携带最后稳定 artifact 时间；若绝对内核路径已失效，面板只显示不含路径的状态提醒，不把旧本地路径泄漏到浏览器。
 
@@ -44,7 +44,7 @@ KerSor 始终是唯一状态所有者。bridge 导入 KerSor 规范的 `SessionS
 | `src/diagnostics.ts` | 不含内容的 issue 分类与有上限的出现次数记账 |
 | `src/detail.ts` | 按需、有上限地投影 worker 身份、消息和活动名称 |
 | `src/classic.ts` | 无 shell、有上限地调用已安装 preset bridge，并校验 wire shape |
-| `src/scanner.ts` | 根扫描：session-v2 目录及其 `autonomous-runs/` 子目录 |
+| `src/scanner.ts` | 根扫描：session-v2 run family 与直接 general Task run |
 | `src/tailer.ts` | 带截断检测的 `events.jsonl` 位置追踪 tail |
 | `src/fold.ts` | KerSor 事件流到视图模型的纯函数折叠 |
 | `src/result.ts` | 排除源码和任意 report 文本的候选选择投影 |

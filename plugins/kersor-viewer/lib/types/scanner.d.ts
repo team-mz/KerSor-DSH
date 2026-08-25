@@ -9,7 +9,7 @@ export declare const DEFAULT_KERSOR_ROOTS: string[];
 /** Summary-derived lifecycle; `workflow_status` takes precedence over legacy `status`. */
 export type KersorRunDiscovery = 'active' | 'completed' | 'waiting' | 'failed';
 /** Storage family of one executable Workflow run. */
-export type KersorRunKind = 'autonomous' | 'classic-round';
+export type KersorRunKind = 'autonomous' | 'classic-round' | 'general-task';
 /** One discovered run: identity paths plus classification. */
 export interface KersorRunRef {
     readonly runId: string;

@@ -119,8 +119,12 @@ def validate_model_id(value: str, label: str) -> str:
 
 def resolve_runtime_tools(*, claude_command: Path | None = None) -> dict[str, str]:
     """Freeze absolute tool paths at trusted install time for generic evolve."""
-    resolved: dict[str, str] = {}
+    resolved: dict[str, str] = {
+        "python3": resolve_runtime_command(Path(sys.executable), "installer Python"),
+    }
     for name in RUNTIME_TOOL_NAMES:
+        if name == "python3":
+            continue
         if name == "claude" and claude_command is not None:
             resolved[name] = resolve_runtime_command(
                 claude_command,

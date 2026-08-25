@@ -325,6 +325,8 @@ function runDisplayLabel(row, session) {
     const round = row.round ?? session?.current_round ?? undefined;
     const roundLabel = round === undefined ? row.runId : `R${String(round).padStart(2, '0')}`;
     const workflow = row.view?.workflow ?? session?.workflow ?? row.runId;
+    if (row.kind === 'general-task')
+        return workflow === row.runId ? row.runId : `${row.runId} · ${workflow}`;
     return `${session?.session_id ?? sessionName(row.sessionDir)} · ${roundLabel} · ${workflow}`;
 }
 function CallDetail({ detail, t }) {
@@ -532,19 +534,23 @@ export function KersorView({ t, store, currentWorkspace, refresh, loadRun, loadC
         if (store.selectedRunDir !== undefined || store.selectedClassicSessionDir !== undefined
             || rows.length === 0)
             return;
-        const currentSessions = classicSessions.filter(session => belongsToWorkspace(session.session_dir, currentWorkspace));
-        const preferredSession = currentSessions.find(session => session.health === 'active')
-            ?? currentSessions[0]
-            ?? classicSessions.find(session => session.health === 'active')
-            ?? classicSessions[0];
-        const matching = preferredSession === undefined
-            ? []
-            : rows.filter(row => row.sessionDir === preferredSession.session_dir);
         const currentRows = rows.filter(row => belongsToWorkspace(row.sessionDir, currentWorkspace));
-        const target = matching.sort((left, right) => (right.round ?? 0) - (left.round ?? 0))[0]
-            ?? currentRows.find(row => row.discovery === 'active')
+        const currentSessions = classicSessions.filter(session => belongsToWorkspace(session.session_dir, currentWorkspace));
+        const preferredCurrentSession = currentSessions.find(session => session.health === 'active')
+            ?? currentSessions[0];
+        const currentMatching = preferredCurrentSession === undefined
+            ? []
+            : rows.filter(row => row.sessionDir === preferredCurrentSession.session_dir);
+        const fallbackSession = classicSessions.find(session => session.health === 'active')
+            ?? classicSessions[0];
+        const fallbackMatching = fallbackSession === undefined
+            ? []
+            : rows.filter(row => row.sessionDir === fallbackSession.session_dir);
+        const target = currentRows.find(row => row.discovery === 'active')
+            ?? currentMatching.sort((left, right) => (right.round ?? 0) - (left.round ?? 0))[0]
             ?? currentRows[0]
             ?? rows.find(row => row.discovery === 'active')
+            ?? fallbackMatching.sort((left, right) => (right.round ?? 0) - (left.round ?? 0))[0]
             ?? rows[0];
         if (target === undefined)
             return;
@@ -616,7 +622,8 @@ export function KersorView({ t, store, currentWorkspace, refresh, loadRun, loadC
                                                         store.select(next);
                                                         if (next !== undefined) {
                                                             void loadRun(next);
-                                                            void loadClassic(row.sessionDir);
+                                                            if (session !== undefined)
+                                                                void loadClassic(row.sessionDir);
                                                         }
                                                     }, children: [_jsx(StateDot, { state: row.discovery === 'active'
                                                                 ? 'ongoing'

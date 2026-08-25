@@ -83,21 +83,31 @@ wrong.
   hash, Session admission, and terminal JSON. The recorded checkout must be
   physically outside the workspace, and the Host passes only frozen HOME, TMP,
   PATH, and KerSor routing values; ambient cloud, provider, and SSH tokens are
-  never inherited. Provider CLIs use their install-recorded local login. Resume only on a later user turn
+  never inherited. DSH does not add a competing process-wide elapsed-time
+  watchdog around the complete multi-activation Core run; each activation and
+  Host evaluator retains its own finite timeout, while cancellation and output
+  caps stay active at the outer process. Provider CLIs use their
+  install-recorded local login. Resume only on a later user turn
   in a new top-level DSH session with the same absolute `run_dir` and
   `resume:true`; every session may call `kersor_evolve` only once, including a
   failed or cancelled call. After any completed or
   blocked result, report that exact result and stop; never inspect, retry, or
   fall back in the same turn. A Mission is deliberately rejected from the Bash
   bridge route so it cannot inherit the calling agent's nested Seatbelt.
-- For a frozen `kersor-task-v1`, run
+- For a frozen `kersor-task-v1` that must run natively in DSH, call
+  `kersor_evolve` with
+  `{"contract":"<absolute-contract-path>","runtime":"dsh"}`. The contract may
+  be inside the current workspace or be the canonical parent `task.json` whose
+  relative `workspace` resolves to the current directory. Make this the first
+  and only tool call. The Host freezes the contract and runtime config, starts
+  the DSH RPC service, limits writes to the exact verifier artifact set, and
+  lets Core own baseline and round verification. For an explicitly requested
+  external Codex Task, retain the workspace-confined bridge route:
   `"${KERSOR_PYTHON:-python3}" "$bridge" evolve --contract <contract-path>`.
-  Fixed Tasks support only `runtime=codex` and retain the workspace-confined
-  Codex shell route and outer workspace-write attestation. Make this foreground
-  invocation the first and only shell action; do not pre-read or inspect its
-  inputs, add environment assignments, background it, or poll it. An explicit
-  Task run directory must be one direct child of `workspace/.kersor`. Report
-  the exact terminal JSON/status and stop after the invocation returns.
+  Make that foreground invocation the first and only shell action; do not
+  pre-read its inputs, add environment assignments, background it, or poll it.
+  An explicit Task run directory must be one direct child of
+  `workspace/.kersor`. Report the exact terminal JSON/status and stop.
 - For a kernel file or task directory, preflight the direct route with `"${KERSOR_PYTHON:-python3}" "$bridge" compose optimize --path <path> --json`.
 - For a bundled case, list or match cases first, then use `"${KERSOR_PYTHON:-python3}" "$bridge" compose build --case <id> --json`.
 - For environment diagnosis, use `"${KERSOR_PYTHON:-python3}" "$bridge" doctor --runtime dsh`.
@@ -110,7 +120,7 @@ request. Use `kersor-task-v1` for one bounded mutate/verify loop. Use
 `kersor-mission-v1` only when the workflow topology must adapt across evidence,
 branches, checkpoints, or feedback. Write the frozen contract under the current
 workspace (for example `.kersor-contracts/<mission-id>.json`) and then use the
-matching Mission Host tool or fixed Task bridge route above;
+matching Host tool or the explicit external-Codex Task bridge route above;
 the user must not prepare Session JSON by hand.
 
 For a Mission, the capability registry may contain only authority already
@@ -151,20 +161,25 @@ SHA-256 again at launch. A completed DSH turn is not Mission success: only a
 Host-owned `kersor_evolve` status of `completed` plus the matching Core result
 may be reported as successful.
 
-The DSH-native Mission route accepts `runtime=dsh` read-only capabilities and
-one-file write capabilities admitted by the Mission authority and backed by a
-live Core transaction. Planner and read-only activations receive only
+The DSH-native route accepts fixed Tasks plus `runtime=dsh` Mission read-only
+capabilities and one-file Mission write capabilities. A fixed Task derives its
+complete transaction artifact set from `verifier.artifacts`; Core retains its
+ordinary baseline, `feedback=status`, round budget, and post-activation Host
+verification. Mission planner and read-only activations receive only
 `read`/`glob`/`grep`; an Execute worker with a bound transaction additionally
 receives `edit`/`write`. A synchronous guard permits those mutation tools only
 for the exact declared artifact, so the worker may revise that file repeatedly
 without gaining arbitrary workspace write access. It denies aliases, links,
 KerSor control trees, the frozen Mission/runtime config/Session, Bash,
 subagents, Workflows, recursive KerSor, and paths outside the workspace. A
+child also cannot read `.git`, `.conformance`, `.kersor`, or
+`.kersor-autonomous`; `glob` and `grep` must name a proper non-control
+workspace descendant instead of searching the workspace root. A
 candidate verifier must be a non-retryable, sealed, read-only `command-v1` Host
 evaluator whose full request, rollback policy, and candidate gate match the
 frozen Mission; Core runs it while the snapshot is live and commits only an
 accepted candidate. Every activation still uses the owner-only AF_UNIX endpoint
-and a fresh DSH `spawn` child pinned to `deepseek-official/deepseek-v4-flash`.
+and a fresh DSH `spawn` child pinned to `deepseek-official/kimi-k2.7-code`.
 The Host folds durable usage chunks and assistant messages by `(turn, step)`,
 with the later sample replacing an earlier sample for that step, and processes
 the durable terminal before requiring structured output. Completeness requires
@@ -198,7 +213,8 @@ General non-quota usage is complete only when every step has an authoritative
 token-meter sample. Durable `blocked`, `aborted`, and `interrupted` terminals
 map to `refusal`, `aborted`, and `error`; route drift, disconnect, cancellation,
 and unsafe transactions also fail closed and dispose the child. Use an external
-runtime for multi-file or otherwise unsupported mutation contracts.
+runtime for Mission mutation contracts that exceed the one-file capability
+rule; fixed Tasks may retain their declared multi-file artifact set.
 
 For `runtime=claude`, the bridge removes ambient `CLAUDE*`, `ANTHROPIC*`, and
 KerSor routing controls and publishes only the Claude-compatible executable and

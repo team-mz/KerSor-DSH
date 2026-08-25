@@ -136,6 +136,52 @@ describe('KerSor conversation view registration', () => {
     expect(container.querySelector('[data-status="waiting"] [data-state="warning"]')).toBeTruthy()
   })
 
+  it('selects the current Workspace Task run before an unrelated classic Session', async () => {
+    const store = new KersorViewerStore()
+    const currentRun = '/work/current/.kersor/20260825T044946Z-general-evolve'
+    const oldSession = '/work/other/.kersor/20260821-134926'
+    const oldRun = `${oldSession}/run-1`
+    store.setSnapshot({
+      ...EMPTY_SNAPSHOT,
+      classic: {
+        source: { state: 'healthy' },
+        sessions: [{
+          session_id: '20260821-134926', session_dir: oldSession, storage_kind: 'v2',
+          lifecycle: 'stalled', status: 'terminal-stalled', health: 'terminal',
+          current_round: 1, max_workflows: 1, warningCount: 0,
+        }],
+      },
+      runs: [
+        {
+          runId: 'run-1', runDir: oldRun, sessionDir: oldSession, root: '/work/other/.kersor',
+          kind: 'classic-round', round: 1, discovery: 'completed',
+        },
+        {
+          runId: path.basename(currentRun), runDir: currentRun, sessionDir: currentRun,
+          root: '/work/current/.kersor', kind: 'general-task', discovery: 'active',
+        },
+      ],
+    })
+    const loadRun = vi.fn(() => Promise.resolve())
+    const props = {
+      t: makeTranslate(zh, commonZh), store,
+      currentWorkspace: '/work/current',
+      refresh: vi.fn(() => Promise.resolve()),
+      loadRun,
+      loadCallDetail: vi.fn(() => Promise.resolve()),
+      loadClassic: vi.fn(() => Promise.resolve()),
+      start: vi.fn(() => Promise.resolve()),
+      stop: vi.fn(() => Promise.resolve()),
+    } as unknown as Parameters<typeof KersorView>[0]
+
+    render(<KersorView {...props} />)
+
+    await waitFor(() => { expect(store.selectedRunDir).toBe(currentRun) })
+    expect(loadRun).toHaveBeenCalledWith(currentRun)
+    const selected = screen.getByRole('button', { name: new RegExp(path.basename(currentRun)) })
+    expect(selected.getAttribute('aria-pressed')).toBe('true')
+  })
+
   it('visualizes the runtime pipeline, parallel calls, and selected candidate', async () => {
     const store = new KersorViewerStore()
     const sessionDir = '/work/other/.kersor/20260821-134926'

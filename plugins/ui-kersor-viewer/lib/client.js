@@ -795,6 +795,7 @@ window.__ModuleLoader__.load({
 			const round = row.round ?? session?.current_round ?? void 0;
 			const roundLabel = round === void 0 ? row.runId : `R${String(round).padStart(2, "0")}`;
 			const workflow = row.view?.workflow ?? session?.workflow ?? row.runId;
+			if (row.kind === "general-task") return workflow === row.runId ? row.runId : `${row.runId} · ${workflow}`;
 			return `${session?.session_id ?? sessionName(row.sessionDir)} · ${roundLabel} · ${workflow}`;
 		}
 		function CallDetail({ detail, t }) {
@@ -1320,11 +1321,13 @@ window.__ModuleLoader__.load({
 			}, [refresh]);
 			(0, react.useEffect)(() => {
 				if (store.selectedRunDir !== void 0 || store.selectedClassicSessionDir !== void 0 || rows.length === 0) return;
-				const currentSessions = classicSessions.filter((session) => belongsToWorkspace(session.session_dir, currentWorkspace));
-				const preferredSession = currentSessions.find((session) => session.health === "active") ?? currentSessions[0] ?? classicSessions.find((session) => session.health === "active") ?? classicSessions[0];
-				const matching = preferredSession === void 0 ? [] : rows.filter((row) => row.sessionDir === preferredSession.session_dir);
 				const currentRows = rows.filter((row) => belongsToWorkspace(row.sessionDir, currentWorkspace));
-				const target = matching.sort((left, right) => (right.round ?? 0) - (left.round ?? 0))[0] ?? currentRows.find((row) => row.discovery === "active") ?? currentRows[0] ?? rows.find((row) => row.discovery === "active") ?? rows[0];
+				const currentSessions = classicSessions.filter((session) => belongsToWorkspace(session.session_dir, currentWorkspace));
+				const preferredCurrentSession = currentSessions.find((session) => session.health === "active") ?? currentSessions[0];
+				const currentMatching = preferredCurrentSession === void 0 ? [] : rows.filter((row) => row.sessionDir === preferredCurrentSession.session_dir);
+				const fallbackSession = classicSessions.find((session) => session.health === "active") ?? classicSessions[0];
+				const fallbackMatching = fallbackSession === void 0 ? [] : rows.filter((row) => row.sessionDir === fallbackSession.session_dir);
+				const target = currentRows.find((row) => row.discovery === "active") ?? currentMatching.sort((left, right) => (right.round ?? 0) - (left.round ?? 0))[0] ?? currentRows[0] ?? rows.find((row) => row.discovery === "active") ?? fallbackMatching.sort((left, right) => (right.round ?? 0) - (left.round ?? 0))[0] ?? rows[0];
 				if (target === void 0) return;
 				store.select(target.runDir);
 				loadRun(target.runDir);
@@ -1467,7 +1470,7 @@ window.__ModuleLoader__.load({
 												store.select(next);
 												if (next !== void 0) {
 													loadRun(next);
-													loadClassic(row.sessionDir);
+													if (session !== void 0) loadClassic(row.sessionDir);
 												}
 											},
 											children: [
@@ -1751,7 +1754,10 @@ window.__ModuleLoader__.load({
 			select(runDir) {
 				this.selected = runDir;
 				if (runDir === void 0) this.selectedClassic = void 0;
-				else this.selectedClassic = this.state.snapshot?.runs.find((ref) => ref.runDir === runDir)?.sessionDir;
+				else {
+					const ref = this.state.snapshot?.runs.find((candidate) => candidate.runDir === runDir);
+					this.selectedClassic = ref?.kind === "general-task" ? void 0 : ref?.sessionDir;
+				}
 				this.state = { ...this.state };
 				this.emit();
 			}

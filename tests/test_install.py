@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -173,6 +174,10 @@ class InstallTests(unittest.TestCase):
             tools = INSTALLER.resolve_runtime_tools()
         self.assertEqual(tools["claude"], str(fake_claude.absolute()))
 
+    def test_runtime_tool_snapshot_uses_the_installer_python(self) -> None:
+        tools = INSTALLER.resolve_runtime_tools()
+        self.assertEqual(tools["python3"], str(Path(sys.executable).resolve()))
+
     def test_install_freezes_an_explicit_claude_compatible_route(self) -> None:
         wrapper = self.root / "trusted-bin" / "claude-infini"
         wrapper.parent.mkdir()
@@ -303,7 +308,7 @@ class InstallTests(unittest.TestCase):
                     "nonce_env": "KERSOR_DSH_RPC_NONCE",
                     "max_frame_bytes": 16 * 1024 * 1024,
                     "provider": "deepseek-official",
-                    "model": "deepseek-v4-flash",
+                    "model": "kimi-k2.7-code",
                     "timeout_seconds": 900,
                 },
             }),
@@ -1493,6 +1498,112 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         self.assertIn("direct child of workspace/.kersor", completed.stderr)
 
+    def test_generic_host_runs_parent_owned_fixed_task_through_dsh(self) -> None:
+        self.prepare_generic_evolve_checkout()
+        destination, _, _ = self.run_install()
+        self.prepare_installed_generic_tools(destination)
+        workspace = self.root / "challenge" / "workspace"
+        workspace.mkdir(parents=True)
+        contract = workspace.parent / "task.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-task-v1",
+                "workspace": "workspace",
+                "runtime": "codex",
+                "objective": "repair the fixed challenge",
+                "max_rounds": 1,
+                "native_subagents": 0,
+                "verifier": {
+                    "argv": ["python3", "../verifier/verify.py"],
+                    "cwd": ".",
+                    "artifacts": ["solution.py"],
+                    "feedback": "status",
+                },
+            }),
+            encoding="utf-8",
+        )
+        (workspace / "solution.py").write_text("pass\n", encoding="utf-8")
+
+        rpc_dir = self.root / "rpc"
+        rpc_dir.mkdir(mode=0o700)
+        rpc_path = rpc_dir / "host.sock"
+        environment = dict(os.environ)
+        environment.update({
+            "KERSOR_DSH_RPC_SOCKET": str(rpc_path),
+            "KERSOR_DSH_RPC_NONCE": "a" * 64,
+        })
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as rpc:
+            rpc.bind(str(rpc_path))
+            rpc_path.chmod(0o600)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(destination / "bin" / "kersor_bridge.py"),
+                    "evolve",
+                    "--host-execution",
+                    "--contract",
+                    str(contract),
+                    "--runtime",
+                    "dsh",
+                    "--expected-runtime",
+                    "dsh",
+                ],
+                cwd=workspace,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        argv = (contract.with_suffix(".json.argv")).read_text(encoding="utf-8").splitlines()
+        self.assertIn("--runtime", argv)
+        self.assertEqual(argv[argv.index("--runtime") + 1], "dsh")
+        self.assertIn("--expected-runtime-config-sha256", argv)
+        environment = (contract.with_suffix(".json.env")).read_text(encoding="utf-8")
+        self.assertNotIn("ambient", environment)
+
+    def test_generic_host_rejects_non_dsh_fixed_task(self) -> None:
+        self.prepare_generic_evolve_checkout()
+        destination, _, _ = self.run_install()
+        self.prepare_installed_generic_tools(destination)
+        workspace = self.root / "challenge" / "workspace"
+        workspace.mkdir(parents=True)
+        contract = workspace.parent / "task.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-task-v1",
+                "workspace": "workspace",
+                "runtime": "codex",
+                "objective": "reject product routing through the Host tool",
+                "max_rounds": 1,
+                "verifier": {
+                    "argv": ["python3", "../verifier/verify.py"],
+                    "artifacts": ["solution.py"],
+                },
+            }),
+            encoding="utf-8",
+        )
+        (workspace / "solution.py").write_text("pass\n", encoding="utf-8")
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(destination / "bin" / "kersor_bridge.py"),
+                "evolve",
+                "--host-execution",
+                "--contract",
+                str(contract),
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("Host fixed Task execution requires runtime=dsh", completed.stderr)
+
     def test_generic_session_bootstrap_failure_is_atomic(self) -> None:
         self.prepare_generic_evolve_checkout()
         (self.kersor / "scripts" / "create-session.py").write_text(
@@ -1670,18 +1781,20 @@ class InstallTests(unittest.TestCase):
         self.assertIn("For a frozen `kersor-mission-v1`, call `kersor_evolve`", skill)
         self.assertIn("first and only tool call of the turn", skill)
         self.assertIn("A Mission is deliberately rejected from the Bash", skill)
-        self.assertIn("Fixed Tasks support only `runtime=codex`", skill)
+        self.assertIn("For a frozen `kersor-task-v1` that must run natively in DSH", skill)
+        self.assertIn('{"contract":"<absolute-contract-path>","runtime":"dsh"}', skill)
+        self.assertIn("canonical parent `task.json`", skill)
         self.assertIn("Never translate a generic contract", skill)
         self.assertIn("never call `kersor_start` for it", skill)
         self.assertIn("the user must not prepare Session JSON by hand", skill)
-        self.assertIn("one-file write capabilities", skill)
-        self.assertIn("live Core transaction", skill)
+        self.assertIn("one-file Mission write capabilities", skill)
+        self.assertIn("complete transaction artifact set", skill)
         self.assertIn("non-retryable, sealed, read-only `command-v1`", skill)
-        self.assertIn("`deepseek-official/deepseek-v4-flash`", skill)
+        self.assertIn("`deepseek-official/kimi-k2.7-code`", skill)
         self.assertIn("outside the workspace", skill)
         self.assertIn("external product-stack route", skill)
         self.assertIn("The Host tool owns the foreground process", skill)
-        self.assertIn("matching Mission Host tool or fixed Task bridge route", skill)
+        self.assertIn("matching Host tool or the explicit external-Codex Task bridge route", skill)
 
     def test_same_size_local_edit_is_not_mistaken_for_identical(self) -> None:
         destination, _, _ = self.run_install()

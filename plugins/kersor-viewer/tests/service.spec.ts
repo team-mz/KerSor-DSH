@@ -67,6 +67,49 @@ afterEach(async () => {
 })
 
 describe('Host snapshot', () => {
+  it('tails a direct general Task run discovered from the current Workspace', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'kersor-viewer-general-task-'))
+    dirs.push(workspace)
+    const runDir = path.join(workspace, '.kersor', '20260825T044946Z-general-evolve')
+    await mkdir(path.join(runDir, '.runtime'), { recursive: true })
+    await writeFile(path.join(runDir, 'task.json'), '{"contract_version":"kersor-task-v1"}')
+    await writeFile(path.join(runDir, '.runtime', 'events.jsonl'), [
+      '{"type":"workflow.started","script":"/workflows/general/self-evolve.js"}',
+      '{"type":"phase.changed","phase":"Evolve 1"}',
+      '{"type":"agent.started","seq":1,"call_id":"Evolve-1/evolve-1/1","phase":"Evolve 1","label":"evolve-1"}',
+      '',
+    ].join('\n'))
+    const service = new KersorViewerService(sourceContext([workspace]), {
+      noDefaultRoots: true, classicSessionLimit: 0,
+    })
+
+    await service.rescan()
+    await settleBacklog(service, runDir, view => view.currentPhase === 'Evolve 1')
+
+    expect(service.snapshot()).toMatchObject({
+      runs: [{
+        runId: path.basename(runDir), runDir, sessionDir: runDir,
+        root: path.join(workspace, '.kersor'), kind: 'general-task', discovery: 'active',
+      }],
+      diagnostics: {
+        scan: { state: 'healthy', roots: [{ origin: 'workspace', runsFound: 1 }] },
+      },
+    })
+    expect(await service.runBacklog(runDir)).toMatchObject({
+      runId: path.basename(runDir), runDir, sessionDir: runDir,
+      status: 'running', currentPhase: 'Evolve 1',
+      totals: { calls: 1, completed: 0, failed: 0 },
+    })
+
+    await appendFile(path.join(runDir, '.runtime', 'events.jsonl'), '{"type":"workflow.failed"}\n')
+    await service.rescan()
+
+    expect(service.snapshot().runs).toContainEqual(expect.objectContaining({
+      runDir, kind: 'general-task', discovery: 'failed',
+    }))
+    expect(await service.runBacklog(runDir)).toMatchObject({ status: 'failed' })
+  })
+
   it('refuses detail reads outside the discovered classic Session inventory', async () => {
     const ctx = sourceContext()
     const service = new KersorViewerService(ctx, {
@@ -422,9 +465,9 @@ describe('Host snapshot', () => {
       phases: [{ title: 'First' }, { title: 'Resumed' }],
       result: { stage: 'second_wait' },
     })
-    expect(service.snapshot().runs).toContainEqual(expect.objectContaining({
-      runDir, discovery: 'waiting', result: expect.objectContaining({ stage: 'second_wait' }),
-    }))
+    const run = service.snapshot().runs.find(candidate => candidate.runDir === runDir)
+    expect(run).toMatchObject({ runDir, discovery: 'waiting' })
+    expect(run?.result).toMatchObject({ stage: 'second_wait' })
     expect(service.snapshot().diagnostics.runs).toContainEqual(expect.objectContaining({
       runDir,
       byteOffset: Buffer.byteLength(first + second),

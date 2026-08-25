@@ -220,7 +220,7 @@ const _deepseek_ai_dsh_kersor_viewer_kersorViewer_snapshot_result$schema = z.obj
   'runDir': z.string().readonly(),
   'sessionDir': z.string().readonly(),
   'root': z.string().readonly(),
-  'kind': z.union([z.literal("autonomous"), z.literal("classic-round")]).readonly(),
+  'kind': z.union([z.literal("autonomous"), z.literal("classic-round"), z.literal("general-task")]).readonly(),
   'round': z.number().readonly().optional(),
   'result': z.object({
   'stage': z.string().readonly().optional(),

@@ -39,7 +39,7 @@ DSH_RPC_SOCKET_ENV = "KERSOR_DSH_RPC_SOCKET"
 DSH_RPC_NONCE_ENV = "KERSOR_DSH_RPC_NONCE"
 DSH_RPC_MAX_FRAME_BYTES = 16 * 1024 * 1024
 DSH_PROVIDER = "deepseek-official"
-DSH_MODEL = "deepseek-v4-flash"
+DSH_MODEL = "kimi-k2.7-code"
 MAX_RUNTIME_CONFIG_BYTES = 1 * 1024 * 1024
 MAX_MODEL_ID_LENGTH = 128
 MAX_AUTONOMOUS_BINDING_BYTES = 256 * 1024
@@ -1004,6 +1004,7 @@ def evolve_parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="kersor_bridge.py evolve")
     result.add_argument("--contract", type=Path, required=True)
     result.add_argument("--host-execution", action="store_true")
+    result.add_argument("--runtime", choices=sorted(GENERIC_RUNTIMES))
     result.add_argument("--expected-contract-sha256")
     result.add_argument("--expected-runtime", choices=sorted(GENERIC_RUNTIMES))
     result.add_argument("--run-dir", type=Path)
@@ -1016,8 +1017,10 @@ def exec_evolve(root: Path, args: list[str]) -> None:
     options = evolve_parser().parse_args(args)
     workspace = Path.cwd().resolve()
     require_checkout_outside_workspace(root, workspace)
-    contract = options.contract.expanduser().resolve()
-    require_descendant(contract, workspace, "generic evolve contract")
+    lexical_contract = Path(os.path.abspath(options.contract.expanduser()))
+    if lexical_contract.is_symlink() or not lexical_contract.is_file():
+        raise RuntimeError("generic evolve contract must be one regular non-symlink file")
+    contract = lexical_contract.resolve()
     try:
         contract_bytes = contract.read_bytes()
     except OSError as error:
@@ -1048,31 +1051,45 @@ def exec_evolve(root: Path, args: list[str]) -> None:
             "DSH generic Mission execution requires the Host-side "
             "kersor_evolve tool; nested shell execution is refused"
         )
-    if version == "kersor-task-v1" and options.host_execution:
-        raise RuntimeError(
-            "--host-execution is reserved for kersor-mission-v1; run a fixed "
-            "Task through the workspace-confined bridge route"
-        )
     owned_workspace = contract_path(contract, value.get("workspace"), "workspace")
     if owned_workspace != workspace:
         raise RuntimeError("generic evolve contract workspace must equal the current DSH workspace")
-    runtime = value.get("runtime")
+    contract_inside_workspace = True
+    try:
+        contract.relative_to(workspace)
+    except ValueError:
+        contract_inside_workspace = False
+    if not contract_inside_workspace and not (
+        version == "kersor-task-v1"
+        and options.host_execution
+        and contract.name == "task.json"
+        and contract.parent == workspace.parent
+        and workspace.name == "workspace"
+    ):
+        raise RuntimeError(
+            "generic evolve contract must stay inside the current DSH workspace "
+            "or be its parent-owned task.json"
+        )
+    runtime = options.runtime or value.get("runtime")
     if options.expected_runtime is not None and runtime != options.expected_runtime:
         raise RuntimeError("generic evolve runtime changed after Host admission")
     if runtime not in GENERIC_RUNTIMES:
         raise RuntimeError(
             "DSH generic evolve requires explicit runtime=codex|claude|dsh"
         )
-    if version == "kersor-task-v1" and runtime != "codex":
-        raise RuntimeError(
-            "DSH fixed Task execution supports runtime=codex only; "
-            f"runtime={runtime} requires a Host-side Mission"
-        )
+    if version == "kersor-task-v1":
+        if options.host_execution and runtime != "dsh":
+            raise RuntimeError("Host fixed Task execution requires runtime=dsh")
+        if not options.host_execution and runtime != "codex":
+            raise RuntimeError(
+                "workspace-confined fixed Task execution supports runtime=codex only; "
+                f"runtime={runtime} requires the Host-side kersor_evolve tool"
+            )
     tools = trusted_runtime_tools(workspace, runtime)
     session: Path | None = None
     runtime_config_sha256: str | None = None
     mission_id: str | None = None
-    needs_outer_workspace_write = version == "kersor-task-v1"
+    needs_outer_workspace_write = version == "kersor-task-v1" and runtime == "codex"
     if version == "kersor-mission-v1":
         mission_id = validated_mission_id(value)
         needs_write = mission_needs_write(value)
@@ -1097,6 +1114,12 @@ def exec_evolve(root: Path, args: list[str]) -> None:
                 needs_write=needs_write,
             )
         needs_outer_workspace_write = needs_write
+    elif runtime == "dsh":
+        _, runtime_config_sha256 = validate_dsh_runtime_config(
+            root,
+            contract,
+            value,
+        )
     else:
         _, runtime_config_sha256 = validate_codex_runtime_config(
             root,
@@ -1136,6 +1159,8 @@ def exec_evolve(root: Path, args: list[str]) -> None:
     if not evolve.is_file():
         raise RuntimeError("bash and KerSor scripts/evolve.sh are required")
     command = [bash, str(evolve), str(contract)]
+    if options.runtime is not None:
+        command.extend(("--runtime", runtime))
     if options.run_dir is not None:
         run_dir = options.run_dir.expanduser().resolve()
         if session is not None:

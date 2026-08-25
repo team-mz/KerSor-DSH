@@ -3,7 +3,7 @@
  * @module @deepseek-ai/dsh-kersor-viewer
  */
 import { createHash } from 'node:crypto';
-import { access, readFile, readdir, stat } from 'node:fs/promises';
+import { access, open, readFile, readdir, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { createIssue, errorCode, issueFromError, mergeIssue } from "./diagnostics.js";
@@ -14,6 +14,7 @@ export const DEFAULT_KERSOR_ROOTS = [
     path.join(homedir(), 'Agent4Kernel', 'KerSor', '.kersor'),
 ];
 const summaryRevisions = new WeakMap();
+const EVENT_TAIL_BYTES = 64 * 1024;
 /**
  * Read the scan-local generation of a run's atomically written summary.
  * This internal signal is intentionally absent from the Remote inventory.
@@ -99,6 +100,108 @@ async function readSummary(file) {
     }
     return { value: decoded, revision };
 }
+async function readTerminalEvent(file) {
+    let handle;
+    try {
+        handle = await open(file, 'r');
+        const info = await handle.stat();
+        const length = Math.min(info.size, EVENT_TAIL_BYTES);
+        if (length === 0)
+            return {};
+        const buffer = Buffer.allocUnsafe(length);
+        await handle.read(buffer, 0, length, info.size - length);
+        const lines = buffer.toString('utf8').split('\n');
+        if (info.size > length)
+            lines.shift();
+        const last = lines.reverse().find(line => line.trim().length > 0);
+        if (last === undefined)
+            return {};
+        let decoded;
+        try {
+            decoded = JSON.parse(last);
+        }
+        catch {
+            return {};
+        }
+        if (decoded === null || typeof decoded !== 'object' || Array.isArray(decoded))
+            return {};
+        const type = decoded.type;
+        if (type === 'workflow.completed')
+            return { discovery: 'completed' };
+        if (type === 'workflow.failed')
+            return { discovery: 'failed' };
+        return {};
+    }
+    catch (error) {
+        if (errorCode(error) === 'ENOENT')
+            return {};
+        return { issue: issueFromError('runs_scan', error, 'warning') };
+    }
+    finally {
+        await handle?.close();
+    }
+}
+async function scanRun(runId, runDir, sessionDir, root, kind, round) {
+    if (kind === 'classic-round' || kind === 'general-task') {
+        try {
+            await access(path.join(runDir, '.runtime', 'events.jsonl'));
+        }
+        catch (error) {
+            if (errorCode(error) === 'ENOENT')
+                return { issues: [] };
+            return { issues: [{ runDir, issue: issueFromError('runs_scan', error, 'warning') }] };
+        }
+    }
+    const issues = [];
+    const summary = await readSummary(path.join(runDir, '.runtime', 'summary.json'));
+    let discovery = 'active';
+    if (summary.value !== undefined) {
+        const status = summary.value.workflow_status ?? summary.value.status;
+        if (status === 'completed' || status === 'succeeded')
+            discovery = 'completed';
+        else if (status === 'waiting')
+            discovery = 'waiting';
+        else if (status === 'error' || status === 'failed' || status === 'blocked'
+            || status === 'stagnated' || status === 'exhausted')
+            discovery = 'failed';
+        else if (status !== undefined) {
+            issues.push({ runDir, issue: createIssue('summary_read', 'invalid_payload', 'warning') });
+        }
+    }
+    if (summary.issue !== undefined)
+        issues.push({ runDir, issue: summary.issue });
+    if (summary.value === undefined) {
+        const terminal = await readTerminalEvent(path.join(runDir, '.runtime', 'events.jsonl'));
+        if (terminal.discovery !== undefined)
+            discovery = terminal.discovery;
+        if (terminal.issue !== undefined)
+            issues.push({ runDir, issue: terminal.issue });
+    }
+    const result = await readWorkflowResult(runDir);
+    const ref = {
+        runId, runDir, sessionDir, root, kind,
+        ...(round === undefined ? {} : { round }),
+        ...(result === undefined ? {} : { result }),
+        discovery,
+    };
+    if (summary.revision !== undefined)
+        summaryRevisions.set(ref, summary.revision);
+    return { ref, issues };
+}
+async function isGeneralTaskRun(dir) {
+    try {
+        const entries = await readdir(dir, { withFileTypes: true });
+        return {
+            accepted: entries.some(entry => entry.isFile() && entry.name === 'task.json'),
+        };
+    }
+    catch (error) {
+        const code = errorCode(error);
+        if (code === 'ENOENT' || code === 'ENOTDIR')
+            return { accepted: false };
+        return { accepted: false, issue: issueFromError('session_inspect', error, 'warning') };
+    }
+}
 async function scanSession(sessionDir, root) {
     const autonomousDir = path.join(sessionDir, 'autonomous-runs');
     let autonomousChildren = [];
@@ -113,44 +216,10 @@ async function scanSession(sessionDir, root) {
     const runs = [];
     const issues = [];
     const appendRun = async (runId, runDir, kind, round) => {
-        if (kind === 'classic-round') {
-            try {
-                await access(path.join(runDir, '.runtime', 'events.jsonl'));
-            }
-            catch (error) {
-                if (errorCode(error) === 'ENOENT')
-                    return;
-                issues.push({ runDir, issue: issueFromError('runs_scan', error, 'warning') });
-                return;
-            }
-        }
-        const summary = await readSummary(path.join(runDir, '.runtime', 'summary.json'));
-        let discovery = 'active';
-        if (summary.value !== undefined) {
-            const status = summary.value.workflow_status ?? summary.value.status;
-            if (status === 'completed' || status === 'succeeded')
-                discovery = 'completed';
-            else if (status === 'waiting')
-                discovery = 'waiting';
-            else if (status === 'error' || status === 'failed' || status === 'blocked'
-                || status === 'stagnated' || status === 'exhausted')
-                discovery = 'failed';
-            else if (status !== undefined) {
-                issues.push({ runDir, issue: createIssue('summary_read', 'invalid_payload', 'warning') });
-            }
-        }
-        if (summary.issue !== undefined)
-            issues.push({ runDir, issue: summary.issue });
-        const result = await readWorkflowResult(runDir);
-        const ref = {
-            runId, runDir, sessionDir, root, kind,
-            ...(round === undefined ? {} : { round }),
-            ...(result === undefined ? {} : { result }),
-            discovery,
-        };
-        runs.push(ref);
-        if (summary.revision !== undefined)
-            summaryRevisions.set(ref, summary.revision);
+        const scanned = await scanRun(runId, runDir, sessionDir, root, kind, round);
+        issues.push(...scanned.issues);
+        if (scanned.ref !== undefined)
+            runs.push(scanned.ref);
     };
     for (const child of autonomousChildren) {
         if (!child.isDirectory() && !child.isSymbolicLink())
@@ -229,6 +298,18 @@ export async function scanRoots(roots, includeDefaults, workspaceRoots = []) {
                 continue;
             observation.sessionsExamined += 1;
             const sessionDir = path.join(candidate.root, session.name);
+            const generalTask = await isGeneralTaskRun(sessionDir);
+            if (generalTask.issue !== undefined)
+                recordRootIssue(observation, generalTask.issue);
+            if (generalTask.accepted) {
+                const scanned = await scanRun(session.name, sessionDir, sessionDir, candidate.root, 'general-task');
+                runs.push(...(scanned.ref === undefined ? [] : [scanned.ref]));
+                runIssues.push(...scanned.issues);
+                observation.runsFound += scanned.ref === undefined ? 0 : 1;
+                for (const scoped of scanned.issues)
+                    recordRootIssue(observation, scoped.issue);
+                continue;
+            }
             const inspected = await isSessionV2(sessionDir);
             if (inspected.issue !== undefined)
                 recordRootIssue(observation, inspected.issue);

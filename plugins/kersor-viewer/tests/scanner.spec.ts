@@ -100,6 +100,49 @@ describe('run discovery', () => {
     expect(found.observation.roots[0]).toMatchObject({ runsFound: 1 })
   })
 
+  it('discovers direct general Task runs under a Workspace KerSor root', async () => {
+    const workspace = await tempRoot()
+    const root = path.join(workspace, '.kersor')
+    const activeRun = path.join(root, '20260825T044946Z-general-evolve')
+    const completedRun = path.join(root, '20260825T045500Z-general-evolve')
+    const failedRun = path.join(root, '20260825T050000Z-general-evolve')
+    for (const runDir of [activeRun, completedRun, failedRun]) {
+      await mkdir(path.join(runDir, '.runtime'), { recursive: true })
+      await writeFile(path.join(runDir, 'task.json'), '{"contract_version":"kersor-task-v1"}')
+      await writeFile(path.join(runDir, '.runtime', 'events.jsonl'), '{"type":"workflow.started"}\n')
+    }
+    await writeFile(path.join(completedRun, '.runtime', 'events.jsonl'), [
+      '{"type":"workflow.started"}',
+      '{"type":"workflow.completed"}',
+      '',
+    ].join('\n'))
+    await writeFile(path.join(failedRun, '.runtime', 'events.jsonl'), [
+      '{"type":"workflow.started"}',
+      '{"type":"workflow.failed"}',
+      '',
+    ].join('\n'))
+
+    const found = await scanRoots([], false, [workspace])
+
+    expect(new Map(found.runs.map(run => [run.runDir, run]))).toEqual(new Map([
+      [activeRun, {
+        runId: path.basename(activeRun), runDir: activeRun, sessionDir: activeRun, root,
+        kind: 'general-task', discovery: 'active',
+      }],
+      [completedRun, {
+        runId: path.basename(completedRun), runDir: completedRun, sessionDir: completedRun, root,
+        kind: 'general-task', discovery: 'completed',
+      }],
+      [failedRun, {
+        runId: path.basename(failedRun), runDir: failedRun, sessionDir: failedRun, root,
+        kind: 'general-task', discovery: 'failed',
+      }],
+    ]))
+    expect(found.observation.roots[0]).toMatchObject({
+      root, origin: 'workspace', sessionsExamined: 3, sessionsAccepted: 0, runsFound: 3,
+    })
+  })
+
   it('normalizes canonical task-v1 terminal statuses', async () => {
     const root = await tempRoot()
     const session = await makeSession(root, 'sess-task-v1')

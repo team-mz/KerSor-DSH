@@ -1,4 +1,4 @@
-/** Host-owned launcher and DSH-native activation broker for one KerSor Mission. */
+/** Host-owned launcher and DSH-native activation broker for one KerSor contract. */
 
 import { spawn } from 'node:child_process'
 import { AsyncLocalStorage } from 'node:async_hooks'
@@ -18,12 +18,14 @@ const BRIDGE = fileURLToPath(new URL('../bin/kersor_bridge.py', import.meta.url)
 const RUNTIME_TOOLS = fileURLToPath(new URL('../.local/runtime-tools.json', import.meta.url))
 const KERSOR_ROOT = fileURLToPath(new URL('../.local/kersor-root', import.meta.url))
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1_000
+const DSH_MAX_ACTIVATION_TIMEOUT_SECONDS = 900
 const DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+const MAX_CONTRACT_BYTES = 1024 * 1024
 const KILL_GRACE_MS = 2_000
 export const DSH_RPC_PROTOCOL = 'kersor-dsh-host-rpc-v1'
 export const DSH_RPC_MAX_FRAME_BYTES = 16 * 1024 * 1024
 export const DSH_PROVIDER = 'deepseek-official'
-export const DSH_MODEL = 'deepseek-v4-flash'
+export const DSH_MODEL = 'kimi-k2.7-code'
 const DSH_RPC_SOCKET_ENV = 'KERSOR_DSH_RPC_SOCKET'
 const DSH_RPC_NONCE_ENV = 'KERSOR_DSH_RPC_NONCE'
 const DSH_READ_TOOLS = Object.freeze(['read', 'glob', 'grep'])
@@ -52,7 +54,6 @@ const DSH_PRE_USAGE_QUOTA_EVENT_TYPES = new Set([
   'step/end',
   'turn/end',
 ])
-const DSH_MAX_ACTIVATION_TIMEOUT_SECONDS = 900
 const MAX_RPC_CONNECTIONS = 64
 const MAX_RPC_ERROR_BYTES = 4_096
 const TERMINAL_STATUSES = new Set(['completed', 'blocked', 'waiting', 'failed'])
@@ -221,11 +222,13 @@ export function runHostProcess({
     const onAbort = () => terminate(
       signal.reason instanceof Error ? signal.reason : new Error('KerSor Mission cancelled'),
     )
-    const timer = setTimeout(
-      () => terminate(new Error(`KerSor Host execution timed out after ${timeoutMs}ms`)),
-      timeoutMs,
-    )
-    timer.unref?.()
+    const timer = timeoutMs === null
+      ? null
+      : setTimeout(
+        () => terminate(new Error(`KerSor Host execution timed out after ${timeoutMs}ms`)),
+        timeoutMs,
+      )
+    timer?.unref?.()
     signal?.addEventListener('abort', onAbort, {once: true})
     child.stdout.on('data', capture(stdout))
     child.stderr.on('data', capture(stderr))
@@ -235,7 +238,7 @@ export function runHostProcess({
     child.once('close', (code, exitSignal) => {
       if (settled) return
       settled = true
-      clearTimeout(timer)
+      if (timer !== null) clearTimeout(timer)
       if (killTimer !== null) clearTimeout(killTimer)
       signal?.removeEventListener('abort', onAbort)
       if (terminalError !== null) {
@@ -690,12 +693,16 @@ function dshActivationError(code, message, result, providerFailure = null) {
   return error
 }
 
-function activationModelRole(value) {
+function activationModelRole(value, policy) {
   if (Object.hasOwn(value, 'model_role') || Object.hasOwn(value, 'modelRole')) {
     throw new Error('DSH RPC activation model_role is Host-derived from phase and must not be supplied')
   }
   if (typeof value.phase !== 'string') {
     throw new Error('DSH RPC activation phase must be a string')
+  }
+  if (policy?.kind === 'task') {
+    if (/^Evolve [1-9]\d*$/u.test(value.phase)) return 'worker'
+    throw new Error('DSH fixed Task activation phase must match "Evolve <positive integer>"')
   }
   if (/^Plan revision [1-9]\d*$/u.test(value.phase)) return 'planner'
   if (/^Execute revision [1-9]\d*$/u.test(value.phase)) return 'worker'
@@ -833,7 +840,7 @@ async function readOnlyActivation(value, workspace, missionPolicy) {
   ) {
     throw new Error(`DSH RPC activation timeout_seconds must be in (0, ${DSH_MAX_ACTIVATION_TIMEOUT_SECONDS}]`)
   }
-  const modelRole = activationModelRole(value)
+  const modelRole = activationModelRole(value, missionPolicy)
   let transactionArtifacts = []
   const transaction = value.options.transaction
   if (transaction !== undefined && transaction !== null) {
@@ -845,11 +852,11 @@ async function readOnlyActivation(value, workspace, missionPolicy) {
     }
     if (
       !Array.isArray(transaction.artifacts)
-      || transaction.artifacts.length !== 1
+      || transaction.artifacts.length === 0
       || new Set(transaction.artifacts).size !== transaction.artifacts.length
       || !transaction.artifacts.every(safeTransactionArtifact)
     ) {
-      throw new Error('DSH activation transaction must declare exactly one canonical artifact')
+      throw new Error('DSH activation transaction must declare a non-empty unique canonical artifact set')
     }
     if (
       transaction.rollback_on_noncompleted_status !== undefined
@@ -917,6 +924,24 @@ function pathInsideWorkspace(workspace, lexicalWorkspace, value, label) {
   return undefined
 }
 
+function runtimeControlReadProblem(workspace, lexicalWorkspace, value, label) {
+  if (typeof value !== 'string' || !value.trim()) return `${label} must be a non-empty string`
+  const lexical = path.resolve(lexicalWorkspace, value)
+  const lexicalRelative = path.relative(lexicalWorkspace, lexical)
+  if (runtimeControlArtifact(lexicalRelative)) {
+    return `${label} must not inspect a KerSor or repository runtime-control path`
+  }
+  try {
+    const physical = realpathSync(lexical)
+    if (runtimeControlArtifact(path.relative(workspace, physical))) {
+      return `${label} must not inspect a KerSor or repository runtime-control path`
+    }
+  } catch {
+    // The ordinary existence diagnostic remains owned by pathInsideWorkspace.
+  }
+  return undefined
+}
+
 function transactionWritePathProblem(workspace, lexicalWorkspace, transactionArtifacts, value, label) {
   if (typeof value !== 'string' || !value) return `${label} must be a non-empty string`
   const match = transactionArtifacts.find(artifact => (
@@ -976,7 +1001,17 @@ function readOnlyChildGuard(workspace, lexicalWorkspace, activation, execution) 
     return `KerSor DSH-native ${execution.name} arguments must be an object`
   }
   if (execution.name === 'read') {
-    return pathInsideWorkspace(workspace, lexicalWorkspace, execution.arguments.file_path, 'read.file_path')
+    return runtimeControlReadProblem(
+      workspace,
+      lexicalWorkspace,
+      execution.arguments.file_path,
+      'read.file_path',
+    ) ?? pathInsideWorkspace(
+      workspace,
+      lexicalWorkspace,
+      execution.arguments.file_path,
+      'read.file_path',
+    )
   }
   if (typeof execution.arguments.pattern !== 'string' || !execution.arguments.pattern) {
     return `${execution.name}.pattern must be a non-empty string`
@@ -988,6 +1023,17 @@ function readOnlyChildGuard(workspace, lexicalWorkspace, activation, execution) 
     }
   }
   const searchPath = execution.arguments.path ?? lexicalWorkspace
+  const controlProblem = runtimeControlReadProblem(
+    workspace,
+    lexicalWorkspace,
+    searchPath,
+    `${execution.name}.path`,
+  )
+  if (controlProblem !== undefined) return controlProblem
+  const lexicalSearch = path.resolve(lexicalWorkspace, searchPath)
+  if (lexicalSearch === lexicalWorkspace || lexicalSearch === workspace) {
+    return `${execution.name}.path must be a proper non-control workspace descendant`
+  }
   return pathInsideWorkspace(workspace, lexicalWorkspace, searchPath, `${execution.name}.path`)
 }
 
@@ -1196,27 +1242,43 @@ function writeRpcFrame(socket, value) {
   })
 }
 
-async function missionRuntime(contract, workspace) {
+async function contractRuntime(contract, workspace, requestedRuntime) {
   let bytes
   let value
   try {
+    const metadata = await stat(contract)
+    if (metadata.size > MAX_CONTRACT_BYTES) {
+      throw new Error(`KerSor contract exceeds the ${MAX_CONTRACT_BYTES}-byte limit`)
+    }
     bytes = await readFile(contract)
     value = JSON.parse(bytes.toString('utf8'))
   } catch (cause) {
-    throw new Error('KerSor Mission contract must be valid JSON', {cause})
+    throw new Error('KerSor contract must be valid JSON', {cause})
   }
-  if (!isRecord(value)) throw new Error('KerSor Mission contract must be an object')
+  if (!isRecord(value)) throw new Error('KerSor contract must be an object')
+  const version = value.contract_version
+  if (requestedRuntime !== undefined && requestedRuntime !== 'dsh') {
+    throw new Error('kersor_evolve runtime override must be dsh')
+  }
+  const selectedRuntime = requestedRuntime ?? value.runtime
   const selected = {
-    runtime: value.runtime,
+    runtime: selectedRuntime,
     sha256: createHash('sha256').update(bytes).digest('hex'),
   }
-  if (value.runtime !== 'dsh') return selected
-  if (value.contract_version !== 'kersor-mission-v1') {
-    throw new Error('runtime=dsh is supported only for kersor-mission-v1')
+  if (version === 'kersor-task-v1' && selectedRuntime !== 'dsh') {
+    throw new Error('Host fixed Task execution requires runtime=dsh')
+  }
+  if (selectedRuntime !== 'dsh') return selected
+  if (version !== 'kersor-task-v1' && version !== 'kersor-mission-v1') {
+    throw new Error('runtime=dsh requires kersor-task-v1 or kersor-mission-v1')
+  }
+  if (version === 'kersor-mission-v1'
+    && requestedRuntime !== undefined && value.runtime !== requestedRuntime) {
+    throw new Error('KerSor Mission runtime differs from the requested Host runtime')
   }
   const contractOwnedPath = (candidate, label) => {
     if (typeof candidate !== 'string' || !candidate) {
-      throw new Error(`runtime=dsh Mission ${label} must be a non-empty path`)
+      throw new Error(`runtime=dsh ${version === 'kersor-task-v1' ? 'Task' : 'Mission'} ${label} must be a non-empty path`)
     }
     return path.isAbsolute(candidate)
       ? path.resolve(candidate)
@@ -1225,7 +1287,41 @@ async function missionRuntime(contract, workspace) {
   const lexicalDeclaredWorkspace = contractOwnedPath(value.workspace, 'workspace')
   const declaredWorkspace = await realpath(lexicalDeclaredWorkspace)
   if (declaredWorkspace !== workspace) {
-    throw new Error('runtime=dsh Mission workspace does not match the top-level DSH workspace')
+    throw new Error('runtime=dsh contract workspace does not match the top-level DSH workspace')
+  }
+  const protectedFiles = [{path: contract, label: `${version === 'kersor-task-v1' ? 'Task' : 'Mission'} contract`}]
+  if (value.runtime_config !== undefined) {
+    protectedFiles.push({
+      path: await realpath(contractOwnedPath(value.runtime_config, 'runtime_config')),
+      label: 'runtime config',
+    })
+  }
+  if (version === 'kersor-task-v1') {
+    const verifier = value.verifier
+    const artifacts = isRecord(verifier) ? verifier.artifacts : undefined
+    if (
+      !Array.isArray(artifacts)
+      || artifacts.length === 0
+      || new Set(artifacts).size !== artifacts.length
+      || !artifacts.every(safeTransactionArtifact)
+    ) {
+      throw new Error('runtime=dsh Task verifier.artifacts must be one non-empty unique canonical artifact set')
+    }
+    if (artifacts.some(runtimeControlArtifact)) {
+      throw new Error('runtime=dsh Task artifacts must not target KerSor runtime control paths')
+    }
+    selected.missionPolicy = {
+      kind: 'task',
+      transactions: [{
+        artifacts: [...artifacts],
+        verifier: null,
+        candidateGate: null,
+        rollbackOnNoncompletedStatus: undefined,
+      }],
+      protectedFiles,
+      protectedRoots: [],
+    }
+    return selected
   }
   const lexicalSessionRoot = contractOwnedPath(value.session, 'session')
   const sessionRelative = path.relative(lexicalDeclaredWorkspace, lexicalSessionRoot)
@@ -1239,13 +1335,6 @@ async function missionRuntime(contract, workspace) {
   }
   await rejectSymlinkSegments(workspace, sessionRelative, 'runtime=dsh Mission Session')
   const sessionRoot = path.resolve(workspace, sessionRelative)
-  const protectedFiles = [{path: contract, label: 'Mission contract'}]
-  if (value.runtime_config !== undefined) {
-    protectedFiles.push({
-      path: await realpath(contractOwnedPath(value.runtime_config, 'runtime_config')),
-      label: 'runtime config',
-    })
-  }
   if (!Array.isArray(value.capabilities)) {
     throw new Error('runtime=dsh Mission capabilities must be an array')
   }
@@ -1429,7 +1518,7 @@ async function missionRuntime(contract, workspace) {
         : {commit_projection: evaluator.commitProjection}),
     }
   }
-  selected.missionPolicy = {transactions, protectedFiles, protectedRoots: [sessionRoot]}
+  selected.missionPolicy = {kind: 'mission', transactions, protectedFiles, protectedRoots: [sessionRoot]}
   return selected
 }
 
@@ -1652,15 +1741,25 @@ function claimedTurnGuard(exec) {
   return undefined
 }
 
-async function missionPath(value, workspace) {
+async function contractPath(value, workspace, requestedRuntime) {
   if (typeof value !== 'string' || !path.isAbsolute(value)) {
     throw new Error('kersor_evolve contract must be an absolute path')
   }
-  const physical = await realpath(value)
-  if (!inside(workspace, physical)) {
-    throw new Error('kersor_evolve contract must stay inside the current DSH workspace')
+  const lexical = path.resolve(value)
+  const metadata = await lstat(lexical)
+  const physical = await realpath(lexical)
+  if (metadata.isSymbolicLink() || !metadata.isFile()) {
+    throw new Error('kersor_evolve contract must be one canonical non-symlink file')
   }
-  if (!(await stat(physical)).isFile()) throw new Error('kersor_evolve contract must be a file')
+  if (!inside(workspace, physical)) {
+    const parentOwnedTask = requestedRuntime === 'dsh'
+      && path.basename(physical) === 'task.json'
+      && path.basename(workspace) === 'workspace'
+      && path.dirname(physical) === path.dirname(workspace)
+    if (!parentOwnedTask) {
+      throw new Error('kersor_evolve contract must stay inside the current DSH workspace or be its parent-owned task.json')
+    }
+  }
   return physical
 }
 
@@ -1682,12 +1781,13 @@ function optionalRunDir(value, workspace, resume) {
 export function createTool({ctx, timeoutMs = DEFAULT_TIMEOUT_MS} = {}) {
   return {
     name: 'kersor_evolve',
-    description: 'Run exactly one frozen kersor-mission-v1 contract through the Host-owned KerSor launcher. The contract must be an absolute file inside the current top-level DSH workspace. This call owns the rest of the turn.',
+    description: 'Run exactly one frozen kersor-task-v1 or kersor-mission-v1 contract through the Host-owned KerSor launcher. A Mission stays inside the top-level DSH workspace; a fixed Task may use the canonical parent task.json whose declared workspace is the current workspace. This call owns the rest of the turn.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        contract: {type: 'string', description: 'Absolute path to one frozen kersor-mission-v1 JSON contract.'},
+        contract: {type: 'string', description: 'Absolute path to one frozen kersor-task-v1 or kersor-mission-v1 JSON contract.'},
+        runtime: {type: 'string', enum: ['dsh'], description: 'Required DSH Host override for a fixed Task whose portable contract names another default runtime.'},
         run_dir: {type: 'string', description: 'Optional absolute existing Mission run directory for explicit resume.'},
         resume: {type: 'boolean', description: 'Resume exactly run_dir. Defaults to false.'},
       },
@@ -1710,13 +1810,13 @@ export function createTool({ctx, timeoutMs = DEFAULT_TIMEOUT_MS} = {}) {
     },
     async execute(args, exec) {
       const {workspace, lexicalWorkspace, session} = await topLevelWorkspace(exec)
-      const contract = await missionPath(args.contract, workspace)
+      const contract = await contractPath(args.contract, workspace, args.runtime)
       claimSession(session, exec)
       try {
         const resume = args.resume === true
         const runDir = optionalRunDir(args.run_dir, workspace, resume)
         const runtime = await installedRuntime(workspace)
-        const selectedContract = await missionRuntime(contract, workspace)
+        const selectedContract = await contractRuntime(contract, workspace, args.runtime)
         if (selectedContract.runtime === 'dsh' && !ctx?.subagents) {
           throw new Error('runtime=dsh requires the DSH subagent Host service')
         }
@@ -1726,6 +1826,7 @@ export function createTool({ctx, timeoutMs = DEFAULT_TIMEOUT_MS} = {}) {
           '--host-execution',
           '--contract',
           contract,
+          ...(args.runtime === undefined ? [] : ['--runtime', args.runtime]),
           '--expected-contract-sha256',
           selectedContract.sha256,
         ]
@@ -1754,7 +1855,12 @@ export function createTool({ctx, timeoutMs = DEFAULT_TIMEOUT_MS} = {}) {
             cwd: workspace,
             environment: rpc === null ? hostEnvironment(runtime) : dshHostEnvironment(runtime, rpc),
             signal: rpc === null ? exec.signal : rpc.signal,
-            timeoutMs,
+            // DSH owns a bounded timeout for every activation and Host
+            // evaluator, while one Core run may contain several of them. A
+            // competing process-wide watchdog would kill and roll back a
+            // valid later round. Keep cancellation and output bounds here,
+            // but leave elapsed-time custody with those bounded operations.
+            timeoutMs: selectedContract.runtime === 'dsh' ? null : timeoutMs,
           })
           if (rpc === null) {
             completed = await process
@@ -1816,4 +1922,9 @@ export function apply(ctx) {
   ctx.tools.register(createTool({ctx}))
 }
 
-export const __test = Object.freeze({PRESET_ROOT, BRIDGE, RUNTIME_TOOLS, KERSOR_ROOT})
+export const __test = Object.freeze({
+  PRESET_ROOT,
+  BRIDGE,
+  RUNTIME_TOOLS,
+  KERSOR_ROOT,
+})
