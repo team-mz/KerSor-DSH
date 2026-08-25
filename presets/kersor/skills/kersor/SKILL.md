@@ -174,8 +174,12 @@ KerSor control trees, the frozen Mission/runtime config/Session, Bash,
 subagents, Workflows, recursive KerSor, and paths outside the workspace. A
 child also cannot read `.git`, `.conformance`, `.kersor`, or
 `.kersor-autonomous`; `glob` and `grep` must name a proper non-control
-workspace descendant instead of searching the workspace root. A
-candidate verifier must be a non-retryable, sealed, read-only `command-v1` Host
+workspace descendant instead of searching the workspace root. Their scoped
+tool descriptions state this before the first call and direct the worker to
+read known root files or search a public subdirectory. Transaction activations
+also name their exact writable artifacts and state that helper or scratch files
+are unavailable, so the worker leaves rejection and retry evidence to the Host.
+A candidate verifier must be a non-retryable, sealed, read-only `command-v1` Host
 evaluator whose full request, rollback policy, and candidate gate match the
 frozen Mission; Core runs it while the snapshot is live and commits only an
 accepted candidate. Every activation still uses the owner-only AF_UNIX endpoint

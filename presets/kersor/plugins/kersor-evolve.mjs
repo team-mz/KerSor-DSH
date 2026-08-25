@@ -31,6 +31,7 @@ const DSH_RPC_NONCE_ENV = 'KERSOR_DSH_RPC_NONCE'
 const DSH_READ_TOOLS = Object.freeze(['read', 'glob', 'grep'])
 const DSH_WRITE_TOOLS = Object.freeze(['edit', 'write'])
 const DSH_STRUCTURED_OUTPUT_TOOL = 'structured_output'
+const DSH_ROOT_SEARCH_GUIDANCE = 'KerSor activation note: a workspace-root search is unavailable because Host control evidence shares that root. Read known root files directly, or set path to a specific public subdirectory.'
 const DSH_RETRY_EVENT_TYPES = new Set(['llm/retry', 'llm/retry-started'])
 const DSH_STEP_SCOPED_EVENT_TYPES = new Set([
   'assistant/chunk',
@@ -1032,9 +1033,34 @@ function readOnlyChildGuard(workspace, lexicalWorkspace, activation, execution) 
   if (controlProblem !== undefined) return controlProblem
   const lexicalSearch = path.resolve(lexicalWorkspace, searchPath)
   if (lexicalSearch === lexicalWorkspace || lexicalSearch === workspace) {
-    return `${execution.name}.path must be a proper non-control workspace descendant`
+    return `${execution.name}.path cannot search the workspace root because it contains Host control evidence; read a known root file directly or search a specific public subdirectory`
   }
   return pathInsideWorkspace(workspace, lexicalWorkspace, searchPath, `${execution.name}.path`)
+}
+
+function installChildToolGuidance(agent, transactionArtifacts) {
+  for (const name of ['glob', 'grep']) {
+    const definition = agent.ctx.tools.get(name, agent)
+    if (definition === undefined) {
+      throw new Error(`KerSor DSH activation requires the ${name} tool definition`)
+    }
+    agent.ctx.effect(() => agent.ctx.tools.register({
+      ...definition,
+      description: `${definition.description} ${DSH_ROOT_SEARCH_GUIDANCE}`,
+    }))
+  }
+  if (transactionArtifacts.length === 0) return
+  const artifactList = JSON.stringify(transactionArtifacts.map(artifact => artifact.relative))
+  for (const name of DSH_WRITE_TOOLS) {
+    const definition = agent.ctx.tools.get(name, agent)
+    if (definition === undefined) {
+      throw new Error(`KerSor DSH activation requires the ${name} tool definition`)
+    }
+    agent.ctx.effect(() => agent.ctx.tools.register({
+      ...definition,
+      description: `${definition.description} KerSor activation note: write only the exact declared transaction artifacts ${artifactList}. Helper, test, and scratch files are not exposed; the Host verifier supplies the next-round evidence.`,
+    }))
+  }
 }
 
 function activationSignal(parent, timeoutSeconds) {
@@ -1064,6 +1090,7 @@ async function executeDshActivation(ctx, parent, workspace, lexicalWorkspace, mi
   const policy = {
     guardedAgents: new Set(),
     guard: execution => readOnlyChildGuard(workspace, lexicalWorkspace, activation, execution),
+    transactionArtifacts: activation.transactionArtifacts,
   }
   let run
   try {
@@ -1917,6 +1944,7 @@ export function apply(ctx) {
     const policy = CHILD_POLICY.getStore()
     if (policy === undefined) return
     agent.ctx.tools.guard(policy.guard)
+    installChildToolGuidance(agent, policy.transactionArtifacts)
     policy.guardedAgents.add(agent)
   })
   ctx.tools.register(createTool({ctx}))

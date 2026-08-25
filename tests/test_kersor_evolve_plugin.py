@@ -151,6 +151,7 @@ const listeners = new Map()
 const telemetry = {
   starts: [],
   guards: {},
+  scoped_tool_descriptions: {},
   dispose_count: 0,
 }
 const topLevelGuards = []
@@ -828,7 +829,24 @@ const child = {
     events: childEvents,
   },
   ctx: {
+    effect(callback) {
+      const dispose = callback()
+      return typeof dispose === 'function' ? dispose : () => undefined
+    },
     tools: {
+      get(name) {
+        if (!['glob', 'grep', 'edit', 'write'].includes(name)) return undefined
+        return {
+          name,
+          description: `${name} base description`,
+          parameters: {},
+          async execute() { return {} },
+        }
+      },
+      register(definition) {
+        telemetry.scoped_tool_descriptions[definition.name] = definition.description
+        return () => undefined
+      },
       guard(value) {
         telemetry.guard_registered = true
         telemetry.guard = value
@@ -1586,7 +1604,11 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         for allowed in ("read", "structured_output"):
             self.assertIsNone(telemetry["guards"][allowed])
         for broad_search in ("glob", "grep"):
-            self.assertIn("proper non-control", telemetry["guards"][broad_search])
+            self.assertIn("workspace root", telemetry["guards"][broad_search])
+            self.assertIn(
+                "workspace-root search is unavailable",
+                telemetry["scoped_tool_descriptions"][broad_search],
+            )
         for forbidden in ("edit", "write", "bash", "subagent", "workflow", "kersor_evolve"):
             self.assertIn("read-only", telemetry["guards"][forbidden])
         for escaped in ("read_outside", "glob_outside", "grep_symlink_escape", "glob_parent_pattern"):
@@ -2145,7 +2167,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         started = time.monotonic()
         result = self.invoke_dsh_native(
             contract,
-            abort_after_ms=250,
+            abort_after_ms=1_000,
             child_mode="wait",
         )
 
@@ -2239,11 +2261,24 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         for allowed in ("read", "structured_output", "edit", "write"):
             self.assertIsNone(result["telemetry"]["guards"][allowed])
         for broad_search in ("glob", "grep"):
-            self.assertIn("proper non-control", result["telemetry"]["guards"][broad_search])
+            self.assertIn("workspace root", result["telemetry"]["guards"][broad_search])
+            self.assertIn(
+                "workspace-root search is unavailable",
+                result["telemetry"]["scoped_tool_descriptions"][broad_search],
+            )
         for control in ("read_control", "glob_control", "grep_control"):
             self.assertIn("runtime-control", result["telemetry"]["guards"][control])
         for forbidden in ("edit_undeclared", "write_undeclared", "edit_alias", "write_alias"):
             self.assertIn("declared transaction artifact", result["telemetry"]["guards"][forbidden])
+        for mutation in ("edit", "write"):
+            self.assertIn(
+                candidate.name,
+                result["telemetry"]["scoped_tool_descriptions"][mutation],
+            )
+            self.assertIn(
+                "Helper, test, and scratch files are not exposed",
+                result["telemetry"]["scoped_tool_descriptions"][mutation],
+            )
         self.assertEqual(candidate.read_text(encoding="utf-8"), "baseline = True\n")
         self.assertEqual(undeclared.read_text(encoding="utf-8"), "protected = True\n")
 
