@@ -187,7 +187,7 @@ describe('KerSor conversation view registration', () => {
     const firstRun = '/work/current/.kersor/20260825T050000Z-general-evolve'
     const secondRun = '/work/current/.kersor/20260825T051000Z-general-evolve'
     const thirdRun = '/work/current/.kersor/20260825T052000Z-general-evolve'
-    const run = (runDir: string, discovery: 'active' | 'failed' = 'active') => ({
+    const run = (runDir: string, discovery: 'active' | 'completed' | 'failed' = 'active') => ({
       runId: path.basename(runDir), runDir, sessionDir: runDir,
       root: '/work/current/.kersor', kind: 'general-task' as const, discovery,
     })
@@ -209,12 +209,16 @@ describe('KerSor conversation view registration', () => {
     expect(loadRun).toHaveBeenCalledTimes(1)
 
     act(() => {
-      store.setSnapshot({ ...EMPTY_SNAPSHOT, runs: [run(secondRun), run(firstRun, 'failed')] })
+      store.setSnapshot({
+        ...EMPTY_SNAPSHOT, runs: [run(firstRun, 'failed'), run(secondRun, 'completed')],
+      })
     })
     await waitFor(() => { expect(store.selectedRunDir).toBe(secondRun) })
     expect(loadRun).toHaveBeenNthCalledWith(2, secondRun)
     act(() => {
-      store.setSnapshot({ ...EMPTY_SNAPSHOT, runs: [run(secondRun), run(firstRun, 'failed')] })
+      store.setSnapshot({
+        ...EMPTY_SNAPSHOT, runs: [run(firstRun, 'failed'), run(secondRun, 'completed')],
+      })
     })
     expect(loadRun).toHaveBeenCalledTimes(2)
 
@@ -223,7 +227,8 @@ describe('KerSor conversation view registration', () => {
     expect(store.selectedRunDir).toBeUndefined()
     act(() => {
       store.setSnapshot({
-        ...EMPTY_SNAPSHOT, runs: [run(thirdRun), run(secondRun), run(firstRun, 'failed')],
+        ...EMPTY_SNAPSHOT,
+        runs: [run(firstRun, 'failed'), run(secondRun, 'completed'), run(thirdRun)],
       })
     })
     expect(store.selectedRunDir).toBeUndefined()

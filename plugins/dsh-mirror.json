@@ -2,7 +2,7 @@
   "schema_version": 2,
   "authority": {
     "repository": "https://github.com/qhy991/deepseek-harness.git",
-    "revision": "a5984379a9a18b91f097086042a59cf1673d09ce",
+    "revision": "446778624812d309c90b6e2335fee93ff322e8f6",
     "source_root": "packages/extensions",
     "reconciled": true
   },
@@ -12,7 +12,7 @@
   },
   "build_receipt": {
     "path": "release/kersor-distribution-build-receipt.json",
-    "sha256": "a9336185d76dd01cab06b8e9a76a45ca96fc103c421a4aef80d03ce0c270bb40",
+    "sha256": "bea0665465fdac016f02872e7a9730aa5dc18f9dcd2f4d10d9f7e5882351f625",
     "recipe_id": "dsh-kersor-distribution-build-v1"
   },
   "files": [
@@ -605,7 +605,7 @@
     },
     {
       "path": "plugins/ui-kersor-viewer/lib/client.js",
-      "sha256": "b703b747ea58be915da7c90034adc5e02c1872958cd84fa5e9ac854a41a5133e",
+      "sha256": "a7108916c8104275ea5ebf20d2c1bc948bc3a2e6733454fb8a42d0b865e67539",
       "origin": "derived-build",
       "source": "packages/extensions/ui-kersor-viewer/lib/client.js",
       "receipt_output": "packages/extensions/ui-kersor-viewer/lib/client.js"
@@ -647,7 +647,7 @@
     },
     {
       "path": "plugins/ui-kersor-viewer/lib/types/client/KersorView.js",
-      "sha256": "d826df0dcd99121de4a3a467f8db5f7972c91edc2893ad40115bada6010beff8",
+      "sha256": "b2c1da8f30d1fb4a5c01f70e52def72208ad15e80d455bb3cf8ba94ee5001ca8",
       "origin": "derived-build",
       "source": "packages/extensions/ui-kersor-viewer/lib/types/client/KersorView.js",
       "receipt_output": "packages/extensions/ui-kersor-viewer/lib/types/client/KersorView.js"
@@ -789,7 +789,7 @@
     },
     {
       "path": "plugins/ui-kersor-viewer/src/client/KersorView.tsx",
-      "sha256": "c707a80acba97fc11093121aaeb972f6dae7ac7febe7225e0c509807d19c81bd",
+      "sha256": "f5589c01e0cc61dc6530262504eac8ce78ebd8167bb3928cfdd60f91e66a1d2f",
       "origin": "tracked",
       "source": "packages/extensions/ui-kersor-viewer/src/client/KersorView.tsx"
     },
@@ -867,7 +867,7 @@
     },
     {
       "path": "plugins/ui-kersor-viewer/tests/view.client.spec.tsx",
-      "sha256": "31a79f75a674f56c33e67db3991f4f241ce9dec1f6acb9128f77ab6d01f3cd41",
+      "sha256": "4b77154c499ed75568fa20b0c49ccb5b81d98539aacf69c0805b4fe234546d81",
       "origin": "tracked",
       "source": "packages/extensions/ui-kersor-viewer/tests/view.client.spec.tsx"
     },

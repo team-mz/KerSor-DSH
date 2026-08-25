@@ -535,9 +535,9 @@ export function KersorView({ t, store, currentWorkspace, refresh, loadRun, loadC
             return;
         const currentRows = rows.filter(row => belongsToWorkspace(row.sessionDir, currentWorkspace));
         const target = currentRows.find(row => row.discovery === 'active')
-            ?? currentRows[0]
+            ?? [...currentRows].sort((left, right) => right.runId.localeCompare(left.runId))[0]
             ?? rows.find(row => row.discovery === 'active')
-            ?? rows[0];
+            ?? [...rows].sort((left, right) => right.runId.localeCompare(left.runId))[0];
         if (target === undefined || !store.followDiscoveredRun(target.runDir))
             return;
         void loadRun(target.runDir);
