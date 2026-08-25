@@ -26,6 +26,7 @@ export declare const zh: {
     readonly 'panel.sourcesDegraded': "仅显示可读取数据：{roots} 个根、{readers} 个 run reader、{sources} 个异常来源；最近 {stage}/{code}（{occurrences} 次）";
     readonly 'panel.sourcesFailed': "KerSor 来源读取失败：{roots} 个根、{readers} 个 run reader；最近 {stage}/{code}（{occurrences} 次）";
     readonly 'panel.hint': "优化会话摘要与 Workflow 实时进度";
+    readonly 'panel.followLatest': "跟随最新活动";
     readonly 'session.title': "优化会话";
     readonly 'session.summary': "最近 {count} 个 · {active} 个活跃";
     readonly 'session.round': "第 {current}/{maximum} 轮";
@@ -225,6 +226,7 @@ export declare const en: {
     readonly 'panel.sourcesDegraded': "Showing readable data only: {roots} roots, {readers} run readers, {sources} unhealthy sources; latest {stage}/{code} ({occurrences} occurrence(s))";
     readonly 'panel.sourcesFailed': "KerSor sources failed: {roots} roots, {readers} run readers; latest {stage}/{code} ({occurrences} occurrence(s))";
     readonly 'panel.hint': "Optimization summaries and live Workflow progress";
+    readonly 'panel.followLatest': "Follow latest activity";
     readonly 'session.title': "Optimization Sessions";
     readonly 'session.summary': "Latest {count} · {active} active";
     readonly 'session.round': "Round {current}/{maximum}";

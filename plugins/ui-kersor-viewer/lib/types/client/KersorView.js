@@ -531,32 +531,17 @@ export function KersorView({ t, store, currentWorkspace, refresh, loadRun, loadC
         void refresh();
     }, [refresh]);
     useEffect(() => {
-        if (store.selectedRunDir !== undefined || store.selectedClassicSessionDir !== undefined
-            || rows.length === 0)
+        if (store.selectionIntent !== 'follow')
             return;
         const currentRows = rows.filter(row => belongsToWorkspace(row.sessionDir, currentWorkspace));
-        const currentSessions = classicSessions.filter(session => belongsToWorkspace(session.session_dir, currentWorkspace));
-        const preferredCurrentSession = currentSessions.find(session => session.health === 'active')
-            ?? currentSessions[0];
-        const currentMatching = preferredCurrentSession === undefined
-            ? []
-            : rows.filter(row => row.sessionDir === preferredCurrentSession.session_dir);
-        const fallbackSession = classicSessions.find(session => session.health === 'active')
-            ?? classicSessions[0];
-        const fallbackMatching = fallbackSession === undefined
-            ? []
-            : rows.filter(row => row.sessionDir === fallbackSession.session_dir);
         const target = currentRows.find(row => row.discovery === 'active')
-            ?? currentMatching.sort((left, right) => (right.round ?? 0) - (left.round ?? 0))[0]
             ?? currentRows[0]
             ?? rows.find(row => row.discovery === 'active')
-            ?? fallbackMatching.sort((left, right) => (right.round ?? 0) - (left.round ?? 0))[0]
             ?? rows[0];
-        if (target === undefined)
+        if (target === undefined || !store.followDiscoveredRun(target.runDir))
             return;
-        store.select(target.runDir);
         void loadRun(target.runDir);
-    }, [classicSessions, currentWorkspace, loadRun, rows, store]);
+    }, [currentWorkspace, loadRun, rows, store]);
     const runStart = async (taskId) => {
         setBusy(`start:${taskId}`);
         try {
@@ -585,7 +570,9 @@ export function KersorView({ t, store, currentWorkspace, refresh, loadRun, loadC
         if (runDir !== undefined)
             void loadRun(runDir);
     };
-    return (_jsxs("section", { className: css.view, "data-conversation-composer-overlay": "", "aria-label": t('panel.title'), children: [_jsxs("div", { className: css.header, children: [_jsx("span", { className: css.title, children: t('panel.title') }), _jsx("span", { className: css.note, children: t('panel.hint') })] }), _jsxs("div", { className: css.body, children: [state.launcher !== undefined
+    return (_jsxs("section", { className: css.view, "data-conversation-composer-overlay": "", "data-selection-intent": store.selectionIntent, "aria-label": t('panel.title'), children: [_jsxs("div", { className: css.header, children: [_jsx("span", { className: css.title, children: t('panel.title') }), store.selectionIntent === 'manual'
+                        ? (_jsx("button", { type: "button", className: css.followButton, onClick: () => { store.followLatest(); }, children: t('panel.followLatest') }))
+                        : _jsx("span", { className: css.note, children: t('panel.hint') })] }), _jsxs("div", { className: css.body, children: [state.launcher !== undefined
                         ? _jsx(LauncherControls, { launcher: state.launcher, busy: busy, start: runStart, stop: runStop, t: t })
                         : null, state.transportError !== undefined
                         ? _jsx("div", { className: css.readError, children: t('panel.readFailed', { message: state.transportError }) })

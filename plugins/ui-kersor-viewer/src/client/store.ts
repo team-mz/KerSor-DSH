@@ -48,6 +48,9 @@ export interface KersorViewerState {
 
 type Listener = () => void
 
+/** Browser-local intent that owns automatic versus explicit selection changes. */
+export type KersorSelectionIntent = 'follow' | 'manual'
+
 /** Snapshot store over the Host projection and per-run folded views. */
 export class KersorViewerStore {
   private state: KersorViewerState = {
@@ -56,6 +59,7 @@ export class KersorViewerStore {
   private readonly listeners = new Set<Listener>()
   private selected: string | undefined
   private selectedClassic: string | undefined
+  private intent: KersorSelectionIntent = 'follow'
 
   /** Stable snapshot for useSyncExternalStore. */
   getSnapshot = (): KersorViewerState => this.state
@@ -84,37 +88,56 @@ export class KersorViewerStore {
     return this.selectedClassic
   }
 
+  /** Whether new active runs may replace the current browser-local selection. */
+  get selectionIntent(): KersorSelectionIntent {
+    return this.intent
+  }
+
   /**
-   * Select one experiment and its newest discovered run as one UI choice.
+   * Select one experiment and its newest discovered run as one explicit UI choice.
    * @param sessionDir - Selected Session directory, or `undefined` to collapse.
    * @returns The newest matching run directory, when the Host discovered one.
    */
   selectClassic(sessionDir: string | undefined): string | undefined {
-    this.selectedClassic = sessionDir
-    this.selected = sessionDir === undefined
+    const runDir = sessionDir === undefined
       ? undefined
       : [...(this.state.snapshot?.runs ?? [])]
         .filter(ref => ref.sessionDir === sessionDir)
         .sort((left, right) => (right.round ?? 0) - (left.round ?? 0))[0]?.runDir
-    this.state = { ...this.state }
-    this.emit()
-    return this.selected
+    this.setSelection(runDir, sessionDir, 'manual')
+    return runDir
   }
 
   /**
-   * Select a run and its owning experiment; persists across Host snapshots.
+   * Select a run and its owning experiment, disabling automatic selection until resumed.
    * @param runDir - Exact discovered run directory, or `undefined` to clear selection.
    */
   select(runDir: string | undefined): void {
-    this.selected = runDir
-    if (runDir === undefined) {
-      this.selectedClassic = undefined
-    } else {
-      const ref = this.state.snapshot?.runs.find(candidate => candidate.runDir === runDir)
-      this.selectedClassic = ref?.kind === 'general-task' ? undefined : ref?.sessionDir
-    }
-    this.state = { ...this.state }
-    this.emit()
+    const ref = this.state.snapshot?.runs.find(candidate => candidate.runDir === runDir)
+    this.setSelection(
+      runDir,
+      runDir === undefined || ref?.kind === 'general-task' ? undefined : ref?.sessionDir,
+      'manual',
+    )
+  }
+
+  /**
+   * Follow one Host-discovered run without turning automatic selection into a user choice.
+   * @param runDir - Exact run selected by the view's current-Workspace policy.
+   * @returns `true` only when the selected run or owning Session changed.
+   */
+  followDiscoveredRun(runDir: string): boolean {
+    const ref = this.state.snapshot?.runs.find(candidate => candidate.runDir === runDir)
+    return this.setSelection(
+      runDir,
+      ref?.kind === 'general-task' ? undefined : ref?.sessionDir,
+      'follow',
+    )
+  }
+
+  /** Resume automatic selection after an explicit run or Session choice. */
+  followLatest(): void {
+    this.setSelection(this.selected, this.selectedClassic, 'follow')
   }
 
   /**
@@ -359,7 +382,24 @@ export class KersorViewerStore {
     }
     this.selected = undefined
     this.selectedClassic = undefined
+    this.intent = 'follow'
     this.emit()
+  }
+
+  private setSelection(
+    runDir: string | undefined,
+    sessionDir: string | undefined,
+    intent: KersorSelectionIntent,
+  ): boolean {
+    if (this.selected === runDir && this.selectedClassic === sessionDir && this.intent === intent) {
+      return false
+    }
+    this.selected = runDir
+    this.selectedClassic = sessionDir
+    this.intent = intent
+    this.state = { ...this.state }
+    this.emit()
+    return true
   }
 
   private withInventoryResult(runDir: string, view: KersorRunView | undefined): KersorRunView | undefined {

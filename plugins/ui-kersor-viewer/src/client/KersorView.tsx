@@ -1113,30 +1113,15 @@ export function KersorView({
   }, [refresh])
 
   useEffect(() => {
-    if (store.selectedRunDir !== undefined || store.selectedClassicSessionDir !== undefined
-      || rows.length === 0) return
+    if (store.selectionIntent !== 'follow') return
     const currentRows = rows.filter(row => belongsToWorkspace(row.sessionDir, currentWorkspace))
-    const currentSessions = classicSessions.filter(session => belongsToWorkspace(session.session_dir, currentWorkspace))
-    const preferredCurrentSession = currentSessions.find(session => session.health === 'active')
-      ?? currentSessions[0]
-    const currentMatching = preferredCurrentSession === undefined
-      ? []
-      : rows.filter(row => row.sessionDir === preferredCurrentSession.session_dir)
-    const fallbackSession = classicSessions.find(session => session.health === 'active')
-      ?? classicSessions[0]
-    const fallbackMatching = fallbackSession === undefined
-      ? []
-      : rows.filter(row => row.sessionDir === fallbackSession.session_dir)
     const target = currentRows.find(row => row.discovery === 'active')
-      ?? currentMatching.sort((left, right) => (right.round ?? 0) - (left.round ?? 0))[0]
       ?? currentRows[0]
       ?? rows.find(row => row.discovery === 'active')
-      ?? fallbackMatching.sort((left, right) => (right.round ?? 0) - (left.round ?? 0))[0]
       ?? rows[0]
-    if (target === undefined) return
-    store.select(target.runDir)
+    if (target === undefined || !store.followDiscoveredRun(target.runDir)) return
     void loadRun(target.runDir)
-  }, [classicSessions, currentWorkspace, loadRun, rows, store])
+  }, [currentWorkspace, loadRun, rows, store])
 
   const runStart = async (taskId: KersorTaskId): Promise<void> => {
     setBusy(`start:${taskId}`)
@@ -1170,11 +1155,18 @@ export function KersorView({
     <section
       className={css.view}
       data-conversation-composer-overlay=""
+      data-selection-intent={store.selectionIntent}
       aria-label={t('panel.title')}
     >
       <div className={css.header}>
         <span className={css.title}>{t('panel.title')}</span>
-        <span className={css.note}>{t('panel.hint')}</span>
+        {store.selectionIntent === 'manual'
+          ? (
+            <button type="button" className={css.followButton} onClick={() => { store.followLatest() }}>
+              {t('panel.followLatest')}
+            </button>
+          )
+          : <span className={css.note}>{t('panel.hint')}</span>}
       </div>
       <div className={css.body}>
         {state.launcher !== undefined

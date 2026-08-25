@@ -5,7 +5,7 @@ import { Context, Service } from '@deepseek-ai/cordis'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
 import { ConversationEventRegistry, SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
 import type { KersorViewerSnapshot } from '@deepseek-ai/dsh-kersor-viewer/types'
@@ -180,6 +180,59 @@ describe('KerSor conversation view registration', () => {
     expect(loadRun).toHaveBeenCalledWith(currentRun)
     const selected = screen.getByRole('button', { name: new RegExp(path.basename(currentRun)) })
     expect(selected.getAttribute('aria-pressed')).toBe('true')
+  })
+
+  it('follows each late current-Workspace active run once until the user selects manually', async () => {
+    const store = new KersorViewerStore()
+    const firstRun = '/work/current/.kersor/20260825T050000Z-general-evolve'
+    const secondRun = '/work/current/.kersor/20260825T051000Z-general-evolve'
+    const thirdRun = '/work/current/.kersor/20260825T052000Z-general-evolve'
+    const run = (runDir: string, discovery: 'active' | 'failed' = 'active') => ({
+      runId: path.basename(runDir), runDir, sessionDir: runDir,
+      root: '/work/current/.kersor', kind: 'general-task' as const, discovery,
+    })
+    const loadRun = vi.fn(() => Promise.resolve())
+    const props = {
+      t: makeTranslate(zh, commonZh), store,
+      currentWorkspace: '/work/current',
+      refresh: vi.fn(() => Promise.resolve()),
+      loadRun,
+      loadCallDetail: vi.fn(() => Promise.resolve()),
+      loadClassic: vi.fn(() => Promise.resolve()),
+      start: vi.fn(() => Promise.resolve()),
+      stop: vi.fn(() => Promise.resolve()),
+    } as unknown as Parameters<typeof KersorView>[0]
+    render(<KersorView {...props} />)
+
+    act(() => { store.setSnapshot({ ...EMPTY_SNAPSHOT, runs: [run(firstRun, 'failed')] }) })
+    await waitFor(() => { expect(store.selectedRunDir).toBe(firstRun) })
+    expect(loadRun).toHaveBeenCalledTimes(1)
+
+    act(() => {
+      store.setSnapshot({ ...EMPTY_SNAPSHOT, runs: [run(secondRun), run(firstRun, 'failed')] })
+    })
+    await waitFor(() => { expect(store.selectedRunDir).toBe(secondRun) })
+    expect(loadRun).toHaveBeenNthCalledWith(2, secondRun)
+    act(() => {
+      store.setSnapshot({ ...EMPTY_SNAPSHOT, runs: [run(secondRun), run(firstRun, 'failed')] })
+    })
+    expect(loadRun).toHaveBeenCalledTimes(2)
+
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(path.basename(secondRun)) }))
+    expect(store.selectionIntent).toBe('manual')
+    expect(store.selectedRunDir).toBeUndefined()
+    act(() => {
+      store.setSnapshot({
+        ...EMPTY_SNAPSHOT, runs: [run(thirdRun), run(secondRun), run(firstRun, 'failed')],
+      })
+    })
+    expect(store.selectedRunDir).toBeUndefined()
+    expect(loadRun).toHaveBeenCalledTimes(2)
+
+    fireEvent.click(screen.getByRole('button', { name: '跟随最新活动' }))
+    await waitFor(() => { expect(store.selectedRunDir).toBe(thirdRun) })
+    expect(store.selectionIntent).toBe('follow')
+    expect(loadRun).toHaveBeenNthCalledWith(3, thirdRun)
   })
 
   it('visualizes the runtime pipeline, parallel calls, and selected candidate', async () => {
@@ -405,7 +458,11 @@ describe('KerSor conversation view registration', () => {
 
     await waitFor(() => { expect(store.selectedClassicSessionDir).toBe(sessionDir) })
     expect(store.selectedRunDir).toBeUndefined()
+    expect(store.selectionIntent).toBe('manual')
     expect(await screen.findByRole('tree', { name: 'KerSor 逐轮实验树' })).toBeTruthy()
     expect(screen.queryByText('unrelated-run')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: '收起 Session 详情' }))
+    expect(store.selectedClassicSessionDir).toBeUndefined()
+    expect(store.selectionIntent).toBe('manual')
   })
 })

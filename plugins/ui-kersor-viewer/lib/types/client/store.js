@@ -12,6 +12,7 @@ export class KersorViewerStore {
     listeners = new Set();
     selected;
     selectedClassic;
+    intent = 'follow';
     /** Stable snapshot for useSyncExternalStore. */
     getSnapshot = () => this.state;
     /** Subscribe to snapshot replacements. */
@@ -34,37 +35,44 @@ export class KersorViewerStore {
     get selectedClassicSessionDir() {
         return this.selectedClassic;
     }
+    /** Whether new active runs may replace the current browser-local selection. */
+    get selectionIntent() {
+        return this.intent;
+    }
     /**
-     * Select one experiment and its newest discovered run as one UI choice.
+     * Select one experiment and its newest discovered run as one explicit UI choice.
      * @param sessionDir - Selected Session directory, or `undefined` to collapse.
      * @returns The newest matching run directory, when the Host discovered one.
      */
     selectClassic(sessionDir) {
-        this.selectedClassic = sessionDir;
-        this.selected = sessionDir === undefined
+        const runDir = sessionDir === undefined
             ? undefined
             : [...(this.state.snapshot?.runs ?? [])]
                 .filter(ref => ref.sessionDir === sessionDir)
                 .sort((left, right) => (right.round ?? 0) - (left.round ?? 0))[0]?.runDir;
-        this.state = { ...this.state };
-        this.emit();
-        return this.selected;
+        this.setSelection(runDir, sessionDir, 'manual');
+        return runDir;
     }
     /**
-     * Select a run and its owning experiment; persists across Host snapshots.
+     * Select a run and its owning experiment, disabling automatic selection until resumed.
      * @param runDir - Exact discovered run directory, or `undefined` to clear selection.
      */
     select(runDir) {
-        this.selected = runDir;
-        if (runDir === undefined) {
-            this.selectedClassic = undefined;
-        }
-        else {
-            const ref = this.state.snapshot?.runs.find(candidate => candidate.runDir === runDir);
-            this.selectedClassic = ref?.kind === 'general-task' ? undefined : ref?.sessionDir;
-        }
-        this.state = { ...this.state };
-        this.emit();
+        const ref = this.state.snapshot?.runs.find(candidate => candidate.runDir === runDir);
+        this.setSelection(runDir, runDir === undefined || ref?.kind === 'general-task' ? undefined : ref?.sessionDir, 'manual');
+    }
+    /**
+     * Follow one Host-discovered run without turning automatic selection into a user choice.
+     * @param runDir - Exact run selected by the view's current-Workspace policy.
+     * @returns `true` only when the selected run or owning Session changed.
+     */
+    followDiscoveredRun(runDir) {
+        const ref = this.state.snapshot?.runs.find(candidate => candidate.runDir === runDir);
+        return this.setSelection(runDir, ref?.kind === 'general-task' ? undefined : ref?.sessionDir, 'follow');
+    }
+    /** Resume automatic selection after an explicit run or Session choice. */
+    followLatest() {
+        this.setSelection(this.selected, this.selectedClassic, 'follow');
     }
     /**
      * Resolve one previously loaded call detail.
@@ -293,7 +301,19 @@ export class KersorViewerStore {
         };
         this.selected = undefined;
         this.selectedClassic = undefined;
+        this.intent = 'follow';
         this.emit();
+    }
+    setSelection(runDir, sessionDir, intent) {
+        if (this.selected === runDir && this.selectedClassic === sessionDir && this.intent === intent) {
+            return false;
+        }
+        this.selected = runDir;
+        this.selectedClassic = sessionDir;
+        this.intent = intent;
+        this.state = { ...this.state };
+        this.emit();
+        return true;
     }
     withInventoryResult(runDir, view) {
         if (view === undefined || view.result !== undefined)

@@ -124,6 +124,32 @@ describe('Host snapshot', () => {
   })
 })
 describe('folded run views', () => {
+  it('separates idempotent follow selection from explicit selection', () => {
+    const store = new KersorViewerStore()
+    store.setSnapshot(snapshot({
+      runs: [{ ...REF, kind: 'general-task' }],
+    }))
+    let notifications = 0
+    const dispose = store.subscribe(() => { notifications += 1 })
+
+    expect(store.selectionIntent).toBe('follow')
+    expect(store.followDiscoveredRun('/runs/r1')).toBe(true)
+    expect(store.followDiscoveredRun('/runs/r1')).toBe(false)
+    expect(notifications).toBe(1)
+
+    store.select(undefined)
+    expect(store.selectionIntent).toBe('manual')
+    expect(store.selectedRunDir).toBeUndefined()
+    store.select(undefined)
+    expect(notifications).toBe(2)
+
+    store.followLatest()
+    expect(store.selectionIntent).toBe('follow')
+    store.followLatest()
+    expect(notifications).toBe(3)
+    dispose()
+  })
+
   it('does not fabricate an all-zero view before backlog arrives', () => {
     const store = new KersorViewerStore()
     store.setSnapshot(snapshot())
@@ -289,6 +315,7 @@ describe('transport and reset', () => {
     expect(store.getSnapshot().loading).toBe(true)
     expect(store.selectedRunDir).toBeUndefined()
     expect(store.selectedClassicSessionDir).toBeUndefined()
+    expect(store.selectionIntent).toBe('follow')
   })
 })
 

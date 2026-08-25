@@ -17,7 +17,7 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
     }
 }
 export type { KersorViewFace } from './slots.ts';
-export type { KersorViewerState, KersorViewerStore, KersorRunRow } from './store.ts';
+export type { KersorRunRow, KersorSelectionIntent, KersorViewerState, KersorViewerStore, } from './store.ts';
 export { KersorViewerStore as KersorViewerStoreClass } from './store.ts';
 export { NS };
 export type { KersorViewerKey } from './locales.ts';

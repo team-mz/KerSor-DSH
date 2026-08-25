@@ -35,12 +35,15 @@ export interface KersorViewerState {
     };
 }
 type Listener = () => void;
+/** Browser-local intent that owns automatic versus explicit selection changes. */
+export type KersorSelectionIntent = 'follow' | 'manual';
 /** Snapshot store over the Host projection and per-run folded views. */
 export declare class KersorViewerStore {
     private state;
     private readonly listeners;
     private selected;
     private selectedClassic;
+    private intent;
     /** Stable snapshot for useSyncExternalStore. */
     getSnapshot: () => KersorViewerState;
     /** Subscribe to snapshot replacements. */
@@ -51,17 +54,27 @@ export declare class KersorViewerStore {
     get selectedRunDir(): string | undefined;
     /** Currently expanded classic Session directory. */
     get selectedClassicSessionDir(): string | undefined;
+    /** Whether new active runs may replace the current browser-local selection. */
+    get selectionIntent(): KersorSelectionIntent;
     /**
-     * Select one experiment and its newest discovered run as one UI choice.
+     * Select one experiment and its newest discovered run as one explicit UI choice.
      * @param sessionDir - Selected Session directory, or `undefined` to collapse.
      * @returns The newest matching run directory, when the Host discovered one.
      */
     selectClassic(sessionDir: string | undefined): string | undefined;
     /**
-     * Select a run and its owning experiment; persists across Host snapshots.
+     * Select a run and its owning experiment, disabling automatic selection until resumed.
      * @param runDir - Exact discovered run directory, or `undefined` to clear selection.
      */
     select(runDir: string | undefined): void;
+    /**
+     * Follow one Host-discovered run without turning automatic selection into a user choice.
+     * @param runDir - Exact run selected by the view's current-Workspace policy.
+     * @returns `true` only when the selected run or owning Session changed.
+     */
+    followDiscoveredRun(runDir: string): boolean;
+    /** Resume automatic selection after an explicit run or Session choice. */
+    followLatest(): void;
     /**
      * Resolve one previously loaded call detail.
      * @param runDir - Exact discovered run directory.
@@ -155,6 +168,7 @@ export declare class KersorViewerStore {
     setRunResult(runDir: string, result: KersorWorkflowResultView | undefined): void;
     /** Drop connection-scoped state. */
     reset(): void;
+    private setSelection;
     private withInventoryResult;
     private emit;
 }
