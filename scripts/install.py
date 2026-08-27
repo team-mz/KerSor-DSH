@@ -8,6 +8,7 @@ import filecmp
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from datetime import datetime
@@ -97,12 +98,49 @@ def validate_kersor_root(path: Path) -> Path:
     return root
 
 
-def resolve_runtime_command(path: Path, label: str) -> str:
-    """Resolve one explicitly selected executable without consulting PATH."""
-    candidate = path.expanduser().resolve()
+def resolve_runtime_command(
+    path: Path, label: str, *, follow_symlinks: bool = True
+) -> str:
+    """Resolve one explicitly selected executable without consulting PATH.
+
+    A virtual environment's interpreter is a symlink to its base Python but is
+    not interchangeable with it: only the venv path carries the venv's
+    ``site-packages``. Following that symlink froze an interpreter that could
+    not import what the operator had installed for KerSor, so callers selecting
+    an interpreter keep the path they were given.
+    """
+    candidate = path.expanduser()
+    candidate = candidate.resolve() if follow_symlinks else Path(os.path.abspath(candidate))
     if not candidate.is_file() or not os.access(candidate, os.X_OK):
         raise RuntimeError(f"{label} is not an executable file: {candidate}")
     return str(candidate)
+
+
+def require_catalog_capable_python(python_path: str) -> None:
+    """Refuse to freeze an interpreter that cannot build a workflow catalog.
+
+    KerSor's session setup regenerates ``workflow-catalog.json`` from the
+    workflow manifests and aborts when no PyYAML is available, because routing
+    must not be inferred from workflow text. An interpreter without PyYAML
+    therefore installs cleanly and then fails every ``compose optimize`` at
+    Session creation, so the missing dependency is named here instead.
+    """
+    probe = subprocess.run(
+        [python_path, "-c", "import yaml"],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode == 0:
+        return
+    raise RuntimeError(
+        f"installer Python cannot import PyYAML: {python_path}\n"
+        "KerSor session setup regenerates the workflow catalog from manifests "
+        "and aborts without it, so this preset would fail every optimize "
+        "Session.\n"
+        f"Fix: {python_path} -m pip install pyyaml\n"
+        "or re-run this installer with a Python 3.10+ interpreter that has it "
+        "(the frozen interpreter is the one running this script)."
+    )
 
 
 def validate_model_id(value: str, label: str) -> str:
@@ -119,9 +157,11 @@ def validate_model_id(value: str, label: str) -> str:
 
 def resolve_runtime_tools(*, claude_command: Path | None = None) -> dict[str, str]:
     """Freeze absolute tool paths at trusted install time for generic evolve."""
-    resolved: dict[str, str] = {
-        "python3": resolve_runtime_command(Path(sys.executable), "installer Python"),
-    }
+    installer_python = resolve_runtime_command(
+        Path(sys.executable), "installer Python", follow_symlinks=False
+    )
+    require_catalog_capable_python(installer_python)
+    resolved: dict[str, str] = {"python3": installer_python}
     for name in RUNTIME_TOOL_NAMES:
         if name == "python3":
             continue
@@ -367,6 +407,15 @@ def install(
     composition = render_composition(
         standard.read_text(encoding="utf-8"),
         skill_dir=destination / "skills",
+    )
+    # --dry-run is a preflight, so it must reach the same verdict a real
+    # install would. Freezing an interpreter that cannot build a workflow
+    # catalog installs cleanly and then fails every optimize Session, and a
+    # dry run that reported "would install" hid exactly that.
+    require_catalog_capable_python(
+        resolve_runtime_command(
+            Path(sys.executable), "installer Python", follow_symlinks=False
+        )
     )
     if dry_run:
         return destination, None, True

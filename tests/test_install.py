@@ -116,6 +116,7 @@ class InstallTests(unittest.TestCase):
         self,
         *,
         force: bool = False,
+        dry_run: bool = False,
         claude_command: Path | None = None,
         claude_model: str | None = None,
     ):
@@ -125,7 +126,7 @@ class InstallTests(unittest.TestCase):
             standard_preset=self.standard,
             kersor_root=self.kersor,
             force=force,
-            dry_run=False,
+            dry_run=dry_run,
             claude_command=claude_command,
             claude_model=claude_model,
         )
@@ -176,7 +177,59 @@ class InstallTests(unittest.TestCase):
 
     def test_runtime_tool_snapshot_uses_the_installer_python(self) -> None:
         tools = INSTALLER.resolve_runtime_tools()
-        self.assertEqual(tools["python3"], str(Path(sys.executable).resolve()))
+        self.assertEqual(tools["python3"], os.path.abspath(sys.executable))
+
+    def test_runtime_tool_snapshot_keeps_a_virtualenv_interpreter(self) -> None:
+        """A venv interpreter is not interchangeable with the base it links to.
+
+        Only the venv path carries the venv's site-packages, so resolving the
+        symlink froze a Python that could not import what the operator had
+        installed for KerSor — PyYAML in particular.
+        """
+        venv_python = self.root / "venv" / "bin" / "python3"
+        venv_python.parent.mkdir(parents=True)
+        venv_python.symlink_to(Path(sys.executable).resolve())
+        # The PyYAML gate has its own test; this one is about the frozen path,
+        # and a bare symlink cannot carry a real venv's site-packages.
+        with mock.patch.object(INSTALLER.sys, "executable", str(venv_python)), \
+                mock.patch.object(INSTALLER, "require_catalog_capable_python"):
+            tools = INSTALLER.resolve_runtime_tools()
+        self.assertEqual(tools["python3"], str(venv_python))
+        self.assertNotEqual(tools["python3"], str(Path(sys.executable).resolve()))
+
+    def test_installer_refuses_a_python_that_cannot_build_a_catalog(self) -> None:
+        """Without PyYAML the preset installs and then fails every Session."""
+        blind = self.root / "bin" / "python-no-yaml"
+        blind.parent.mkdir(parents=True, exist_ok=True)
+        blind.write_text(
+            "#!/bin/sh\n"
+            "if [ \"${2:-}\" = 'import yaml' ]; then exit 1; fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        blind.chmod(0o700)
+        with mock.patch.object(INSTALLER.sys, "executable", str(blind)):
+            with self.assertRaises(RuntimeError) as raised:
+                INSTALLER.resolve_runtime_tools()
+        message = str(raised.exception)
+        self.assertIn("cannot import PyYAML", message)
+        self.assertIn("pip install pyyaml", message)
+
+    def test_dry_run_reaches_the_same_verdict_as_a_real_install(self) -> None:
+        """A preflight that says "would install" must mean it."""
+        blind = self.root / "bin" / "python-no-yaml-dry"
+        blind.parent.mkdir(parents=True, exist_ok=True)
+        blind.write_text(
+            "#!/bin/sh\n"
+            "if [ \"${2:-}\" = 'import yaml' ]; then exit 1; fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        blind.chmod(0o700)
+        with mock.patch.object(INSTALLER.sys, "executable", str(blind)):
+            with self.assertRaises(RuntimeError) as raised:
+                self.run_install(dry_run=True)
+        self.assertIn("cannot import PyYAML", str(raised.exception))
 
     def test_install_freezes_an_explicit_claude_compatible_route(self) -> None:
         wrapper = self.root / "trusted-bin" / "claude-infini"
