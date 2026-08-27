@@ -1,6 +1,6 @@
 ---
 name: kersor
-description: Route local task evolution, benchmarked optimization, workflow execution, status, resume, trace, and diagnosis through the installed KerSor checkout
+description: Route local task evolution, benchmarked optimization, pinned Hugging Face to ApxInf deployment Missions, workflow execution, status, resume, trace, and diagnosis through the installed KerSor checkout
 ---
 
 # KerSor DSH bridge
@@ -111,6 +111,11 @@ wrong.
   An explicit Task run directory must be one direct child of
   `workspace/.kersor`. Report the exact terminal JSON/status and stop.
 - For a kernel file or task directory, preflight the direct route with `"${KERSOR_PYTHON:-python3}" "$bridge" compose optimize --path <path> --json`.
+- For a pinned Hugging Face model that must be ported and deployed through
+  ApxInf, read `$kersor_root/skills/deploy-hf-model-to-apxinf/SKILL.md`
+  completely and follow its request-materialization and finite dsh Mission
+  registration path. Do not route this open repository/service task through
+  kernel `compose optimize` or copy its domain policy into this adapter.
 - For a bundled case, list or match cases first, then use `"${KERSOR_PYTHON:-python3}" "$bridge" compose build --case <id> --json`.
 - For environment diagnosis, use `"${KERSOR_PYTHON:-python3}" "$bridge" doctor --runtime dsh`.
 - For status, call `kersor_status` first with an empty argument object. It always reads the current DSH workspace; never pass the KerSor checkout or another filesystem path. It reads canonical Session and Attempt Result stores and renders the live round, workflow, best measured speedup, target, fit, and recent decisions.

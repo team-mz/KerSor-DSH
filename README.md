@@ -167,6 +167,7 @@ python3 scripts/install.py \
 | 通用本地任务的固定验证循环 | KerSor preset → Host `kersor_evolve` → `runtime=dsh` → DSH `spawn` child；显式外部 Codex 请求保留 bridge | 固定 DSH route／usage receipt、Core artifact transaction、`output.json` 与 verifier evidence |
 | 自主 Workflow / Mission（只读或单文件事务） | KerSor preset → Host `kersor_evolve` → `runtime=dsh` → DSH `spawn` child | 固定 `deepseek-official/kimi-k2.7-code` route receipt、durable usage／terminal evidence、Core transaction／Host gate、`result.json` |
 | 超出 DSH 单文件 Mission 事务边界的自主 Workflow / Mission | KerSor preset → Host `kersor_evolve` → 外部 Codex／Claude-compatible worker | `result.json`、artifact receipts、独立 verifier |
+| 固定 HF 模型到 ApxInf 部署 | `kersor` adapter → KerSor `deploy-hf-model-to-apxinf` skill → 有限 dsh Mission 注册 | Host model／deployment gates、`result.json`、独立 verifier |
 | 状态、恢复、诊断 | child 调用 `kersor_status`；父对话用 `kersor_resume` 恢复同一 child | 当前磁盘 Session + 原 DSH child，不依赖聊天记忆 |
 
 不要把 CUDA Workflow 硬套到 Python、VLIW、Verilog 或普通工程任务。任务类型不匹配时，稳定 `optimize` 路径应先确定性拒绝不兼容的已发布 Workflow，再通过有界 workflow authoring 创作 task-native Proposal；workflow evolution 只属于显式 research runner。任务自己的测试命令始终是唯一验收门。
