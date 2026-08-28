@@ -63,6 +63,29 @@ describe('run lifecycle', () => {
     expect(view.status).toBe('failed')
     expect(view.error).toBe('boom')
   })
+
+  it('closes every buried phase bucket on terminal events, not just the last', () => {
+    // An event still carrying an earlier phase title (late agent.queued or a
+    // mid-run attach) opens a phantom bucket at the end WITHOUT closing the
+    // bucket it buries mid-array; the terminal sweep must reach that bucket.
+    const completed = createRunView('r1', '/runs/r1', '/sessions/s1')
+    foldAll(completed, events(
+      { type: 'phase.changed', phase: 'Setup' },
+      { type: 'phase.changed', phase: 'Execute' },
+      { type: 'agent.queued', seq: 0, call_id: 'setup/late/0', phase: 'Setup', label: 'late' },
+      { type: 'workflow.completed', calls: 1 },
+    ))
+    expect(completed.phases.map(phase => phase.status)).toEqual(['completed', 'completed', 'completed'])
+
+    const failed = createRunView('r2', '/runs/r2', '/sessions/s1')
+    foldAll(failed, events(
+      { type: 'phase.changed', phase: 'Setup' },
+      { type: 'phase.changed', phase: 'Execute' },
+      { type: 'agent.queued', seq: 0, call_id: 'setup/late/0', phase: 'Setup', label: 'late' },
+      { type: 'workflow.failed', error: { message: 'boom' } },
+    ))
+    expect(failed.phases.map(phase => phase.status)).toEqual(['completed', 'failed', 'failed'])
+  })
 })
 
 describe('phase and call folding', () => {

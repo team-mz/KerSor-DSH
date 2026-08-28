@@ -2,7 +2,7 @@
   "schema_version": 2,
   "authority": {
     "repository": "https://github.com/qhy991/deepseek-harness.git",
-    "revision": "00db21d4b4f40a6ebb91823b0b7995a705039ee8",
+    "revision": "ef3348c9fd52abcf6250e9cf285728f1f5ea96fb",
     "source_root": "packages/extensions",
     "reconciled": true
   },
@@ -12,7 +12,7 @@
   },
   "build_receipt": {
     "path": "release/kersor-distribution-build-receipt.json",
-    "sha256": "a9faca3c5ede3e467203666a59f0b8e8d57a20385c7fcdf3d8f1920f18afb034",
+    "sha256": "26040eaae409a06c0f7b4cf23ad38c297b506a18e1cb0664acb2da4421d0c2e3",
     "recipe_id": "dsh-kersor-distribution-build-v1"
   },
   "files": [
@@ -36,7 +36,7 @@
     },
     {
       "path": "plugins/kersor-viewer/lib/index.js",
-      "sha256": "2275c7c8ae4a17494688ef7de568f666fe10aa8f1eab03d63250f3b4bddfb5d2",
+      "sha256": "208a90a8fc0e58366962b8c8b0d7239afa2e68a3c5c20af4c693b123e12b3cfe",
       "origin": "derived-build",
       "source": "packages/extensions/kersor-viewer/lib/index.js",
       "receipt_output": "packages/extensions/kersor-viewer/lib/index.js"
@@ -127,7 +127,7 @@
     },
     {
       "path": "plugins/kersor-viewer/lib/types/fold.js",
-      "sha256": "9c28e556465a3afafd69db0df0c1d32ba2d7d45b8396653917b88f17c5786c56",
+      "sha256": "2872899399696c946519d9516b125ea0a47358f2b2f245b01737aca221b237f2",
       "origin": "derived-build",
       "source": "packages/extensions/kersor-viewer/lib/types/fold.js",
       "receipt_output": "packages/extensions/kersor-viewer/lib/types/fold.js"
@@ -255,7 +255,7 @@
     },
     {
       "path": "plugins/kersor-viewer/src/fold.ts",
-      "sha256": "d51d4b46dfce359a74b5869600cb1f83eec6a841a749b14a85db948d029bfff7",
+      "sha256": "0092b96afbaddb1173bb49b6cff9519f921fae833d4cfe84f465a98576ae29d6",
       "origin": "tracked",
       "source": "packages/extensions/kersor-viewer/src/fold.ts"
     },
@@ -315,7 +315,7 @@
     },
     {
       "path": "plugins/kersor-viewer/tests/fold.spec.ts",
-      "sha256": "b8ec1a1e9cd46c020ffd97f1cc35e38d1ca2ada9ed644d82eda4c7431aa09164",
+      "sha256": "e6328e64d9a49ab56cf3b01a2fdf38c84d74ceaeda99bafe428b4af389699bef",
       "origin": "tracked",
       "source": "packages/extensions/kersor-viewer/tests/fold.spec.ts"
     },

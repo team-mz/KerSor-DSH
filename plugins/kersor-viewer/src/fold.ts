@@ -250,8 +250,11 @@ export function foldEvent(view: KersorRunView, event: KersorEvent): void {
       view.endedTs = event.ts
       const tokens = totalTokens(event.usage)
       if (tokens !== undefined) view.totals.tokens = tokens
-      const lastPhase = view.phases.at(-1)
-      if (lastPhase !== undefined) lastPhase.status = 'completed'
+      // Phantom-phase events can bury earlier buckets mid-array, so sweep
+      // every still-running phase, not just the last one.
+      for (const phase of view.phases) {
+        if (phase.status === 'running') phase.status = 'completed'
+      }
       return
     }
     case 'workflow.failed': {
@@ -260,8 +263,11 @@ export function foldEvent(view: KersorRunView, event: KersorEvent): void {
       view.error = errorMessage(event.error)
       const tokens = totalTokens(event.usage)
       if (tokens !== undefined) view.totals.tokens = tokens
-      const lastPhase = view.phases.at(-1)
-      if (lastPhase !== undefined) lastPhase.status = 'failed'
+      // Phantom-phase events can bury earlier buckets mid-array, so sweep
+      // every still-running phase, not just the last one.
+      for (const phase of view.phases) {
+        if (phase.status === 'running') phase.status = 'failed'
+      }
       return
     }
     case 'agent.queued':

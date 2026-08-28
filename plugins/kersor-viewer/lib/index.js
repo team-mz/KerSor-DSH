@@ -1595,8 +1595,7 @@ function foldEvent(view, event) {
 			view.endedTs = event.ts;
 			const tokens = totalTokens(event.usage);
 			if (tokens !== void 0) view.totals.tokens = tokens;
-			const lastPhase = view.phases.at(-1);
-			if (lastPhase !== void 0) lastPhase.status = "completed";
+			for (const phase of view.phases) if (phase.status === "running") phase.status = "completed";
 			return;
 		}
 		case "workflow.failed": {
@@ -1605,8 +1604,7 @@ function foldEvent(view, event) {
 			view.error = errorMessage(event.error);
 			const tokens = totalTokens(event.usage);
 			if (tokens !== void 0) view.totals.tokens = tokens;
-			const lastPhase = view.phases.at(-1);
-			if (lastPhase !== void 0) lastPhase.status = "failed";
+			for (const phase of view.phases) if (phase.status === "running") phase.status = "failed";
 			return;
 		}
 		case "agent.queued":
