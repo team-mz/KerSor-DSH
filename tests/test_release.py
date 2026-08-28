@@ -462,6 +462,16 @@ class ReleaseParityTests(unittest.TestCase):
         self.assertEqual(environment["npm_config_globalconfig"], str(npm_config))
         self.assertEqual(npm_config.read_bytes(), b"")
         self.assertEqual(stat.S_IMODE(npm_config.stat().st_mode), 0o600)
+        pnpm_launcher = runtime_home / "bin" / "pnpm"
+        self.assertTrue(pnpm_launcher.is_file())
+        self.assertFalse(pnpm_launcher.is_symlink())
+        self.assertEqual(pnpm_launcher.stat().st_nlink, 1)
+        self.assertEqual(stat.S_IMODE(pnpm_launcher.stat().st_mode), 0o700)
+        self.assertEqual(
+            environment["PATH"].split(os.pathsep)[0],
+            str(pnpm_launcher.parent),
+        )
+        self.assertIn(str(Path(sys.executable).resolve()), pnpm_launcher.read_text())
 
     def test_dsh_plugin_rejects_linked_runtime_npm_config(self) -> None:
         runtime_home = self.root / "runtime-home-link"

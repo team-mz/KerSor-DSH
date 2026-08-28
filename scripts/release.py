@@ -16,6 +16,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -1890,6 +1891,72 @@ def _prepare_runtime_temporary_directory(runtime_home: Path) -> Path:
     return temporary
 
 
+def _prepare_runtime_pnpm_launcher(
+    runtime_home: Path,
+    node: Path,
+    pnpm: Path,
+) -> Path:
+    """Create a private ``pnpm`` command bound to the verified tool paths."""
+    directory = runtime_home / "bin"
+    try:
+        directory.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise ReleaseError(f"release runtime pnpm directory is unavailable: {error}") from error
+    metadata = directory.lstat()
+    current_uid = os.getuid() if hasattr(os, "getuid") else metadata.st_uid
+    if stat.S_ISLNK(metadata.st_mode) \
+            or not stat.S_ISDIR(metadata.st_mode) \
+            or metadata.st_uid != current_uid \
+            or stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise ReleaseError("release runtime pnpm directory must be owned and private")
+    directory.chmod(0o700)
+
+    launcher = directory / "pnpm"
+    try:
+        existing = launcher.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise ReleaseError(f"release runtime pnpm launcher is unavailable: {error}") from error
+    else:
+        if stat.S_ISLNK(existing.st_mode) \
+                or not stat.S_ISREG(existing.st_mode) \
+                or existing.st_nlink != 1 \
+                or existing.st_uid != current_uid:
+            raise ReleaseError(
+                "release runtime pnpm launcher must be an owned unlinked regular file"
+            )
+
+    content = (
+        "#!/bin/sh\n"
+        f"exec {shlex.quote(str(node.resolve(strict=True)))} "
+        f"{shlex.quote(str(pnpm.resolve(strict=True)))} \"$@\"\n"
+    ).encode("utf-8")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".pnpm.", dir=directory)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o700)
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            descriptor = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, launcher)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+    final = launcher.lstat()
+    if not stat.S_ISREG(final.st_mode) or final.st_nlink != 1 \
+            or final.st_uid != current_uid \
+            or stat.S_IMODE(final.st_mode) != 0o700 \
+            or launcher.read_bytes() != content:
+        raise ReleaseError("release runtime pnpm launcher did not materialize safely")
+    return launcher
+
+
 def _run_dsh_plugin(
     *,
     node: Path,
@@ -1904,13 +1971,14 @@ def _run_dsh_plugin(
     runtime_home.mkdir(parents=True, exist_ok=True, mode=0o700)
     empty_npm_config = _prepare_runtime_npm_config(runtime_home)
     temporary = _prepare_runtime_temporary_directory(runtime_home)
+    pnpm_launcher = _prepare_runtime_pnpm_launcher(runtime_home, node, pnpm)
     environment = {
         "DSH_HOME": str(dsh_home),
         "HOME": str(runtime_home),
         "USERPROFILE": str(runtime_home),
         "TMPDIR": str(temporary),
         "PATH": os.pathsep.join(dict.fromkeys([
-            str(pnpm.resolve().parent),
+            str(pnpm_launcher.parent),
             str(node.resolve().parent),
             "/usr/bin",
             "/bin",
