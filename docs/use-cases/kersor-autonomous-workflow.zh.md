@@ -35,6 +35,15 @@ DSH Chat
 
 整个标准优化路径固定使用 DSH 原生 controller 和 DSH Workflow workers，不需要 Claude Code 或 Codex 作为外部执行器。
 
+固定 Task 可用 `native_subagents: 1..4` 让 primary Worker 在写入前向指定数量的
+独立只读顾问征询分析。安装后的 KerSor preset 在 DSH `tool-subagent` 的权威配置处
+关闭后台执行，因此模型侧工具只包含 `description` 与 `prompt`；Host 等待所有顾问
+结束，整棵树共用一个 activation budget，并保持 primary 是唯一写入者和集成者。
+
+越界写入只有在 DSH 持久历史证明 Guard 已返回错误、mutation tool 从未执行时才是
+非终止错误。失败调用仍显示在对话里，但之后对声明 artifact 的合法修改仍可交给
+Host 验证并提交；拒绝证据缺失或不一致时继续 fail closed。
+
 ## 2. 准备与启动 Web
 
 先按照仓库根目录的[安装说明](../../README.md#五分钟上手)安装 KerSor preset 和 Web bundle。启动 Host 的 Python 必须是可执行文件的绝对路径：

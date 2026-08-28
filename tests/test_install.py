@@ -42,6 +42,16 @@ STANDARD = """# The `standard` agent preset.
   name: '@deepseek-ai/dsh-skill-filesystem'
 - id: tool-skill
   name: '@deepseek-ai/dsh-tool-skill'
+- id: delegation
+  name: cordis:group
+  group: true
+  config:
+    - id: tool-subagent
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: spawn
+        toolName: subagent
+        backgroundMode: continuable
 """
 
 
@@ -142,6 +152,9 @@ class InstallTests(unittest.TestCase):
         self.assertIn("name: './plugins/kersor-evolve.mjs'", composition)
         self.assertIn("name: '@deepseek-ai/dsh-kersor/control'", composition)
         self.assertIn("customSkillDirs:", composition)
+        self.assertIn("enableRunInBackground: false", composition)
+        self.assertIn("backgroundMode: one-shot", composition)
+        self.assertNotIn("backgroundMode: continuable", composition)
         self.assertIn(str((destination / "skills").resolve()), composition)
         self.assertNotIn(str(self.kersor), composition)
         self.assertTrue((destination / "plugins" / "kersor-status.mjs").is_file())
@@ -356,7 +369,7 @@ class InstallTests(unittest.TestCase):
                 "budget": {"total_tokens": 4_000_000},
                 "broker": {
                     "type": "dsh-host-rpc",
-                    "protocol": "kersor-dsh-host-rpc-v1",
+                    "protocol": "kersor-dsh-host-rpc-v3",
                     "socket_env": "KERSOR_DSH_RPC_SOCKET",
                     "nonce_env": "KERSOR_DSH_RPC_NONCE",
                     "max_frame_bytes": 16 * 1024 * 1024,
@@ -1576,6 +1589,8 @@ class InstallTests(unittest.TestCase):
             encoding="utf-8",
         )
         (workspace / "solution.py").write_text("pass\n", encoding="utf-8")
+        predecessor = workspace / ".kersor" / "predecessor"
+        predecessor.mkdir(parents=True)
 
         rpc_dir = self.root / "rpc"
         rpc_dir.mkdir(mode=0o700)
@@ -1600,6 +1615,8 @@ class InstallTests(unittest.TestCase):
                     "dsh",
                     "--expected-runtime",
                     "dsh",
+                    "--predecessor-run",
+                    str(predecessor),
                 ],
                 cwd=workspace,
                 check=False,
@@ -1613,6 +1630,9 @@ class InstallTests(unittest.TestCase):
         self.assertIn("--runtime", argv)
         self.assertEqual(argv[argv.index("--runtime") + 1], "dsh")
         self.assertIn("--expected-runtime-config-sha256", argv)
+        self.assertEqual(
+            argv[argv.index("--predecessor-run") + 1], str(predecessor.resolve())
+        )
         environment = (contract.with_suffix(".json.env")).read_text(encoding="utf-8")
         self.assertNotIn("ambient", environment)
 
@@ -1937,6 +1957,13 @@ class InstallTests(unittest.TestCase):
         )
         self.assertIn("without a model-visible\nline projection", skill)
         self.assertIn("exactly one\nforeground DSH child", skill)
+        self.assertIn("DSH adapter registration is the sole owner", skill)
+        self.assertIn("personal Host is the budget-metering TCB", skill)
+        self.assertIn("does not independently prove the registration-owned context", skill)
+        self.assertIn(
+            "dsh-host-attested-actual-or-registration-context-reservation-v1",
+            skill,
+        )
         self.assertIn("must not read or copy the\nlong prompt", skill)
         self.assertNotIn('"action":"profile_context"', skill)
         self.assertNotIn('"action":"profile_seal"', skill)

@@ -35,6 +35,19 @@ The ownership boundary is:
 
 The canonical optimization path uses a DSH-native controller and DSH Workflow workers. It does not require Claude Code or Codex as an external executor.
 
+For a fixed Task, `native_subagents: 1..4` lets the primary worker ask that many
+independent read-only advisers for analysis before it writes. The installed
+KerSor preset disables background execution at DSH's `tool-subagent` owner, so
+the model-facing tool contains only `description` and `prompt`; the Host waits
+for every adviser, shares one activation budget across the tree, and keeps the
+primary as the sole writer and integrator.
+
+A rejected out-of-scope mutation is non-terminal only when the durable DSH
+history proves that the guard returned an error and the mutation tool never
+ran. The failed call remains visible in the conversation while a later valid
+edit to the declared artifact may still be verified and committed. Missing or
+inconsistent rejection evidence remains fail-closed.
+
 ## 2. Prepare and start the Web Host
 
 Install the KerSor preset and Web bundle using the repository's [five-minute setup](../../README.md#五分钟上手). The Host Python interpreter must be an absolute path to an executable file:

@@ -84,6 +84,12 @@ const exec = {
           {type: 'turn/end', data: {turn: 1}},
           {type: 'tool/call', data: {turn: 2, step: 1, callId: 'call-test-evolve', name: 'kersor_evolve'}},
         ]
+      : request.historical_command === true
+        ? [
+            {type: 'command/run', data: {commandId: 'cmd-previous', name: 'kersor-evolve', args: '{}', source: {kind: 'user'}}},
+            {type: 'command/done', data: {commandId: 'cmd-previous', kind: 'success'}},
+            {type: 'tool/call', data: {turn: 1, step: 1, callId: 'call-test-evolve', name: 'kersor_evolve'}},
+          ]
       : [{type: 'tool/call', data: {turn: 1, step: 1, callId: 'call-test-evolve', name: 'kersor_evolve'}}],
   }},
   signal: controller.signal,
@@ -146,6 +152,7 @@ import {pathToFileURL} from 'node:url'
 
 const request = JSON.parse(fs.readFileSync(0, 'utf8'))
 const driverStartedAt = Date.now()
+let contextWindowIndex = 0
 const plugin = await import(pathToFileURL(request.module).href)
 const listeners = new Map()
 const telemetry = {
@@ -153,9 +160,13 @@ const telemetry = {
   guards: {},
   scoped_tool_descriptions: {},
   dispose_count: 0,
+  provider_calls: 0,
+  streamed_calls: [],
 }
 const topLevelGuards = []
 let registeredTool
+let registeredCommand
+let scopedSubagentDefinition
 const quotaFailure = {
   message: '[Service quota exceeded.]',
   code: 'QUOTA',
@@ -169,6 +180,14 @@ const serverFailure = {
 const unknownFailure = {
   message: 'provider request failed before usage was observed',
   code: 'UNKNOWN',
+}
+const timeoutFailure = {
+  message: 'DeepSeek stream idle timeout after 300000ms',
+  code: 'TIMEOUT',
+}
+const tokenBudgetFailure = {
+  message: 'DSH child activation token budget exhausted',
+  code: 'DSH_ACTIVATION_TOKEN_BUDGET_EXHAUSTED',
 }
 const withSeq = events => events.map((event, index) => ({...event, seq: index}))
 const completedEvents = withSeq([
@@ -190,6 +209,177 @@ const completedEvents = withSeq([
   {type: 'step/end', data: {turn: 1, step: 1}},
   {type: 'turn/end', data: {turn: 1, reason: {kind: 'completed'}}},
 ])
+const ledgerAllCallsEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 1,
+      chunk: {type: 'usage', usage: {inputTokens: 7, outputTokens: 3}},
+    },
+  },
+  {type: 'llm/retry-started', data: {turn: 1, step: 1, retryId: 'retry-ledger', retry: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 1,
+      chunk: {type: 'usage', usage: {inputTokens: 11, cacheReadTokens: 4, outputTokens: 5}},
+    },
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'completed'}}},
+])
+const tokenBudgetEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {
+      turn: 1,
+      step: 1,
+      chunk: {type: 'usage', usage: {inputTokens: 70, outputTokens: 20}},
+    },
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'step/start', data: {turn: 1, step: 2}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 2, chunk: {type: 'finish', reason: {kind: 'error', failure: tokenBudgetFailure}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 2}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'error', error: tokenBudgetFailure}}},
+])
+const ledgerMissingUsageEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'stop'}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'completed'}}},
+])
+const retryAfterUnmeteredTimeoutEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {
+      type: 'finish', reason: {kind: 'error', failure: timeoutFailure},
+    }},
+  },
+  {type: 'llm/retry', data: {turn: 1, step: 1, retryId: 'retry-timeout', retry: 1}},
+  {type: 'llm/retry-started', data: {turn: 1, step: 1, retryId: 'retry-timeout', retry: 1}},
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'usage', usage: {
+      inputTokens: 11, cacheReadTokens: 3, cacheWriteTokens: 2, outputTokens: 7,
+    }}},
+  },
+  {
+    type: 'assistant/chunk',
+    data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'stop'}}},
+  },
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'completed'}}},
+])
+const guardedToolEvents = ({toolName, callId, isError = true, includeResult = true}) => withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {
+    type: 'assistant/message',
+    data: {
+      turn: 1,
+      step: 1,
+      usage: {
+        inputTokens: 11,
+        cacheReadTokens: 3,
+        cacheWriteTokens: 2,
+        outputTokens: 7,
+      },
+      message: {
+        id: `assistant-${callId}`,
+        role: 'assistant',
+        content: [{type: 'tool-call', id: callId, name: toolName, arguments: '{}'}],
+        source: {kind: 'model', provider: 'deepseek-official', model: 'kimi-k2.7-code'},
+      },
+    },
+  },
+  {type: 'tool/call', data: {turn: 1, step: 1, callId, name: toolName, arguments: '{}'}},
+  ...(includeResult ? [{
+    type: 'tool/result',
+    data: {
+      turn: 1,
+      step: 1,
+      message: {
+        source: {kind: 'tool', callId},
+        role: 'user',
+        content: [{
+          type: 'tool-result',
+          toolCallId: callId,
+          content: [{type: 'text', text: isError ? 'Error: denied by test guard' : 'ordinary tool result'}],
+          isError,
+        }],
+      },
+    },
+  }] : []),
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'completed'}}},
+])
+const deniedMutationEvents = guardedToolEvents({toolName: 'write', callId: 'denied-write-1'})
+const deniedMutationMissingResultEvents = guardedToolEvents({
+  toolName: 'write',
+  callId: 'denied-write-missing-result',
+  includeResult: false,
+})
+const deniedMutationNonerrorResultEvents = guardedToolEvents({
+  toolName: 'write',
+  callId: 'denied-write-nonerror-result',
+  isError: false,
+})
+const deniedMutationUsageIncompleteEvents = withSeq(deniedMutationEvents.filter(
+  event => event.type !== 'step/end',
+))
+const deniedMutationUnmeteredRetryEvents = withSeq([
+  {type: 'turn/start', data: {turn: 1}},
+  {type: 'step/start', data: {turn: 1, step: 1}},
+  {type: 'assistant/chunk', data: {turn: 1, step: 1, chunk: {
+    type: 'finish', reason: {kind: 'error', failure: timeoutFailure},
+  }}},
+  {type: 'llm/retry', data: {turn: 1, step: 1, retryId: 'denied-retry', retry: 1}},
+  {type: 'llm/retry-started', data: {turn: 1, step: 1, retryId: 'denied-retry', retry: 1}},
+  {type: 'assistant/chunk', data: {turn: 1, step: 1, chunk: {type: 'usage', usage: {
+    inputTokens: 11, cacheReadTokens: 3, cacheWriteTokens: 2, outputTokens: 7,
+  }}}},
+  {type: 'assistant/chunk', data: {turn: 1, step: 1, chunk: {type: 'finish', reason: {kind: 'stop'}}}},
+  {type: 'assistant/message', data: {
+    turn: 1,
+    step: 1,
+    usage: {inputTokens: 11, cacheReadTokens: 3, cacheWriteTokens: 2, outputTokens: 7},
+    message: {
+      id: 'assistant-denied-unmetered',
+      role: 'assistant',
+      content: [{type: 'tool-call', id: 'denied-write-unmetered', name: 'write', arguments: '{}'}],
+      source: {kind: 'model', provider: 'deepseek-official', model: 'kimi-k2.7-code'},
+    },
+  }},
+  {type: 'tool/call', data: {turn: 1, step: 1, callId: 'denied-write-unmetered', name: 'write', arguments: '{}'}},
+  {type: 'tool/result', data: {turn: 1, step: 1, message: {
+    source: {kind: 'tool', callId: 'denied-write-unmetered'},
+    role: 'user',
+    content: [{type: 'tool-result', toolCallId: 'denied-write-unmetered', content: [
+      {type: 'text', text: 'Error: denied by test guard'},
+    ], isError: true}],
+  }}},
+  {type: 'step/end', data: {turn: 1, step: 1}},
+  {type: 'turn/end', data: {turn: 1, reason: {kind: 'completed'}}},
+])
+const deniedReadEvents = guardedToolEvents({toolName: 'read', callId: 'denied-read-1'})
+const deniedGlobEvents = guardedToolEvents({toolName: 'glob', callId: 'denied-glob-1'})
+const allowedEditErrorEvents = guardedToolEvents({toolName: 'edit', callId: 'allowed-edit-error-1'})
 const quotaLifecycle = failure => withSeq([
   {type: 'turn/start', data: {turn: 1}},
   {type: 'step/start', data: {turn: 1, step: 1}},
@@ -779,6 +969,18 @@ const gapSeqEvents = completedEvents.map((event, index) => (
   index < 2 ? event : {...event, seq: event.seq + 1}
 ))
 const eventsByMode = new Map([
+  ['ledger-all-calls', ledgerAllCallsEvents],
+  ['token-budget', tokenBudgetEvents],
+  ['ledger-missing-usage', ledgerMissingUsageEvents],
+  ['retry-after-unmetered-timeout', retryAfterUnmeteredTimeoutEvents],
+  ['denied-mutation', deniedMutationEvents],
+  ['denied-mutation-missing-result', deniedMutationMissingResultEvents],
+  ['denied-mutation-nonerror-result', deniedMutationNonerrorResultEvents],
+  ['denied-mutation-usage-incomplete', deniedMutationUsageIncompleteEvents],
+  ['denied-mutation-unmetered-retry', deniedMutationUnmeteredRetryEvents],
+  ['denied-read', deniedReadEvents],
+  ['denied-glob', deniedGlobEvents],
+  ['allowed-edit-error', allowedEditErrorEvents],
   ['quota', quotaEvents],
   ...quotaCodeVariantEvents,
   ['quota-after-content', quotaAfterContentEvents],
@@ -822,10 +1024,96 @@ const eventsByMode = new Map([
   ['gap-seq', gapSeqEvents],
 ])
 const childEvents = eventsByMode.get(request.child_mode) ?? completedEvents
+
+function usageCallsFromEvents(events) {
+  const byStep = new Map()
+  const retrySteps = new Set()
+  for (const event of events) {
+    const data = event?.data
+    const key = Number.isSafeInteger(data?.turn) && Number.isSafeInteger(data?.step)
+      ? `${data.turn}/${data.step}`
+      : null
+    if (key === null) continue
+    if (event.type === 'llm/retry-started') retrySteps.add(key)
+    if (event.type === 'assistant/chunk' && data.chunk?.type === 'usage') {
+      const current = byStep.get(key) ?? {chunks: [], message: null}
+      current.chunks.push(data.chunk.usage)
+      byStep.set(key, current)
+    }
+    if (event.type === 'assistant/message' && data.usage !== undefined) {
+      const current = byStep.get(key) ?? {chunks: [], message: null}
+      current.message = data.usage
+      byStep.set(key, current)
+    }
+    if (event.type === 'assistant/chunk' && data.chunk?.type === 'finish') {
+      const current = byStep.get(key) ?? {chunks: [], message: null}
+      current.finish = data.chunk
+      byStep.set(key, current)
+    }
+  }
+  const calls = []
+  for (const [key, samples] of byStep) {
+    const usages = retrySteps.has(key)
+      ? samples.chunks
+      : [samples.message ?? samples.chunks.at(-1)].filter(value => value !== undefined)
+    for (const [index, usage] of usages.entries()) {
+      calls.push({
+        session_id: 'child',
+        chunks: [
+          {type: 'usage', usage},
+          index === usages.length - 1 && samples.finish !== undefined
+            ? samples.finish
+            : {type: 'finish', reason: {kind: 'stop'}},
+        ],
+      })
+    }
+    if (usages.length === 0 && samples.finish !== undefined) {
+      calls.push({session_id: 'child', chunks: [samples.finish]})
+    }
+  }
+  return calls
+}
+
+async function collectLlmStream(options, chunks) {
+  const preparedListeners = listeners.get('llm/prepared-stream') ?? []
+  const contextWindow = request.context_windows?.[contextWindowIndex++]
+    ?? request.context_window
+  const call = Object.freeze({
+    registration: Object.freeze({
+      provider: Object.freeze({id: options.provider, name: options.provider}),
+      retryPolicy: Object.freeze({maxRetries: 0}),
+    }),
+    config: Object.freeze({provider: options.provider, model: options.model}),
+    ...(contextWindow === null ? {} : {
+      context: Object.freeze({contextWindow: contextWindow ?? 100}),
+    }),
+    options: Object.freeze(options),
+  })
+  const dispatchPrepared = index => {
+    if (index >= preparedListeners.length) {
+      telemetry.provider_calls += 1
+      return (async function* () {
+        for (const chunk of chunks) yield chunk
+      })()
+    }
+    return preparedListeners[index](call, () => dispatchPrepared(index + 1))
+  }
+  const streamListeners = listeners.get('llm/stream') ?? []
+  const dispatchOuter = index => {
+    if (index >= streamListeners.length) return dispatchPrepared(0)
+    return streamListeners[index](options, () => dispatchOuter(index + 1))
+  }
+  const observed = []
+  for await (const chunk of dispatchOuter(0)) observed.push(chunk)
+  telemetry.streamed_calls.push({options, chunks: observed})
+  return observed
+}
+
 const child = {
   id: 'dsh-child-route-probe',
   options: {provider: plugin.DSH_PROVIDER, model: plugin.DSH_MODEL},
   session: {
+    header: {parentSession: 'dsh-parent-route-probe'},
     events: childEvents,
   },
   ctx: {
@@ -835,22 +1123,30 @@ const child = {
     },
     tools: {
       get(name) {
-        if (!['glob', 'grep', 'edit', 'write'].includes(name)) return undefined
+        if (!['glob', 'grep', 'edit', 'write', 'subagent'].includes(name)) return undefined
         return {
           name,
           description: `${name} base description`,
           parameters: {},
-          async execute() { return {} },
+          async execute(args) {
+            if (name === 'subagent') telemetry.forwarded_adviser_args = args
+            return {}
+          },
         }
       },
       register(definition) {
         telemetry.scoped_tool_descriptions[definition.name] = definition.description
+        if (definition.name === 'subagent') scopedSubagentDefinition = definition
         return () => undefined
       },
       guard(value) {
         telemetry.guard_registered = true
         telemetry.guard = value
         return () => { telemetry.guard_disposed = true }
+      },
+      restrict(value) {
+        telemetry.primary_restriction = value
+        return () => undefined
       },
     },
   },
@@ -864,6 +1160,12 @@ const callingAgent = {
   },
 }
 const ctx = {
+  commands: {
+    register(command) {
+      registeredCommand = command
+      return () => undefined
+    },
+  },
   tools: {
     register(tool) {
       registeredTool = tool
@@ -880,10 +1182,14 @@ const ctx = {
     listeners.set(name, current)
     return () => undefined
   },
+  llm: {
+    preparedStreamVersion: request.prepared_stream_version ?? 1,
+  },
   subagents: {
     async start(provider, value) {
       telemetry.starts.push({
         provider,
+        label: value.label,
         parent_is_caller: value.parent === callingAgent,
         agent_options: value.agentOptions,
         tool_filter: value.toolFilter,
@@ -896,6 +1202,155 @@ const ctx = {
       }
       for (const listener of listeners.get('agent/created') ?? []) listener({agent: child})
       if (typeof telemetry.guard !== 'function') throw new Error('child guard was not installed during agent/created')
+      const primaryGuard = telemetry.guard
+      const nativeAdvisers = request.native_advisers ?? 0
+      if (nativeAdvisers > 0) {
+        const adviserDefinition = scopedSubagentDefinition ?? child.ctx.tools.get('subagent')
+        telemetry.scoped_adviser_parameters = Object.keys(adviserDefinition.parameters)
+        await adviserDefinition.execute(
+          {description: 'probe adviser', prompt: 'probe'},
+          {agent: child, signal: value.signal},
+        )
+      }
+      for (let index = 0; index < nativeAdvisers; index += 1) {
+        const callId = `native-adviser-${index + 1}`
+        const denial = primaryGuard({
+          name: 'subagent',
+          callId,
+          arguments: {},
+          agent: child,
+        })
+        if (denial !== undefined) throw new Error(denial)
+        const adviserEvents = completedEvents.map(event => ({...event, data: {...event.data}}))
+        const adviser = {
+          id: `dsh-adviser-${index + 1}`,
+          options: {provider: plugin.DSH_PROVIDER, model: plugin.DSH_MODEL},
+          session: {
+            header: {parentSession: child.id},
+            events: adviserEvents,
+          },
+          ctx: {
+            effect(callback) {
+              const dispose = callback()
+              return typeof dispose === 'function' ? dispose : () => undefined
+            },
+            tools: {
+              get(name) {
+                if (!['read', 'glob', 'grep'].includes(name)) return undefined
+                return {name, description: `${name} adviser description`, parameters: {}, async execute() { return {} }}
+              },
+              register(definition) {
+                telemetry.scoped_tool_descriptions[`${adviser.id}:${definition.name}`] = definition.description
+                return () => undefined
+              },
+              guard(value) {
+                adviser.guard = value
+                return () => undefined
+              },
+              restrict(value) {
+                adviser.restriction = value
+                return () => undefined
+              },
+            },
+          },
+        }
+        for (const listener of listeners.get('agent/created') ?? []) listener({agent: adviser})
+        telemetry.advisers ??= []
+        telemetry.advisers.push({
+          id: adviser.id,
+          restriction: adviser.restriction,
+        })
+        for (const call of usageCallsFromEvents(adviserEvents)) {
+          await collectLlmStream({
+            provider: plugin.DSH_PROVIDER,
+            model: plugin.DSH_MODEL,
+            sessionId: adviser.id,
+            messages: [],
+            signal: value.signal,
+          }, call.chunks)
+        }
+      }
+      const llmCalls = request.llm_calls ?? (
+        request.child_mode === 'wait' ? [] : usageCallsFromEvents(childEvents)
+      )
+      for (const call of llmCalls) {
+        await collectLlmStream({
+          provider: call.provider ?? plugin.DSH_PROVIDER,
+          model: call.model ?? plugin.DSH_MODEL,
+          sessionId: call.session_id === 'other' ? 'unrelated-session' : child.id,
+          ...(call.purpose === undefined ? {} : {purpose: call.purpose}),
+          messages: [],
+          signal: value.signal,
+        }, call.chunks)
+      }
+      if (request.trailing_title_event === true) {
+        child.session.events.push({
+          type: 'session/title',
+          seq: child.session.events.length,
+          data: {title: 'Late title', messageSeqs: [], source: {kind: 'fallback'}},
+        })
+      }
+      const actualGuardExecutions = {
+        'denied-mutation': {
+          name: 'write',
+          callId: 'denied-write-1',
+          arguments: {file_path: request.undeclared_artifact},
+        },
+        'denied-mutation-missing-result': {
+          name: 'write',
+          callId: 'denied-write-missing-result',
+          arguments: {file_path: request.undeclared_artifact},
+        },
+        'denied-mutation-nonerror-result': {
+          name: 'write',
+          callId: 'denied-write-nonerror-result',
+          arguments: {file_path: request.undeclared_artifact},
+        },
+        'denied-mutation-usage-incomplete': {
+          name: 'write',
+          callId: 'denied-write-1',
+          arguments: {file_path: request.undeclared_artifact},
+        },
+        'denied-mutation-unmetered-retry': {
+          name: 'write',
+          callId: 'denied-write-unmetered',
+          arguments: {file_path: request.undeclared_artifact},
+        },
+        'denied-read': {
+          name: 'read',
+          callId: 'denied-read-1',
+          arguments: {file_path: '.kersor/control.json'},
+        },
+        'denied-glob': {
+          name: 'glob',
+          callId: 'denied-glob-1',
+          arguments: {pattern: '*'},
+        },
+        'allowed-edit-error': {
+          name: 'edit',
+          callId: 'allowed-edit-error-1',
+          arguments: {file_path: request.transaction_artifact},
+        },
+      }
+      const actualGuardExecution = actualGuardExecutions[request.child_mode]
+      if (actualGuardExecution !== undefined) {
+        if (request.child_mode === 'denied-mutation') {
+          telemetry.no_call_id_guard_result = telemetry.guard({
+            name: 'write',
+            arguments: {file_path: request.undeclared_artifact},
+            agent: child,
+          }) ?? null
+        }
+        telemetry.actual_guard_result = telemetry.guard({...actualGuardExecution, agent: child}) ?? null
+        if (request.child_mode === 'denied-mutation') {
+          telemetry.second_guard_result = telemetry.guard({
+            name: 'edit',
+            callId: 'denied-edit-2',
+            arguments: {file_path: request.undeclared_artifact},
+            agent: child,
+          }) ?? null
+        }
+      }
       const guardProbes = {
         read: {name: 'read', arguments: {file_path: request.args.contract}},
         glob: {name: 'glob', arguments: {pattern: '*.json'}},
@@ -939,6 +1394,22 @@ const ctx = {
       if (request.child_mode === 'wait') {
         result = new Promise(resolve => {
           const settle = () => {
+            child.session.events.splice(0, child.session.events.length, ...withSeq([
+              {type: 'turn/start', data: {turn: 1}},
+              {type: 'step/start', data: {turn: 1, step: 1}},
+              {
+                type: 'assistant/chunk',
+                data: {
+                  turn: 1,
+                  step: 1,
+                  chunk: {type: 'finish', reason: {kind: 'aborted', failure: {
+                    message: 'KerSor DSH activation timed out', code: 'ABORTED',
+                  }}},
+                },
+              },
+              {type: 'step/end', data: {turn: 1, step: 1}},
+              {type: 'turn/end', data: {turn: 1, reason: {kind: 'aborted'}}},
+            ]))
             telemetry.child_abort_count = (telemetry.child_abort_count ?? 0) + 1
             telemetry.child_abort_after_ms = Date.now() - driverStartedAt
             resolve({output: [], stopReason: 'aborted'})
@@ -1000,6 +1471,7 @@ const ctx = {
         'terminal-step-quota-zero-metered-progress',
         'usage-missing-step-end',
         'duplicate-step-usage',
+        'token-budget',
         'interrupted',
       ].includes(request.child_mode)) {
         result = Promise.resolve({output: [], stopReason: 'error'})
@@ -1023,8 +1495,14 @@ const ctx = {
     },
   },
 }
-plugin.apply(ctx)
+try {
+  plugin.apply(ctx)
+} catch (error) {
+  process.stdout.write(JSON.stringify({apply_error: String(error?.message ?? error), telemetry}))
+  process.exit(0)
+}
 if (registeredTool === undefined) throw new Error('kersor_evolve tool was not registered')
+if (registeredCommand === undefined) throw new Error('kersor-evolve command was not registered')
 if (request.timeout_ms !== undefined) {
   registeredTool = plugin.createTool({ctx, timeoutMs: request.timeout_ms})
 }
@@ -1039,8 +1517,45 @@ const exec = {
   concludeTurn() { telemetry.conclude_count = (telemetry.conclude_count ?? 0) + 1 },
 }
 let payload
+if (request.invoke_command === true) {
+  const commandId = 'command-test-evolve'
+  callingAgent.session.events = [{
+    type: 'command/run',
+    data: {commandId, name: 'kersor-evolve', args: JSON.stringify(request.args), source: {kind: 'user'}},
+  }]
+  try {
+    const result = await registeredCommand.handler({
+      commandId,
+      agent: callingAgent,
+      rawInput: JSON.stringify(request.args),
+      attachments: [],
+      signal: controller.signal,
+    })
+    payload = {
+      ok: true,
+      command_result: result,
+      command_engages_session: registeredCommand.engagesSession,
+      session_events: callingAgent.session.events,
+      telemetry,
+    }
+  } catch (error) {
+    payload = {ok: false, error: String(error?.message ?? error), telemetry}
+  }
+} else {
 try {
   const value = await registeredTool.execute(request.args, exec)
+  if (request.late_same_session_probe === true) {
+    telemetry.late_same_session_chunks = await collectLlmStream({
+      provider: plugin.DSH_PROVIDER,
+      model: plugin.DSH_MODEL,
+      sessionId: child.id,
+      messages: [],
+      signal: new AbortController().signal,
+    }, [
+      {type: 'usage', usage: {inputTokens: 1, outputTokens: 1}},
+      {type: 'finish', reason: {kind: 'stop'}},
+    ])
+  }
   if (request.guard_probe === true) {
     callingAgent.session.events.push({
       type: 'tool/call',
@@ -1078,6 +1593,7 @@ try {
   payload = {ok: true, value, telemetry}
 } catch (error) {
   payload = {ok: false, error: String(error?.message ?? error), telemetry}
+}
 }
 delete telemetry.guard
 process.stdout.write(JSON.stringify(payload))
@@ -1139,6 +1655,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         timeout_ms: int = 5_000,
         second_call: bool = False,
         historical_call: bool = False,
+        historical_command: bool = False,
     ) -> tuple[dict[str, object], float]:
         request: dict[str, object] = {
             "module": str(self.module),
@@ -1148,6 +1665,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             "timeout_ms": timeout_ms,
             "second_call": second_call,
             "historical_call": historical_call,
+            "historical_command": historical_command,
         }
         if abort_after_ms is not None:
             request["abort_after_ms"] = abort_after_ms
@@ -1194,7 +1712,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
                 "budget": {"total_tokens": 1000},
                 "broker": {
                     "type": "dsh-host-rpc",
-                    "protocol": "kersor-dsh-host-rpc-v1",
+                    "protocol": "kersor-dsh-host-rpc-v3",
                     "socket_env": "KERSOR_DSH_RPC_SOCKET",
                     "nonce_env": "KERSOR_DSH_RPC_NONCE",
                     "max_frame_bytes": 16 * 1024 * 1024,
@@ -1222,7 +1740,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             "contract = Path(sys.argv[1])\n"
             "contract_value = json.loads(contract.read_text())\n"
             "request = {\n"
-            "  'protocol': 'kersor-dsh-host-rpc-v1',\n"
+            "  'protocol': contract_value.get('rpc_protocol', 'kersor-dsh-host-rpc-v3'),\n"
             "  'type': 'execute',\n"
             "  'request_id': 'route-probe-1',\n"
             "  'nonce': os.environ['KERSOR_DSH_RPC_NONCE'],\n"
@@ -1237,6 +1755,14 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             f"    'project_root': {str(self.workspace)!r},\n"
             "  },\n"
             "}\n"
+            "if not contract_value.get('omit_activation_budget', False):\n"
+            "  limit = contract_value.get('activation_budget_limit', 1000)\n"
+            "  request['activation']['activation_budget'] = contract_value.get(\n"
+            "    'activation_budget_override', {\n"
+            "      'limit_tokens': limit,\n"
+            "      'basis': 'remaining-workflow-budget',\n"
+            "      'workflow_remaining_tokens': limit,\n"
+            "    })\n"
             "if 'activation_model_role' in contract_value:\n"
             "  request['activation']['model_role'] = contract_value['activation_model_role']\n"
             "if 'activation_timeout_seconds' in contract_value:\n"
@@ -1330,6 +1856,14 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         cwd: Path | None = None,
         swap_workspace_to: Path | None = None,
         timeout_ms: int | None = None,
+        context_window: int | None = 100,
+        context_windows: list[int] | None = None,
+        llm_calls: list[dict[str, object]] | None = None,
+        late_same_session_probe: bool = False,
+        trailing_title_event: bool = False,
+        prepared_stream_version: int | None = 1,
+        invoke_command: bool = False,
+        native_advisers: int = 0,
     ) -> dict[str, object]:
         request: dict[str, object] = {
             "module": str(self.module),
@@ -1341,6 +1875,8 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             "outside_file": str(self.outside_secret),
             "outside_directory": str(self.home),
             "escape_symlink": str(self.escape_symlink),
+            "context_window": context_window,
+            "native_advisers": native_advisers,
         }
         if abort_after_ms is not None:
             request["abort_after_ms"] = abort_after_ms
@@ -1358,16 +1894,62 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             request["swap_workspace_to"] = str(swap_workspace_to)
         if timeout_ms is not None:
             request["timeout_ms"] = timeout_ms
+        if llm_calls is not None:
+            request["llm_calls"] = llm_calls
+        if context_windows is not None:
+            request["context_windows"] = context_windows
+        if late_same_session_probe:
+            request["late_same_session_probe"] = True
+        if trailing_title_event:
+            request["trailing_title_event"] = True
+        if prepared_stream_version is not None:
+            request["prepared_stream_version"] = prepared_stream_version
+        if invoke_command:
+            request["invoke_command"] = True
         completed = subprocess.run(
             [NODE, "--input-type=module", "-e", DSH_NODE_DRIVER],
             input=json.dumps(request),
             check=False,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=20,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         return json.loads(completed.stdout)
+
+    def write_transaction_probe_contract(
+        self,
+        candidate: Path,
+        mission_id: str,
+        *,
+        capture_error: bool = False,
+    ) -> Path:
+        return self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / mission_id),
+            runtime="dsh",
+            **({"probe_mode": "capture-error"} if capture_error else {}),
+            activation_phase="Execute revision 1",
+            activation_label="mutate_candidate",
+            activation_options={"transaction": {
+                "artifacts": [candidate.name],
+                "rollback_on_noncompleted_status": True,
+            }},
+            mission={
+                "mission_id": mission_id,
+                "goal": "mutate one declared candidate",
+                "authority": [f"write {candidate.name}"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{
+                "name": "mutate",
+                "side_effect": "write",
+                "transaction_artifacts": [candidate.name],
+            }],
+        )
 
     def test_public_host_runs_fixed_task_through_dsh_transaction(self) -> None:
         self.prepare_dsh_native_core()
@@ -1409,12 +1991,125 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self.assertEqual(result["value"]["status"], "completed", result)
         self.assertEqual(result["value"]["dsh_result"]["model_role"], "worker")
         self.assertEqual(len(result["telemetry"]["starts"]), 1)
+        self.assertEqual(result["telemetry"]["starts"][0]["label"], "KerSor · evolve-1")
         self.assertEqual(
             result["telemetry"]["starts"][0]["tool_filter"],
             {"allow": ["read", "glob", "grep", "edit", "write"]},
         )
         self.assertIsNone(result["telemetry"]["guards"]["edit"])
         self.assertIsNone(result["telemetry"]["guards"]["write"])
+
+    def test_public_host_runs_exact_read_only_advisers_under_one_activation_ledger(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        contract = self.root / "task.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-task-v1",
+                "workspace": "workspace",
+                "runtime": "codex",
+                "objective": "repair with two independent reviews",
+                "max_rounds": 1,
+                "native_subagents": 2,
+                "activation_phase": "Evolve 1",
+                "activation_label": "evolve-1",
+                "activation_options": {
+                    "native_subagents": 2,
+                    "transaction": {"artifacts": [candidate.name]},
+                },
+                "verifier": {
+                    "argv": ["python3", "../verifier/verify.py"],
+                    "cwd": ".",
+                    "artifacts": [candidate.name],
+                    "feedback": "status",
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        result = self.invoke_dsh_native(
+            contract,
+            runtime="dsh",
+            transaction_artifact=candidate,
+            native_advisers=2,
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "completed", result)
+        receipt = result["value"]["dsh_result"]
+        self.assertEqual(receipt["usage"]["total_tokens"], 69)
+        self.assertEqual(receipt["budget_charge_tokens"], 69)
+        self.assertEqual(receipt["native_subagents"], {
+            "requested": 2,
+            "spawned": 2,
+            "completed": 2,
+            "thread_ids": ["dsh-adviser-1", "dsh-adviser-2"],
+            "status": "observed",
+        })
+        self.assertEqual(
+            result["telemetry"]["starts"][0]["tool_filter"],
+            {"allow": ["read", "glob", "grep", "edit", "write", "subagent"]},
+        )
+        self.assertEqual(
+            [item["restriction"] for item in result["telemetry"]["advisers"]],
+            [{"allow": ["read", "glob", "grep"]}] * 2,
+        )
+        self.assertNotIn("run_in_background", result["telemetry"]["scoped_adviser_parameters"])
+
+        incomplete = self.invoke_dsh_native(
+            contract,
+            runtime="dsh",
+            transaction_artifact=candidate,
+            native_advisers=1,
+        )
+        self.assertTrue(incomplete["ok"], incomplete.get("error"))
+        self.assertEqual(incomplete["value"]["status"], "failed")
+        self.assertIn("exact requested native adviser set", incomplete["value"]["error"])
+
+    def test_human_command_launches_fixed_task_without_a_model_turn(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        contract = self.root / "task.json"
+        contract.write_text(
+            json.dumps({
+                "contract_version": "kersor-task-v1",
+                "workspace": "workspace",
+                "runtime": "codex",
+                "objective": "repair the declared artifact",
+                "max_rounds": 1,
+                "native_subagents": 0,
+                "activation_phase": "Evolve 1",
+                "activation_label": "evolve-1",
+                "activation_options": {"transaction": {
+                    "artifacts": [candidate.name],
+                }},
+                "verifier": {
+                    "argv": ["python3", "../verifier/verify.py"],
+                    "cwd": ".",
+                    "artifacts": [candidate.name],
+                    "feedback": "status",
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        result = self.invoke_dsh_native(
+            contract,
+            runtime="dsh",
+            transaction_artifact=candidate,
+            invoke_command=True,
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["command_result"]["kind"], "success")
+        self.assertIs(result["command_engages_session"], True)
+        terminal = json.loads(result["command_result"]["text"])
+        self.assertEqual(terminal["status"], "completed")
+        self.assertEqual(len(result["session_events"]), 1)
+        self.assertEqual(len(result["telemetry"]["starts"]), 1)
+        self.assertNotIn("conclude_count", result["telemetry"])
 
     def test_dsh_outer_host_does_not_time_out_a_later_bounded_activation(self) -> None:
         self.prepare_dsh_native_core()
@@ -1495,6 +2190,347 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self.assertIn("timeout_seconds must be in (0, 3600]", rejected["value"]["error"])
         self.assertEqual(rejected["telemetry"]["starts"], [])
 
+    def test_public_host_requires_exact_activation_budget_before_child_start(self) -> None:
+        self.prepare_dsh_native_core()
+        for mutation in (
+            {"omit_activation_budget": True},
+            {"activation_budget_override": {
+                "limit_tokens": 1000,
+                "basis": "remaining-workflow-budget",
+                "workflow_remaining_tokens": 999,
+            }},
+            {"activation_budget_override": {
+                "limit_tokens": 1000,
+                "basis": "remaining-workflow-budget",
+                "workflow_remaining_tokens": 1000,
+                "extra": True,
+            }},
+        ):
+            with self.subTest(mutation=mutation):
+                contract = self.write_dsh_failure_contract("strict-activation-budget")
+                value = json.loads(contract.read_text(encoding="utf-8"))
+                value.update(mutation)
+                contract.write_text(json.dumps(value), encoding="utf-8")
+
+                result = self.invoke_dsh_native(contract)
+
+                self.assertTrue(result["ok"], result.get("error"))
+                response = result["value"]["dsh_response"]
+                self.assertEqual(response["error"]["code"], "DSH_ACTIVATION_REJECTED")
+                self.assertIn("activation_budget", response["error"]["message"])
+                self.assertEqual(result["telemetry"]["starts"], [])
+                self.assertEqual(result["telemetry"]["provider_calls"], 0)
+
+    def test_public_host_requires_registration_bound_prepared_stream_seam(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("missing-prepared-stream-seam")
+
+        result = self.invoke_dsh_native(contract, prepared_stream_version=0)
+
+        self.assertIn("prepared-stream admission v1", result["apply_error"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(result["telemetry"]["provider_calls"], 0)
+
+    def test_public_host_requires_prepared_context_before_provider_start(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("missing-context-window")
+
+        result = self.invoke_dsh_native(contract, context_window=None)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_CHILD_USAGE_INCOMPLETE")
+        self.assertEqual(len(result["telemetry"]["starts"]), 1)
+        self.assertEqual(result["telemetry"]["provider_calls"], 0)
+
+    def test_public_host_rejects_v1_before_child_or_provider_start(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("old-rpc-protocol")
+        value = json.loads(contract.read_text(encoding="utf-8"))
+        value["rpc_protocol"] = "kersor-dsh-host-rpc-v1"
+        contract.write_text(json.dumps(value), encoding="utf-8")
+
+        result = self.invoke_dsh_native(contract)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_ACTIVATION_REJECTED")
+        self.assertIn("protocol or type", response["error"]["message"])
+        self.assertEqual(result["telemetry"]["starts"], [])
+        self.assertEqual(result["telemetry"]["provider_calls"], 0)
+
+    def test_public_host_returns_typed_child_deadline_receipt(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("typed-child-timeout")
+        value = json.loads(contract.read_text(encoding="utf-8"))
+        value["activation_timeout_seconds"] = 0.05
+        contract.write_text(json.dumps(value), encoding="utf-8")
+
+        result = self.invoke_dsh_native(contract, child_mode="wait")
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"], {
+            "code": "DSH_CHILD_TIMEOUT",
+            "message": "DSH child activation timed out",
+        })
+        self.assertEqual(response["result"]["stop_reason"], "aborted")
+        self.assertFalse(response["result"]["usage_complete"])
+        self.assertEqual(response["result"]["artifacts"], [])
+
+    def test_public_host_allows_trailing_session_title_metadata(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("trailing-title")
+
+        result = self.invoke_dsh_native(contract, trailing_title_event=True)
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "completed")
+        self.assertTrue(result["value"]["dsh_result"]["usage_complete"])
+
+    def test_public_host_ledgers_retry_title_and_compaction_by_child_session(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "ledger-all-calls"),
+            runtime="dsh",
+            mission={
+                "mission_id": "ledger-all-calls",
+                "goal": "account for every child model request",
+                "authority": ["read workspace"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{"name": "inspect", "side_effect": "read"}],
+        )
+        calls = [
+            {"session_id": "child", "chunks": [
+                {"type": "usage", "usage": {"inputTokens": 7, "outputTokens": 3}},
+                {"type": "finish", "reason": {"kind": "error", "failure": {
+                    "message": "retryable", "code": "SERVER", "status": 503,
+                }}},
+            ]},
+            {"session_id": "child", "chunks": [
+                {"type": "usage", "usage": {
+                    "inputTokens": 11, "cacheReadTokens": 4, "outputTokens": 5,
+                }},
+                {"type": "finish", "reason": {"kind": "stop"}},
+            ]},
+            {"session_id": "child", "purpose": "session-title", "chunks": [
+                {"type": "usage", "usage": {"inputTokens": 2, "outputTokens": 1}},
+                {"type": "finish", "reason": {"kind": "stop"}},
+            ]},
+            {"session_id": "child", "purpose": "compaction", "chunks": [
+                {"type": "usage", "usage": {"inputTokens": 3, "outputTokens": 1}},
+                {"type": "finish", "reason": {"kind": "stop"}},
+            ]},
+            {"session_id": "other", "chunks": [
+                {"type": "usage", "usage": {"inputTokens": 80, "outputTokens": 20}},
+                {"type": "finish", "reason": {"kind": "stop"}},
+            ]},
+        ]
+
+        result = self.invoke_dsh_native(
+            contract,
+            child_mode="ledger-all-calls",
+            llm_calls=calls,
+            late_same_session_probe=True,
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        receipt = result["value"]["dsh_result"]
+        self.assertEqual(receipt["usage"], {
+            "input_tokens": 23,
+            "cached_input_tokens": 4,
+            "output_tokens": 10,
+            "total_tokens": 37,
+        })
+        self.assertTrue(receipt["usage_observed"])
+        self.assertTrue(receipt["usage_complete"])
+        self.assertEqual(receipt["budget_charge_tokens"], 37)
+        self.assertEqual(
+            receipt["budget_charge_basis"],
+            "dsh-host-attested-actual-or-registration-context-reservation-v1",
+        )
+        self.assertEqual(receipt["unmetered_attempts"], 0)
+        self.assertEqual(receipt["metered_attempt_tokens"], 37)
+        self.assertEqual(receipt["unmetered_reservation_tokens"], 0)
+        self.assertEqual(result["telemetry"]["provider_calls"], 6)
+        self.assertEqual(
+            result["telemetry"]["late_same_session_chunks"][-1]["type"],
+            "finish",
+        )
+
+    def test_public_host_denies_next_request_before_provider_when_budget_cannot_reserve_context(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("token-budget")
+        value = json.loads(contract.read_text(encoding="utf-8"))
+        value["activation_budget_limit"] = 150
+        contract.write_text(json.dumps(value), encoding="utf-8")
+        calls = [
+            {"session_id": "child", "chunks": [
+                {"type": "usage", "usage": {"inputTokens": 70, "outputTokens": 20}},
+                {"type": "finish", "reason": {"kind": "stop"}},
+            ]},
+            {"session_id": "child", "chunks": [
+                {"type": "usage", "usage": {"inputTokens": 1, "outputTokens": 1}},
+                {"type": "finish", "reason": {"kind": "stop"}},
+            ]},
+        ]
+
+        result = self.invoke_dsh_native(
+            contract,
+            child_mode="token-budget",
+            context_window=100,
+            llm_calls=calls,
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"], {
+            "code": "DSH_CHILD_TOKEN_BUDGET_EXHAUSTED",
+            "message": "DSH child activation token budget exhausted",
+        })
+        self.assertEqual(result["telemetry"]["provider_calls"], 1)
+        self.assertEqual(response["result"]["usage"], {
+            "input_tokens": 70,
+            "cached_input_tokens": 0,
+            "output_tokens": 20,
+            "total_tokens": 90,
+        })
+        self.assertTrue(response["result"]["usage_complete"])
+        self.assertEqual(response["result"]["artifacts"], [{
+            "schema_version": 1,
+            "kind": "dsh-activation-budget-exhausted",
+            "source": "dsh-host-llm-stream-ledger",
+            "reason_code": "insufficient-context-window-reservation",
+            "limit_tokens": 150,
+            "charged_tokens": 90,
+            "remaining_tokens": 60,
+            "required_reservation_tokens": 100,
+            "provider_request_started": False,
+        }])
+
+    def test_public_host_charges_one_unmetered_success_from_its_exact_reservation(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("ledger-missing-usage")
+
+        result = self.invoke_dsh_native(
+            contract,
+            child_mode="ledger-missing-usage",
+            llm_calls=[{"session_id": "child", "chunks": [
+                {"type": "finish", "reason": {"kind": "stop"}},
+            ]}],
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        receipt = result["value"]["dsh_result"]
+        self.assertEqual(receipt["usage"], {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        })
+        self.assertFalse(receipt["usage_observed"])
+        self.assertFalse(receipt["usage_complete"])
+        self.assertEqual(receipt["budget_charge_tokens"], 100)
+        self.assertEqual(
+            receipt["budget_charge_basis"],
+            "dsh-host-attested-actual-or-registration-context-reservation-v1",
+        )
+        self.assertEqual(receipt["unmetered_attempts"], 1)
+        self.assertEqual(receipt["metered_attempt_tokens"], 0)
+        self.assertEqual(receipt["unmetered_reservation_tokens"], 100)
+        self.assertEqual(result["telemetry"]["provider_calls"], 1)
+
+    def test_public_host_does_not_close_ledger_before_dsh_retry(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("retry-after-unmetered-timeout")
+        calls = [
+            {"session_id": "child", "chunks": [{
+                "type": "finish",
+                "reason": {"kind": "error", "failure": {
+                    "message": "DeepSeek stream idle timeout after 300000ms",
+                    "code": "TIMEOUT",
+                }},
+            }]},
+            {"session_id": "child", "chunks": [
+                {"type": "usage", "usage": {
+                    "inputTokens": 11,
+                    "cacheReadTokens": 3,
+                    "cacheWriteTokens": 2,
+                    "outputTokens": 7,
+                }},
+                {"type": "finish", "reason": {"kind": "stop"}},
+            ]},
+        ]
+
+        result = self.invoke_dsh_native(
+            contract,
+            child_mode="retry-after-unmetered-timeout",
+            llm_calls=calls,
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        receipt = result["value"]["dsh_result"]
+        self.assertEqual(receipt["usage"], {
+            "input_tokens": 11,
+            "cached_input_tokens": 5,
+            "output_tokens": 7,
+            "total_tokens": 23,
+        })
+        self.assertTrue(receipt["usage_observed"])
+        self.assertFalse(receipt["usage_complete"])
+        self.assertEqual(receipt["budget_charge_tokens"], 123)
+        self.assertEqual(
+            receipt["budget_charge_basis"],
+            "dsh-host-attested-actual-or-registration-context-reservation-v1",
+        )
+        self.assertEqual(receipt["unmetered_attempts"], 1)
+        self.assertEqual(receipt["metered_attempt_tokens"], 23)
+        self.assertEqual(receipt["unmetered_reservation_tokens"], 100)
+        self.assertEqual(result["telemetry"]["provider_calls"], 2)
+        self.assertEqual(
+            result["telemetry"]["streamed_calls"][1]["chunks"][-1],
+            {"type": "finish", "reason": {"kind": "stop"}},
+        )
+
+    def test_public_host_reserves_a_larger_registration_bound_context_window(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("token-budget-context-growth")
+        value = json.loads(contract.read_text(encoding="utf-8"))
+        value["activation_budget_limit"] = 220
+        contract.write_text(json.dumps(value), encoding="utf-8")
+        calls = [
+            {"session_id": "child", "chunks": [
+                {"type": "usage", "usage": {"inputTokens": 70, "outputTokens": 20}},
+                {"type": "finish", "reason": {"kind": "stop"}},
+            ]},
+            {"session_id": "child", "chunks": [
+                {"type": "usage", "usage": {"inputTokens": 1, "outputTokens": 1}},
+                {"type": "finish", "reason": {"kind": "stop"}},
+            ]},
+        ]
+
+        result = self.invoke_dsh_native(
+            contract,
+            child_mode="token-budget",
+            context_windows=[100, 150],
+            llm_calls=calls,
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_CHILD_TOKEN_BUDGET_EXHAUSTED")
+        self.assertEqual(result["telemetry"]["provider_calls"], 1)
+        receipt = response["result"]["artifacts"][0]
+        self.assertEqual(receipt["limit_tokens"], 220)
+        self.assertEqual(receipt["charged_tokens"], 90)
+        self.assertEqual(receipt["remaining_tokens"], 130)
+        self.assertEqual(receipt["required_reservation_tokens"], 150)
+
     def test_public_host_rejects_fixed_task_phase_drift_before_child_start(self) -> None:
         self.prepare_dsh_native_core()
         candidate = self.workspace / "candidate.py"
@@ -1574,6 +2610,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         provider_code: str = "QUOTA",
         provider_status: int = 429,
         expected_usage: dict[str, int] | None = None,
+        expected_usage_observed: bool = True,
     ) -> None:
         contract = self.write_dsh_failure_contract(mode)
         result = self.invoke_dsh_native(contract, child_mode=mode)
@@ -1589,7 +2626,9 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             "output_tokens": 6,
             "total_tokens": 76,
         })
-        self.assertTrue(response["result"]["usage_observed"])
+        self.assertEqual(
+            response["result"]["usage_observed"], expected_usage_observed
+        )
         self.assertFalse(response["result"]["usage_complete"])
         return response
 
@@ -1648,8 +2687,9 @@ class KerSorEvolvePluginTests(unittest.TestCase):
                 "workspace-root search is unavailable",
                 telemetry["scoped_tool_descriptions"][broad_search],
             )
-        for forbidden in ("edit", "write", "bash", "subagent", "workflow", "kersor_evolve"):
+        for forbidden in ("edit", "write", "bash", "workflow", "kersor_evolve"):
             self.assertIn("read-only", telemetry["guards"][forbidden])
+        self.assertIn("did not request native advisers", telemetry["guards"]["subagent"])
         for escaped in ("read_outside", "glob_outside", "grep_symlink_escape", "glob_parent_pattern"):
             self.assertIsNotNone(telemetry["guards"][escaped])
         for control in ("read_control", "glob_control", "grep_control"):
@@ -1945,6 +2985,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
                 "output_tokens": 0,
                 "total_tokens": 0,
             },
+            expected_usage_observed=False,
         )
 
     def test_public_host_requires_prior_canonical_assistant_output_for_terminal_quota(self) -> None:
@@ -2320,6 +3361,184 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             )
         self.assertEqual(candidate.read_text(encoding="utf-8"), "baseline = True\n")
         self.assertEqual(undeclared.read_text(encoding="utf-8"), "protected = True\n")
+
+    def test_public_host_keeps_a_proven_unexecuted_mutation_nonterminal(
+        self,
+    ) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        denied = self.workspace / "SECRET_DENIED_HELPER_PATH.py"
+        contract = self.write_transaction_probe_contract(
+            candidate,
+            "denied-mutation-receipt",
+            capture_error=True,
+        )
+
+        result = self.invoke_dsh_native(
+            contract,
+            child_mode="denied-mutation",
+            transaction_artifact=candidate,
+            undeclared_artifact=denied,
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "completed", result)
+        receipt = result["value"]["dsh_result"]
+        self.assertEqual(
+            receipt["output"],
+            [{"type": "text", "text": "DSH route probe completed"}],
+        )
+        self.assertEqual(receipt["structured"], {"observed": True})
+        self.assertEqual(receipt["stop_reason"], "completed")
+        self.assertTrue(receipt["usage_observed"])
+        self.assertTrue(receipt["usage_complete"])
+        self.assertEqual(receipt["artifacts"], [])
+        self.assertIn("declared transaction artifact", result["telemetry"]["no_call_id_guard_result"])
+        self.assertIn("declared transaction artifact", result["telemetry"]["actual_guard_result"])
+        self.assertIn("declared transaction artifact", result["telemetry"]["second_guard_result"])
+        self.assertNotIn(str(denied), json.dumps(result))
+        self.assertFalse(denied.exists())
+
+    def test_public_host_requires_durable_error_result_for_denied_mutation_receipt(
+        self,
+    ) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        denied = self.workspace / "helper.py"
+        for child_mode in (
+            "denied-mutation-missing-result",
+            "denied-mutation-nonerror-result",
+        ):
+            with self.subTest(child_mode=child_mode):
+                contract = self.write_transaction_probe_contract(
+                    candidate,
+                    child_mode,
+                    capture_error=True,
+                )
+                result = self.invoke_dsh_native(
+                    contract,
+                    child_mode=child_mode,
+                    transaction_artifact=candidate,
+                    undeclared_artifact=denied,
+                )
+
+                self.assertTrue(result["ok"], result.get("error"))
+                response = result["value"]["dsh_response"]
+                self.assertFalse(response["ok"])
+                self.assertEqual(response["error"]["code"], "DSH_CHILD_EVIDENCE_INVALID")
+                self.assertNotEqual(response["error"]["code"], "DSH_MUTATION_PERMISSION_DENIED")
+                self.assertEqual(response["result"]["artifacts"], [])
+
+    def test_public_host_requires_complete_usage_before_denied_mutation_receipt(
+        self,
+    ) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        denied = self.workspace / "helper.py"
+        contract = self.write_transaction_probe_contract(
+            candidate,
+            "denied-mutation-usage-incomplete",
+            capture_error=True,
+        )
+
+        result = self.invoke_dsh_native(
+            contract,
+            child_mode="denied-mutation-usage-incomplete",
+            transaction_artifact=candidate,
+            undeclared_artifact=denied,
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error"], {
+            "code": "DSH_CHILD_USAGE_INCOMPLETE",
+            "message": "DSH child did not publish complete observed token usage",
+        })
+        self.assertNotEqual(response["error"]["code"], "DSH_MUTATION_PERMISSION_DENIED")
+        self.assertEqual(response["result"]["output"], [])
+        self.assertIsNone(response["result"]["structured"])
+        self.assertEqual(response["result"]["stop_reason"], "completed")
+        self.assertFalse(response["result"]["usage_complete"])
+        self.assertEqual(response["result"]["artifacts"], [])
+
+    def test_public_host_attests_denied_mutation_after_one_unmetered_retry(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        denied = self.workspace / "helper.py"
+        contract = self.write_transaction_probe_contract(
+            candidate,
+            "denied-mutation-unmetered-retry",
+            capture_error=True,
+        )
+        calls = [
+            {"session_id": "child", "chunks": [{
+                "type": "finish",
+                "reason": {"kind": "error", "failure": {
+                    "message": "DeepSeek stream idle timeout after 300000ms",
+                    "code": "TIMEOUT",
+                }},
+            }]},
+            {"session_id": "child", "chunks": [
+                {"type": "usage", "usage": {
+                    "inputTokens": 11,
+                    "cacheReadTokens": 3,
+                    "cacheWriteTokens": 2,
+                    "outputTokens": 7,
+                }},
+                {"type": "finish", "reason": {"kind": "stop"}},
+            ]},
+        ]
+
+        result = self.invoke_dsh_native(
+            contract,
+            child_mode="denied-mutation-unmetered-retry",
+            transaction_artifact=candidate,
+            undeclared_artifact=denied,
+            llm_calls=calls,
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        response = result["value"]["dsh_response"]
+        self.assertEqual(response["error"]["code"], "DSH_CHILD_USAGE_INCOMPLETE")
+        self.assertEqual(response["result"]["budget_charge_tokens"], 123)
+        self.assertEqual(response["result"]["metered_attempt_tokens"], 23)
+        self.assertEqual(response["result"]["unmetered_reservation_tokens"], 100)
+        self.assertEqual(response["result"]["unmetered_attempts"], 1)
+        self.assertEqual(
+            response["result"]["budget_charge_basis"],
+            "dsh-host-attested-actual-or-registration-context-reservation-v1",
+        )
+
+    def test_public_host_keeps_denied_reads_and_ordinary_tool_errors_nonterminal(
+        self,
+    ) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        for child_mode in ("denied-read", "denied-glob", "allowed-edit-error"):
+            with self.subTest(child_mode=child_mode):
+                contract = self.write_transaction_probe_contract(
+                    candidate,
+                    f"nonterminal-{child_mode}",
+                )
+                result = self.invoke_dsh_native(
+                    contract,
+                    child_mode=child_mode,
+                    transaction_artifact=candidate,
+                )
+
+                self.assertTrue(result["ok"], result.get("error"))
+                self.assertEqual(result["value"]["status"], "completed", result)
+                self.assertEqual(result["value"]["dsh_result"]["artifacts"], [])
+                if child_mode == "allowed-edit-error":
+                    self.assertIsNone(result["telemetry"]["actual_guard_result"])
+                else:
+                    self.assertIsInstance(result["telemetry"]["actual_guard_result"], str)
 
     def test_public_host_rechecks_the_actual_write_path_after_cwd_alias_drift(self) -> None:
         self.prepare_dsh_native_core()
@@ -3178,6 +4397,20 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self.assertEqual(result["conclude_count"], 0)
         self.assertIn("only one call per top-level DSH session", result["error"])
         self.assertFalse(marker.exists(), "second durable call reached the bridge")
+
+    def test_durable_command_history_blocks_a_tool_launch_after_restart(self) -> None:
+        marker = self.workspace / "bridge-launched"
+        contract = self.write_contract(status="completed", launch_marker=str(marker))
+
+        result, _ = self.invoke(
+            {"contract": str(contract)},
+            historical_command=True,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["conclude_count"], 0)
+        self.assertIn("only one call per top-level DSH session", result["error"])
+        self.assertFalse(marker.exists(), "tool launch bypassed durable command claim")
 
     def test_fresh_top_level_session_can_resume_one_exact_run_directory(self) -> None:
         contract = self.write_contract(status="completed")

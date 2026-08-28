@@ -48,6 +48,23 @@ KERSOR_CONTROL_ENTRY = (
     "- id: kersor-control\n"
     "  name: '@deepseek-ai/dsh-kersor/control'"
 )
+STANDARD_SUBAGENT_ENTRY = (
+    "    - id: tool-subagent\n"
+    "      name: '@deepseek-ai/dsh-tool-subagent'\n"
+    "      config:\n"
+    "        provider: spawn\n"
+    "        toolName: subagent\n"
+    "        backgroundMode: continuable"
+)
+KERSOR_SUBAGENT_ENTRY = (
+    "    - id: tool-subagent\n"
+    "      name: '@deepseek-ai/dsh-tool-subagent'\n"
+    "      config:\n"
+    "        provider: spawn\n"
+    "        toolName: subagent\n"
+    "        enableRunInBackground: false\n"
+    "        backgroundMode: one-shot"
+)
 RUNTIME_TOOL_NAMES = ("bash", "python3", "node", "jq", "codex", "claude")
 EXPECTED_OUTER_FILESYSTEM_POLICY = "workspace-write"
 MAX_MODEL_ID_LENGTH = 128
@@ -205,6 +222,11 @@ def render_composition(standard_source: str, *, skill_dir: Path) -> str:
             "standard preset skill-filesystem anchor changed; inspect the current "
             "DSH preset before updating this renderer"
         )
+    if standard_source.count(STANDARD_SUBAGENT_ENTRY) != 1:
+        raise RuntimeError(
+            "standard preset subagent anchor changed; inspect the current DSH preset "
+            "before updating this renderer"
+        )
     lines = standard_source.splitlines()
     if not lines:
         raise RuntimeError("standard preset is empty")
@@ -230,6 +252,11 @@ def render_composition(standard_source: str, *, skill_dir: Path) -> str:
             f"{TOOL_SKILL_ENTRY}\n\n{KERSOR_STATUS_ENTRY}\n\n"
             f"{KERSOR_EVOLVE_ENTRY}\n\n{KERSOR_CONTROL_ENTRY}"
         ),
+        1,
+    )
+    rendered = rendered.replace(
+        STANDARD_SUBAGENT_ENTRY,
+        KERSOR_SUBAGENT_ENTRY,
         1,
     )
     return rendered.rstrip("\n") + "\n"

@@ -34,7 +34,7 @@ CLAUDE_MUTATION_TOOLS = [*CLAUDE_READ_ONLY_TOOLS, "Edit", "Write"]
 EXPECTED_OUTER_FILESYSTEM_POLICY = "workspace-write"
 OUTER_SANDBOX_ENV = "KERSOR_CODEX_OUTER_SANDBOX"
 OUTER_SANDBOX_PROBE_PREFIX = ".kersor-outer-sandbox-probe-"
-DSH_RPC_PROTOCOL = "kersor-dsh-host-rpc-v1"
+DSH_RPC_PROTOCOL = "kersor-dsh-host-rpc-v3"
 DSH_RPC_SOCKET_ENV = "KERSOR_DSH_RPC_SOCKET"
 DSH_RPC_NONCE_ENV = "KERSOR_DSH_RPC_NONCE"
 DSH_RPC_MAX_FRAME_BYTES = 16 * 1024 * 1024
@@ -1009,6 +1009,7 @@ def evolve_parser() -> argparse.ArgumentParser:
     result.add_argument("--expected-contract-sha256")
     result.add_argument("--expected-runtime", choices=sorted(GENERIC_RUNTIMES))
     result.add_argument("--run-dir", type=Path)
+    result.add_argument("--predecessor-run", type=Path)
     result.add_argument("--resume", action="store_true")
     return result
 
@@ -1155,6 +1156,12 @@ def exec_evolve(root: Path, args: list[str]) -> None:
         ensure_autonomous_session(root, workspace, session, mission_id)
     if options.resume and options.run_dir is None:
         raise RuntimeError("generic evolve --resume requires --run-dir")
+    if options.predecessor_run is not None and (
+        version != "kersor-task-v1" or runtime != "dsh" or options.resume
+    ):
+        raise RuntimeError(
+            "generic evolve --predecessor-run requires a fresh runtime=dsh Fixed Task"
+        )
     evolve = root / "scripts" / "evolve.sh"
     bash = tools["bash"]
     if not evolve.is_file():
@@ -1177,6 +1184,19 @@ def exec_evolve(root: Path, args: list[str]) -> None:
                     "Task run-dir must be one direct child of workspace/.kersor"
                 )
         command.extend(("--run-dir", str(run_dir)))
+    if options.predecessor_run is not None:
+        lexical_predecessor = Path(
+            os.path.abspath(options.predecessor_run.expanduser())
+        )
+        if lexical_predecessor.is_symlink() or not lexical_predecessor.is_dir():
+            raise RuntimeError("Task predecessor run must be a physical directory")
+        predecessor_run = lexical_predecessor.resolve(strict=True)
+        require_descendant(predecessor_run, workspace, "Task predecessor run")
+        if predecessor_run.parent != (workspace / ".kersor").resolve():
+            raise RuntimeError(
+                "Task predecessor run must be one direct child of workspace/.kersor"
+            )
+        command.extend(("--predecessor-run", str(predecessor_run)))
     if options.resume:
         command.append("--resume")
     command.extend(("--expected-contract-sha256", contract_sha256))

@@ -87,6 +87,16 @@ STANDARD = """# The `standard` agent preset.
   name: '@deepseek-ai/dsh-skill-filesystem'
 - id: tool-skill
   name: '@deepseek-ai/dsh-tool-skill'
+- id: delegation
+  name: cordis:group
+  group: true
+  config:
+    - id: tool-subagent
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: spawn
+        toolName: subagent
+        backgroundMode: continuable
 """
 
 

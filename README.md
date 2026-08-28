@@ -170,6 +170,18 @@ python3 scripts/install.py \
 | 固定 HF 模型到 ApxInf 部署 | `kersor` adapter → KerSor `deploy-hf-model-to-apxinf` skill → 有限 dsh Mission 注册 | Host model／deployment gates、`result.json`、独立 verifier |
 | 状态、恢复、诊断 | child 调用 `kersor_status`；父对话用 `kersor_resume` 恢复同一 child | 当前磁盘 Session + 原 DSH child，不依赖聊天记忆 |
 
+`kersor-task-v1` 的 `native_subagents: 1..4` 在 DSH route 上创建有界 adviser
+树：每轮仍只有一个可写 primary Worker，但它会先启动指定数量的前台只读
+adviser。adviser 只能读取公开 workspace，不能写入、继续委派或后台遗留；
+KerSor preset 在 DSH 原生 `tool-subagent` 配置处关闭后台能力，因此模型侧 schema
+只保留 `description` 与 `prompt`，前台结算只有这一条权威路径；
+若 Guard 已用持久化 error result 证明越界写入从未执行，该次调用只作为普通工具
+错误留在对话中，不再回滚 Agent 随后对声明 artifact 作出的合法修改；缺失或伪造
+拒绝证据仍会 fail closed。
+所有 Agent 的 provider attempts 共用同一个 activation ledger，成功 receipt
+必须列出精确的 requested/spawned/completed 数量与 adviser Session ids。Host
+verifier、事务边界和总 token budget 不因多 Agent 而放宽。
+
 不要把 CUDA Workflow 硬套到 Python、VLIW、Verilog 或普通工程任务。任务类型不匹配时，稳定 `optimize` 路径应先确定性拒绝不兼容的已发布 Workflow，再通过有界 workflow authoring 创作 task-native Proposal；workflow evolution 只属于显式 research runner。任务自己的测试命令始终是唯一验收门。
 
 自定义模拟器任务的推荐入口：
@@ -209,15 +221,27 @@ parent 代写、字段不规范、integration pattern 漂移或 seal 后修改�
 
 在 DSH 中新建 task 并选择 `KerSor` preset。遇到 kernel 优化、通用本地任务演化、KerSor 状态或恢复请求时，加载 `kersor` skill。skill 会读取 KerSor checkout 中当前的 `AGENTS.md` 与 command protocol；KerSor 仓库仍是行为和参数的唯一权威来源。
 
+已经冻结合同的通用任务不需要先请求模型决定是否启动。在 composer 直接输入 `/kersor-evolve {"contract":"/absolute/path/to/task.json","runtime":"dsh"}`；DSH human-command plane 会在同一 Session 记录 `command/run` 与 `command/done`，并直接进入相同的 Host launcher。模型可见的 `kersor_evolve` tool 继续服务于自然语言任务先由 agent 冻结合同时的兼容路径。两条入口共享验证、RPC、预算与唯一 Session claim，不形成第二个执行实现。
+
 通用任务与优化控制面是两条独立路径。自然语言通用请求由 agent 先只读分析工作区，再把最小权限、Completion 和既有确定性 verifier 冻结到工作区内的 `kersor-task-v1` 或 `kersor-mission-v1`。固定 Task 和 Mission 的 DSH-native 路径都由 Host 侧 `kersor_evolve` 接管；只有用户明确要求外部 Codex Task 时才保留 workspace-confined bridge 与外层写权限证明。`kersor_evolve` 必须是该回合第一且唯一执行动作；它从安装目录冻结 Python 和 bridge、以前台进程处理取消和有界输出，只接受当前顶层 DSH 工作区内的绝对合同路径，或固定 Task 的规范同级 `task.json`，并只返回唯一 JSON terminal。DSH 的每次 activation 和 Host evaluator 分别拥有自己的有界超时；canonical DSH activation 的默认值与上限均为 3600 秒（60 分钟），Host evaluator 仍保持独立的最多 120 秒上限。外层进程不再叠加一个会在后续 round 中误杀正常 Core 工作流的静态短 watchdog。一次有效调用会接管本回合：同一回合中模型已提交的后续工具也由单调 guard 在执行前拒绝；非取消异常被投影为 `status=failed` 业务终态并结束回合，不能由模型改写合同后重试。DSH 的 `turn/end=completed` 只表示该模型回合已结束；只有 `kersor_evolve` 的 Host-owned status 与 Core 终态证据均为 `completed` 时才算成功。DSH Host 还会从受信 Core activation 的规范 phase 推导 `planner`／`worker` 角色，拒绝调用方自报角色，避免成本与轨迹统计错标。外壳启动会 fail closed，避免继承调用 agent 的嵌套 Seatbelt；安装记录的 KerSor core 也必须物理位于工作区外，Host tool 与 bridge 会分别复核。安装器会把当时可信的 Bash／Python／Node／jq 以及 Codex／Claude 可执行文件绝对路径、可选的 Codex auth home 路径写入 preset 私有清单（不复制凭据）；generic bridge 仍会完整校验安装记录 checkout、合同 hash、runtime config、Session 身份与权限。材料化器可以把匹配的可信 runtime config 复制到任务目录，但 bridge 只接受与对应安装配置逐字节相同、常规、单链接且 inode 独立的副本，并在 launch 时再次绑定预期 SHA-256。
+
+Fixed Task 正常终态会由 Core 在 run 内保存不可变 `candidate-snapshot/`。Suite reset 后，新 Session 可在 slash-command JSON 或 tool args 中增加 `"predecessor_run":"/absolute/workspace/.kersor/<run>"`，创建 fresh successor；Host 会验证旧 Task、output、manifest 与 blob 后恢复候选，旧 run 保持只读。`resume:true` 仍只恢复同一个中断 run，不能与 `predecessor_run` 同时使用。
 
 仅固定 Task 的 Codex shell 路径会用唯一、必清理的 `O_EXCL` 文件证明 workspace 可写且 HOME 根不可写，并在证明与安装记录一致时发布 `KERSOR_CODEX_OUTER_SANDBOX=workspace-write`。Host 的 DSH-native Task 与 Mission 路径都不发布该 marker，也不依赖外层证明；其每个不可信 agent 与 evaluator 都必须由 core 的 canonical config 和 Host 在每次 activation 建立匹配路由的隔离边界。Host 与 core 子进程环境都从空 allowlist 构造，只发布冻结的 HOME／TMP／PATH 与必要 KerSor 路由；不会继承 AWS、GitHub、SSH、OpenAI 或其他 ambient token。Codex 可使用冻结 HOME 中的本地 CLI 登录；Claude-compatible 路径可由安装时冻结的 wrapper 自行从 Host-owned 凭据存储加载路由与密钥。安装器还能冻结该路径的模型 ID，bridge 会把它作为 `KERSOR_CLAUDE_MODEL` 传给 core。canonical broker 仍精确要求 `filesystem_sandbox=required` 与 preflight。
 
 Host evaluator 必须使用 `command-v1` 的 `filesystem_policy: "read-only"`、`network_policy: "denied"`、`output_policy: "sealed"`，可选 timeout 必须在 `(0,120]`，可选输出上限必须在 `[1,4194304]`，且不得 `materialize`。安全的 standalone evaluator 由 Core 直接执行；若 agent capability 通过 `candidate_verifier` 引用 evaluator，该 evaluator 才额外要求不可重试、精确的 Host-owned 输出以及与候选事务逐字段绑定的 gate，多个候选 capability 可以共享同一个 evaluator。fact projection 也只能读取 `passed`、`exit_code`、`timed_out` 或 `artifact_set_sha256`，不能投影 stdout／stderr／解析输出。其 argv 与所有后代进程会进入 fail-closed 的真实只读文件系统边界。外部 `runtime=codex|claude` 继续使用这些规则；Claude-compatible 路径只接受 KerSor canonical `config/runtime-claude-autonomous.json`，并依据 capability/transaction artifacts 在精确只读工具集与精确 mutation 工具集之间切换。
 
-DSH-native Mission 现在接受 `side_effect=none|read`，也接受由 Mission authority 准入、Core 活事务绑定的单文件 `side_effect=write` capability。planner 与只读 worker 仍只看见 `read/glob/grep`；只有 Execute worker 的事务激活才额外看见 `edit/write`，并且同步 guard 在每次执行处只允许声明 artifact 的规范相对路径或对应绝对路径。agent 可以在同一事务中多次编辑该文件，但不能写其他路径、路径别名、链接、`.git`／`.conformance`／`.kersor*`、冻结 Mission、runtime config 或任意 Session 控制树，也不能调用 Bash、subagent、Workflow 或递归 KerSor。Read 会拒绝所有 runtime control tree；`glob`／`grep` 必须从 proper non-control workspace descendant 开始，不能从 workspace root 枚举隐藏证据。每个 DSH child 的 scoped tool 描述会在首次模型请求前说明搜索限制与精确可写 artifact，并提示直接 read 已知根文件、搜索公开子目录，以及把下一轮失败证据交给 Host verifier，不能依靠失败结果传递 capability。若 capability 声明 `candidate_verifier`，完整 candidate gate、rollback 策略与 evaluator request 都必须和冻结 Mission 逐字段匹配；只读 `command-v1` evaluator 仍由 Core 在事务快照存活时执行，通过才提交，失败、断连、取消或非完成输出均由 Core 回滚。Host 与 bridge 继续用同一合同 SHA 和 runtime 绑定一次读取，core 只能通过 owner-only AF_UNIX RPC 请求激活；每个 child 固定为 `deepseek-official/kimi-k2.7-code`。Host 按 `(turn, step)` 折叠 durable `assistant/chunk(type=usage)` 与 `assistant/message`，同一步以后出现的样本覆盖早期样本，并在检查 requested structured output 之前先处理 durable terminal error。typed `DSH_CHILD_QUOTA` 只有两种可证明形态：fresh child 的首个且唯一未计量 step 可以产生 `usage_observed=false`、`usage_complete=true` 的全零 known-zero 收据；若 child 已完成至少一个连续、逐一闭合且各有权威 token meter 的先前 step，累计 usage 为正，而最后一个唯一未计量 step 严格以配额终态闭合，则收据保留先前累计 usage，并声明 `usage_observed=true`、`usage_complete=true`。known-zero 的 in-process result output 必须为空；已计量进展形态则要求该 output 与终末 step 之前最后一条非空 canonical `assistant/message.content` 规范 JSON 相同，且两者都不能有 structured result。完成该一致性证明后，Host 才为 Core 把 typed 收据规范化为 `output=[]`、`structured=null`。两种形态的 `finish` 与 `turn/end` failure 还必须规范 JSON 一致、raw machine code 逐字精确为 `QUOTA`（不修剪空白、不折叠大小写）、status 精确为 HTTP 429。每个顶层 DSH session 仍只能调用一次 `kersor_evolve`，失败、取消或 resume 都必须换新 session。
+DSH-native Mission 接受 `side_effect=none|read`，也接受由 Mission authority 准入、Core 活事务绑定的单文件 `side_effect=write` capability。Planner 与只读 worker 只看见 `read/glob/grep`；事务 Execute worker 才额外获得只指向声明 artifact 的 `edit/write`。路径别名、链接、控制树、Bash、delegation、Workflow 与递归 KerSor 都被拒绝，candidate verifier 仍由 Core 在活快照内执行并决定提交或回滚。`kersor-dsh-host-rpc-v3` 还要求精确有限的 `activation_budget`：Host 只在 DSH registration-bound `llm/prepared-stream` seam 准入 provider 请求，按 actual dispatch 的 exact context window 预留，并把 main request、retry、自动 title 与 compaction 全部计入同一 child ledger。Retry step 累计每次 provider attempt；非 retry step 使用最终 message usage 或唯一 usage chunk。缺失／畸形 usage 不会冒充 actual usage，而是保留该 attempt 的完整 exact reservation 并继续限制后续准入。若 child 最终成功，且每个 attempt 都由 actual usage 或 reservation 覆盖、总 upper-bound charge 不超过 activation budget，Host 可继续提交 output；v3 receipt 同时保留 `usage_complete=false`，并暴露 `budget_charge_tokens`、固定 `dsh-host-attested-actual-or-registration-context-reservation-v1` basis 与正数 `unmetered_attempts`。Route／context integrity 失败仍立即 fail closed；下一次 reservation 放不下时会在 provider I/O 前返回 typed `DSH_CHILD_TOKEN_BUDGET_EXHAUSTED`。Typed `DSH_CHILD_QUOTA` 与 denied mutation 的严格门禁不变。每个顶层 DSH session 仍只能调用一次 `kersor_evolve`。
 
-两种配额特例都要求完整 child event log 的 `seq` 从 0 开始无间隙、fresh `turn=1` 的 step 从 1 连续且逐一闭合，并且 `turn/end` 是最后一个事件。known-zero 形态恰好只有 `step=1`；已计量进展形态的整个 lifecycle 不得有 retry，最后一步在 `step/start → QUOTA finish → step/end → turn/end` 中只能有该 finish，不能有 assistant output／message／usage 或 `tool/*`，所有先前 step 则必须逐一完整计量。合法的 inbox、user prompt、title 与 request metadata 可以位于这些边界之间。近似 code/status、重复或漂移的 turn／step、缺失／乱序边界、终态后事件、failure 不匹配、任一步出现 retry、最后一步出现 output／tool／usage、缺少先前 canonical assistant message、result output 与最后一条该 message 的 content 不一致，或任一先前 step 未完整计量，都会降级为普通 `DSH_CHILD_TERMINAL_ERROR` 与 incomplete usage，并保留原始 result output；Host 不会无条件丢弃它。即使最后一步观察到 usage，也不能把不再属于 pre-generation 的 QUOTA 证明为 complete。一般非配额 usage 只有在 lifecycle 有效且每个 step 都有权威 token meter 时才可声明完整；`blocked`、`aborted`、`interrupted` 分别投影为 `refusal`、`aborted`、`error`。
+DSH adapter registration 是 dispatch context window 的唯一 owner，经 nonce 认证的 personal Host 是预算计量 TCB；Core 不复制或重新推导 registration context。V3 receipt 的 `metered_attempt_tokens` 与 `unmetered_reservation_tokens` 是 Host attestation：Core 只校验两者之和等于 charge、reservation 覆盖未归入完整 attempt 的已观测 actual usage、正 context window 下界，以及 activation cap。若 denied mutation 发生时 actual usage 不完整，Host 会清空 output、保留真实 `stop_reason=completed`，并返回精确 `DSH_CHILD_USAGE_INCOMPLETE`；Core 将其作为不可纠正的 remote failure 处理，不进入 permission corrective round。
+
+同步 guard 拒绝首个 `edit`／`write` 时，即使 child 随后报告 completed，Host 也只在同一
+step 找到唯一 durable failed `tool/result` 后生成不含路径的
+`DSH_MUTATION_PERMISSION_DENIED`，清空 child output，再由 Core 回滚 transaction；固定
+Task 最多获得一次 bounded corrective round。被拒的 read/search，以及已允许 edit 的
+普通工具失败，仍只是同轮反馈，不触发该终态。
+
+Child execution event 的 `seq` 必须从 0 连续，fresh `turn=1` 的 step 从 1 逐一闭合，并由唯一 `turn/end` 关闭执行；清理期间只有 `session/title` metadata 可以跟在 terminal 后面，任何新的 assistant／tool／step／turn 事件仍使证据失效。Quota 终末 step 不允许 retry、output、tool 或 usage；近似 code/status、坐标漂移、failure 不匹配、result output 不一致或任一先前 step 未完整计量，都会降级为普通 incomplete `DSH_CHILD_TERMINAL_ERROR`。一般非配额 usage 只有在 lifecycle 与 prepared-stream ledger 一致时才完整；child deadline 使用 typed `DSH_CHILD_TIMEOUT`，`blocked`／`aborted`／`interrupted` 分别投影为 `refusal`／`aborted`／`error`。
 
 推荐提示词至少包含：
 

@@ -109,7 +109,12 @@ wrong.
   Make that foreground invocation the first and only shell action; do not
   pre-read its inputs, add environment assignments, background it, or poll it.
   An explicit Task run directory must be one direct child of
-  `workspace/.kersor`. Report the exact terminal JSON/status and stop.
+  `workspace/.kersor`. When the user explicitly continues a terminal Fixed
+  Task run after its candidate was reset, add that direct-child run as
+  `predecessor_run`; the Host verifies and restores its immutable candidate
+  snapshot into one fresh successor. Do not combine `predecessor_run` with
+  `resume`, which remains limited to the same interrupted run. Report the exact
+  terminal JSON/status and stop.
 - For a kernel file or task directory, preflight the direct route with `"${KERSOR_PYTHON:-python3}" "$bridge" compose optimize --path <path> --json`.
 - For a pinned Hugging Face model that must be ported and deployed through
   ApxInf, read `$kersor_root/skills/deploy-hf-model-to-apxinf/SKILL.md`
@@ -178,7 +183,14 @@ receives `edit`/`write`. A synchronous guard permits those mutation tools only
 for the exact declared artifact, so the worker may revise that file repeatedly
 without gaining arbitrary workspace write access. It denies aliases, links,
 KerSor control trees, the frozen Mission/runtime config/Session, Bash,
-subagents, Workflows, recursive KerSor, and paths outside the workspace. A
+Workflows, recursive KerSor, and paths outside the workspace. For a fixed Task
+with `native_subagents: 1..4`, the primary worker additionally receives the DSH
+`subagent` tool and must start exactly that many advisers before writing. The
+Host settles those calls in the foreground and omits background scheduling from
+the model-facing schema. Advisers are direct children of the
+primary, inherit the pinned route, expose only `read`/`glob`/`grep`, cannot
+delegate, and must all finish successfully. The primary remains the only writer.
+A
 child also cannot read `.git`, `.conformance`, `.kersor`, or
 `.kersor-autonomous`; `glob` and `grep` must name a proper non-control
 workspace descendant instead of searching the workspace root. Their scoped
@@ -186,46 +198,63 @@ tool descriptions state this before the first call and direct the worker to
 read known root files or search a public subdirectory. Transaction activations
 also name their exact writable artifacts and state that helper or scratch files
 are unavailable, so the worker leaves rejection and retry evidence to the Host.
+A denied mutation request is a recoverable tool error only when durable DSH
+history proves the guard returned an error before execution; the primary may
+then continue with the declared artifact. Missing or inconsistent denial
+evidence fails closed.
 A candidate verifier must be a non-retryable, sealed, read-only `command-v1` Host
 evaluator whose full request, rollback policy, and candidate gate match the
 frozen Mission; Core runs it while the snapshot is live and commits only an
 accepted candidate. Every activation still uses the owner-only AF_UNIX endpoint
 and a fresh DSH `spawn` child pinned to `deepseek-official/kimi-k2.7-code`.
-The Host folds durable usage chunks and assistant messages by `(turn, step)`,
-with the later sample replacing an earlier sample for that step, and processes
-the durable terminal before requiring structured output. Completeness requires
-the full child log to have contiguous `seq` values starting at zero, one fresh
-`turn=1`, consecutive closed steps starting at 1, and a final `turn/end` event.
-A typed `DSH_CHILD_QUOTA` has exactly two proof shapes. A first and only
-unmetered step may produce the known pre-usage receipt
-(`usage_observed=false`, `usage_complete=true`, all token counts zero). Or, after
-one or more completely metered prior steps with positive aggregate usage, one
-final unmetered step may preserve that cumulative usage and produce
-`usage_observed=true`, `usage_complete=true`. The known pre-usage shape requires
-empty in-process result output. The metered-progress shape instead requires that
-output to equal the canonical content of the last non-empty `assistant/message`
-before the terminal step. Neither shape permits a structured result. Only after
-that proof does the Host normalize the typed Core receipt to `output=[]` and
-`structured=null`. Both shapes also require canonically identical `finish` and
-`turn/end` failures whose raw machine code is exactly `QUOTA` (without whitespace
-trimming or case folding) and whose status is exactly HTTP 429. Neither proof shape
-admits retry activity anywhere in the lifecycle. The final quota step must close
-in `step/start -> finish -> step/end -> turn/end` order and contain no other
-assistant output/message/usage or `tool/*`. Inbox,
-user-message, title, and request-metadata events between lifecycle boundaries
-are permitted. Approximate code/status, duplicate or drifted coordinates,
-missing/reordered boundaries, post-terminal events, mismatched failures, any
-retry, final-step output/tool/usage, an absent prior canonical assistant message,
-result output that differs from its content, or any unmetered prior step remains
-a generic `DSH_CHILD_TERMINAL_ERROR` with incomplete usage and preserves the
-original result output. In particular, observing usage
-in the failing quota step does not prove a pre-generation terminal quota.
-General non-quota usage is complete only when every step has an authoritative
-token-meter sample. Durable `blocked`, `aborted`, and `interrupted` terminals
-map to `refusal`, `aborted`, and `error`; route drift, disconnect, cancellation,
-and unsafe transactions also fail closed and dispose the child. Use an external
-runtime for Mission mutation contracts that exceed the one-file capability
-rule; fixed Tasks may retain their declared multi-file artifact set.
+`kersor-dsh-host-rpc-v3` requires Core to supply one exact finite
+`activation_budget`. Before provider I/O, the Host admits only calls observed at
+DSH's registration-bound `llm/prepared-stream` seam and reserves the exact
+dispatch context window. DSH adapter registration is the sole owner of that
+window, and this nonce-authenticated personal Host is the budget-metering TCB;
+Core does not duplicate or rederive registration context. Primary-worker and
+adviser requests, retries, automatic title generation, and compaction for every
+Session in the bounded activation tree share one cumulative ledger. A retry step
+adds every provider attempt; a non-retry step uses its final message usage or
+single usage chunk. Missing or malformed usage retains the full reservation and
+marks episode usage incomplete, but does not itself close admission: a
+DSH-owned retry may start only when another exact context reservation fits. The
+Host may return a later successful child output only when every provider attempt
+is covered by either actual usage or its exact reservation and the conservative
+sum remains within the activation budget. That v3 receipt keeps
+`usage_complete=false` and exposes `budget_charge_tokens`, the fixed
+`dsh-host-attested-actual-or-registration-context-reservation-v1` basis, and a positive
+`unmetered_attempts`. `metered_attempt_tokens` and
+`unmetered_reservation_tokens` are the Host attestation. Core validates their
+arithmetic, observed-usage coverage, positive-window lower bound, and activation
+cap; it does not independently prove the registration-owned context. The receipt
+never relabels a reservation as actual usage. Route or
+context-integrity failures still close the ledger immediately. If the next context
+reservation does not fit, no provider call starts and the Host returns
+`DSH_CHILD_TOKEN_BUDGET_EXHAUSTED`; per-request `maxTokens` is not an episode
+budget.
+
+If the synchronous guard denies the first `edit` or `write`, a later completed
+child does not turn that denial into success. The Host requires one same-step
+durable failed `tool/result`, clears child output, and returns a path-free
+`DSH_MUTATION_PERMISSION_DENIED` receipt so Core rolls the transaction back. A
+fixed Task may use at most one bounded corrective round. Denied read/search
+calls and ordinary failures from an otherwise allowed edit remain in-turn
+feedback and do not produce this terminal.
+
+The durable execution log must have contiguous `seq` values, one fresh
+`turn=1`, consecutive closed steps, and one `turn/end`. Cleanup may append only
+`session/title` metadata after that terminal; a later assistant, tool, step, or
+turn event invalidates the receipt. A typed `DSH_CHILD_QUOTA` still has exactly
+two proofs: an all-zero first-step known quota, or positive completely metered
+prior progress followed by one unmetered terminal quota step. Both require exact
+raw `QUOTA`, HTTP 429, matching `finish`/`turn/end` failures, no retry, and no
+output/tool/usage in the terminal quota step. Anything approximate remains an
+incomplete `DSH_CHILD_TERMINAL_ERROR`. A child deadline returns typed
+`DSH_CHILD_TIMEOUT`; route drift, disconnect, cancellation, and unsafe
+transactions fail closed and dispose the child. Use an external runtime for
+Mission mutation contracts beyond the one-file capability rule; fixed Tasks
+may retain their declared multi-file artifact set.
 
 For `runtime=claude`, the bridge removes ambient `CLAUDE*`, `ANTHROPIC*`, and
 KerSor routing controls and publishes only the Claude-compatible executable and

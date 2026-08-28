@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 
 
 export const name = 'kersor-evolve'
-export const inject = ['tools', 'subagents']
+export const inject = ['tools', 'subagents', 'llm', 'commands']
 
 const PRESET_ROOT = fileURLToPath(new URL('..', import.meta.url))
 const BRIDGE = fileURLToPath(new URL('../bin/kersor_bridge.py', import.meta.url))
@@ -22,15 +22,28 @@ const DSH_MAX_ACTIVATION_TIMEOUT_SECONDS = 3600
 const DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 const MAX_CONTRACT_BYTES = 1024 * 1024
 const KILL_GRACE_MS = 2_000
-export const DSH_RPC_PROTOCOL = 'kersor-dsh-host-rpc-v1'
+export const DSH_RPC_PROTOCOL = 'kersor-dsh-host-rpc-v3'
 export const DSH_RPC_MAX_FRAME_BYTES = 16 * 1024 * 1024
 export const DSH_PROVIDER = 'deepseek-official'
 export const DSH_MODEL = 'kimi-k2.7-code'
+export const DSH_BUDGET_CHARGE_BASIS = 'dsh-host-attested-actual-or-registration-context-reservation-v1'
 const DSH_RPC_SOCKET_ENV = 'KERSOR_DSH_RPC_SOCKET'
 const DSH_RPC_NONCE_ENV = 'KERSOR_DSH_RPC_NONCE'
 const DSH_READ_TOOLS = Object.freeze(['read', 'glob', 'grep'])
 const DSH_WRITE_TOOLS = Object.freeze(['edit', 'write'])
+const DSH_ADVISER_TOOL = 'subagent'
+const DSH_MAX_NATIVE_SUBAGENTS = 4
+const DSH_DENIED_MUTATION_CALL_ID_MAX_BYTES = 256
+const DSH_CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/u
 const DSH_STRUCTURED_OUTPUT_TOOL = 'structured_output'
+const DSH_TOKEN_BUDGET_ERROR_CODE = 'DSH_CHILD_TOKEN_BUDGET_EXHAUSTED'
+const DSH_TOKEN_BUDGET_ERROR_MESSAGE = 'DSH child activation token budget exhausted'
+const DSH_TOKEN_BUDGET_FINISH_CODE = 'DSH_ACTIVATION_TOKEN_BUDGET_EXHAUSTED'
+const DSH_ACTIVATION_BUDGET_KEYS = Object.freeze([
+  'basis', 'limit_tokens', 'workflow_remaining_tokens',
+])
+const DSH_LLM_PURPOSES = new Set([undefined, 'session-title', 'compaction'])
+const DSH_BUDGET_RUNTIME = Symbol('kersor-evolve-dsh-budget-runtime')
 const DSH_ROOT_SEARCH_GUIDANCE = 'KerSor activation note: a workspace-root search is unavailable because Host control evidence shares that root. Read known root files directly, or set path to a specific public subdirectory.'
 const DSH_RETRY_EVENT_TYPES = new Set(['llm/retry', 'llm/retry-started'])
 const DSH_STEP_SCOPED_EVENT_TYPES = new Set([
@@ -55,6 +68,7 @@ const DSH_PRE_USAGE_QUOTA_EVENT_TYPES = new Set([
   'step/end',
   'turn/end',
 ])
+const DSH_POST_TERMINAL_METADATA_EVENT_TYPES = new Set(['session/title'])
 const MAX_RPC_CONNECTIONS = 64
 const MAX_RPC_ERROR_BYTES = 4_096
 const TERMINAL_STATUSES = new Set(['completed', 'blocked', 'waiting', 'failed'])
@@ -62,6 +76,7 @@ const DSH_RPC_ERROR = Symbol('kersor-dsh-rpc-error')
 const CLAIMED_SESSIONS = new WeakSet()
 const CLAIMED_TURNS = new WeakMap()
 const CHILD_POLICY = new AsyncLocalStorage()
+const COMMAND_NAME = 'kersor-evolve'
 
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -315,6 +330,350 @@ function childUsageBuckets(value) {
   }
 }
 
+function zeroUsage() {
+  return {
+    input_tokens: 0,
+    cached_input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+  }
+}
+
+function addUsage(target, increment) {
+  for (const key of ['input_tokens', 'cached_input_tokens', 'output_tokens', 'total_tokens']) {
+    target[key] = safeTokenCount(target[key] + increment[key], `aggregate ${key}`)
+  }
+}
+
+function sameUsage(left, right) {
+  return left.input_tokens === right.input_tokens
+    && left.cached_input_tokens === right.cached_input_tokens
+    && left.output_tokens === right.output_tokens
+    && left.total_tokens === right.total_tokens
+}
+
+function exactActivationBudget(value) {
+  if (!isRecord(value)) throw new Error('DSH RPC activation activation_budget must be an object')
+  const keys = Object.keys(value).sort()
+  if (
+    keys.length !== DSH_ACTIVATION_BUDGET_KEYS.length
+    || keys.some((key, index) => key !== DSH_ACTIVATION_BUDGET_KEYS[index])
+  ) {
+    throw new Error('DSH RPC activation activation_budget must contain only the exact budget fields')
+  }
+  if (
+    value.basis !== 'remaining-workflow-budget'
+    || !Number.isSafeInteger(value.limit_tokens)
+    || value.limit_tokens <= 0
+    || !Number.isSafeInteger(value.workflow_remaining_tokens)
+    || value.workflow_remaining_tokens !== value.limit_tokens
+  ) {
+    throw new Error('DSH RPC activation activation_budget must be one positive remaining-workflow-budget limit')
+  }
+  return {
+    basis: value.basis,
+    limitTokens: value.limit_tokens,
+    workflowRemainingTokens: value.workflow_remaining_tokens,
+  }
+}
+
+function exactPreUsageQuota(chunks, usage) {
+  if (usage !== null || chunks.length !== 1) return false
+  const finish = chunks[0]
+  const failure = finish?.type === 'finish' && finish.reason?.kind === 'error'
+    ? finish.reason.failure
+    : null
+  return isRecord(failure) && failure.code === 'QUOTA' && failure.status === 429
+}
+
+class DshActivationTokenLedger {
+  constructor({limitTokens, signal}) {
+    this.limitTokens = limitTokens
+    this.signal = signal
+    this.usage = zeroUsage()
+    this.conversationUsage = zeroUsage()
+    this.chargedTokens = 0
+    this.reservedTokens = 0
+    this.inFlight = 0
+    this.closed = false
+    this.poisoned = false
+    this.usageComplete = true
+    this.unmeteredAttempts = 0
+    this.meteredAttemptTokens = 0
+    this.unmeteredReservationTokens = 0
+    this.denial = null
+    this.waiters = new Set()
+  }
+
+  notify() {
+    for (const resolve of this.waiters) resolve()
+    this.waiters.clear()
+  }
+
+  close() {
+    this.closed = true
+    this.notify()
+  }
+
+  poison() {
+    this.poisoned = true
+    this.close()
+  }
+
+  async waitForSettlement(signal) {
+    if (signal?.aborted) throw signal.reason ?? new Error('DSH model request was aborted')
+    await new Promise((resolve, reject) => {
+      const done = () => {
+        signal?.removeEventListener('abort', aborted)
+        this.waiters.delete(done)
+        resolve()
+      }
+      const aborted = () => {
+        this.waiters.delete(done)
+        reject(signal.reason ?? new Error('DSH model request was aborted'))
+      }
+      this.waiters.add(done)
+      signal?.addEventListener('abort', aborted, {once: true})
+      if (signal?.aborted) aborted()
+    })
+  }
+
+  async admit(signal, currentContextWindow) {
+    const requiredTokens = currentContextWindow
+    while (true) {
+      if (this.poisoned) return {kind: 'closed'}
+      if (this.closed) return {kind: this.denial === null ? 'closed' : 'denied'}
+      const unreserved = this.limitTokens - this.chargedTokens - this.reservedTokens
+      if (unreserved >= requiredTokens) {
+        this.reservedTokens += requiredTokens
+        this.inFlight += 1
+        return {kind: 'admitted', reservedTokens: requiredTokens}
+      }
+      if (this.limitTokens - this.chargedTokens < requiredTokens) {
+        this.denial = {
+          limitTokens: this.limitTokens,
+          requiredReservationTokens: requiredTokens,
+        }
+        this.close()
+        return {kind: 'denied'}
+      }
+      await this.waitForSettlement(signal)
+    }
+  }
+
+  settle(reservation, {usage, complete, purpose}) {
+    this.reservedTokens = safeTokenCount(
+      this.reservedTokens - reservation.reservedTokens,
+      'remaining reserved tokens',
+    )
+    this.inFlight = safeTokenCount(this.inFlight - 1, 'in-flight request count')
+    if (usage !== null) {
+      addUsage(this.usage, usage)
+      if (purpose === undefined) addUsage(this.conversationUsage, usage)
+    }
+    if (complete) {
+      this.meteredAttemptTokens = safeTokenCount(
+        this.meteredAttemptTokens + (usage?.total_tokens ?? 0),
+        'metered attempt tokens',
+      )
+      this.chargedTokens = safeTokenCount(
+        this.chargedTokens + (usage?.total_tokens ?? 0),
+        'charged tokens',
+      )
+    } else {
+      this.unmeteredReservationTokens = safeTokenCount(
+        this.unmeteredReservationTokens + reservation.reservedTokens,
+        'unmetered reservation tokens',
+      )
+      this.chargedTokens = safeTokenCount(
+        this.chargedTokens + Math.max(
+          reservation.reservedTokens,
+          usage?.total_tokens ?? 0,
+        ),
+        'conservative charged tokens',
+      )
+      this.usageComplete = false
+      this.unmeteredAttempts += 1
+    }
+    this.notify()
+  }
+
+  async drain() {
+    while (this.inFlight > 0) await this.waitForSettlement()
+  }
+
+  snapshot() {
+    if (this.inFlight !== 0) throw new Error('DSH activation token ledger is not quiescent')
+    return {
+      usage: {...this.usage},
+      conversationUsage: {...this.conversationUsage},
+      usageObserved: this.usage.total_tokens > 0,
+      usageComplete: this.usageComplete && !this.poisoned,
+      chargedTokens: this.chargedTokens,
+      unmeteredAttempts: this.unmeteredAttempts,
+      meteredAttemptTokens: this.meteredAttemptTokens,
+      unmeteredReservationTokens: this.unmeteredReservationTokens,
+      poisoned: this.poisoned,
+      denial: this.denial === null ? null : {...this.denial},
+    }
+  }
+}
+
+function budgetFailureStream(message, code = DSH_TOKEN_BUDGET_FINISH_CODE) {
+  return (async function* () {
+    yield {type: 'finish', reason: {kind: 'error', failure: {message, code}}}
+  })()
+}
+
+function createDshBudgetRuntime(ctx) {
+  if (ctx.llm.preparedStreamVersion !== 1) {
+    throw new Error('KerSor DSH Host requires llm prepared-stream admission v1')
+  }
+  const sessions = new Map()
+  ctx.on('llm/prepared-stream', (call, next) => {
+    const options = call?.options
+    const entry = sessions.get(String(options?.sessionId ?? ''))
+    if (entry === undefined) return next()
+    const ledger = entry.ledger
+    if (
+      options.provider !== DSH_PROVIDER
+      || options.model !== DSH_MODEL
+      || !DSH_LLM_PURPOSES.has(options.purpose)
+    ) {
+      ledger.poison()
+      return budgetFailureStream(
+        'KerSor DSH activation attempted an unpinned model route or purpose',
+        'DSH_ACTIVATION_MODEL_ROUTE_INVALID',
+      )
+    }
+    return (async function* () {
+      const currentContextWindow = call?.context?.contextWindow
+      if (!Number.isSafeInteger(currentContextWindow) || currentContextWindow <= 0) {
+        ledger.poison()
+        yield* budgetFailureStream(
+          'KerSor DSH activation requires a positive exact model context window',
+          'DSH_ACTIVATION_MODEL_CONTEXT_INVALID',
+        )
+        return
+      }
+      const reservation = await ledger.admit(
+        options.signal ?? ledger.signal,
+        currentContextWindow,
+      )
+      if (reservation.kind === 'denied') {
+        yield* budgetFailureStream(DSH_TOKEN_BUDGET_ERROR_MESSAGE)
+        return
+      }
+      if (reservation.kind !== 'admitted') {
+        yield* budgetFailureStream('KerSor DSH activation model ledger is closed', 'ABORTED')
+        return
+      }
+      let usage = null
+      let valid = true
+      let finishCount = 0
+      let sawFinish = false
+      const chunks = []
+      try {
+        for await (const chunk of next()) {
+          chunks.push(chunk)
+          if (chunk?.type === 'usage') {
+            if (usage !== null || sawFinish) {
+              valid = false
+            } else {
+              try {
+                usage = childUsageBuckets(chunk.usage)
+              } catch {
+                valid = false
+              }
+            }
+          } else if (chunk?.type === 'finish') {
+            finishCount += 1
+            sawFinish = true
+          } else if (sawFinish) {
+            valid = false
+          }
+          yield chunk
+        }
+      } catch (error) {
+        valid = false
+        throw error
+      } finally {
+        const knownZeroQuota = valid && finishCount === 1 && exactPreUsageQuota(chunks, usage)
+        const complete = valid
+          && finishCount === 1
+          && (knownZeroQuota || (
+            usage !== null && usage.total_tokens <= reservation.reservedTokens
+          ))
+        ledger.settle(reservation, {
+          usage: knownZeroQuota ? null : usage,
+          complete,
+          purpose: options.purpose,
+        })
+      }
+    })()
+  }, {global: true})
+  return {
+    create({activationBudget, signal}) {
+      return new DshActivationTokenLedger({
+        limitTokens: activationBudget.limitTokens,
+        signal,
+      })
+    },
+    bind(policy, agent) {
+      const id = String(agent.id ?? '')
+      if (!id || sessions.has(id)) throw new Error('DSH activation child identity is unavailable or reused')
+      if (policy.primaryAgent === null) {
+        policy.primaryAgent = agent
+        policy.activationAgents.set(id, agent)
+        sessions.set(id, {agent, ledger: policy.ledger, policy})
+        return 'primary'
+      }
+      if (agent.session?.header?.parentSession !== policy.primaryAgent.id) {
+        throw new Error('DSH activation adviser must be a direct child of the primary worker')
+      }
+      if (policy.advisers.size >= policy.nativeSubagents) {
+        throw new Error('DSH activation published more advisers than native_subagents permits')
+      }
+      policy.advisers.set(id, {
+        agent,
+      })
+      policy.activationAgents.set(id, agent)
+      sessions.set(id, {agent, ledger: policy.ledger, policy})
+      return 'adviser'
+    },
+    assertBound(policy, agent) {
+      const entry = sessions.get(String(agent?.id ?? ''))
+      if (policy.primaryAgent !== agent || entry?.agent !== agent || entry.ledger !== policy.ledger) {
+        throw new Error('DSH spawn child token ledger binding is invalid')
+      }
+    },
+    policyFor(agent) {
+      const parentId = String(agent?.session?.header?.parentSession ?? '')
+      if (!parentId) return undefined
+      const parent = sessions.get(parentId)
+      return parent?.policy?.primaryAgent?.id === parentId ? parent.policy : undefined
+    },
+    async close(policy, run) {
+      policy.ledger.close()
+      let disposalError = null
+      try {
+        if (run !== undefined) await run.dispose()
+      } catch (error) {
+        disposalError = error
+      }
+      try {
+        await policy.ledger.drain()
+      } finally {
+        for (const [id, agent] of policy.activationAgents) {
+          const entry = sessions.get(id)
+          if (entry?.agent === agent && entry.ledger === policy.ledger) sessions.delete(id)
+        }
+      }
+      if (disposalError !== null) throw disposalError
+    },
+  }
+}
+
 function childStepOrNull(value) {
   if (
     !isRecord(value)
@@ -406,6 +765,10 @@ function childLifecycle(events) {
   for (const [ordinal, event] of events.entries()) {
     if (!Number.isSafeInteger(event?.seq) || event.seq !== ordinal) valid = false
     const type = event?.type
+    if (terminal !== null) {
+      if (!DSH_POST_TERMINAL_METADATA_EVENT_TYPES.has(type)) valid = false
+      continue
+    }
     if (type === 'assistant/chunk' || type === 'assistant/message') assistantEvents.push(event)
     if (DSH_RETRY_EVENT_TYPES.has(type)) retryEvents.push(event)
 
@@ -488,7 +851,6 @@ function childLifecycle(events) {
         || openTurn === null
         || turn !== openTurn
         || openStep !== null
-        || ordinal !== events.length - 1
       ) {
         valid = false
       }
@@ -518,50 +880,64 @@ function childLifecycle(events) {
   }
 }
 
+function conversationUsageEvidence(events) {
+  const steps = new Map()
+  const retried = new Set()
+  const meteredSteps = new Set()
+  let complete = true
+  for (const event of events) {
+    const position = childStepOrNull(event?.data)
+    if (position === null) continue
+    if (DSH_RETRY_EVENT_TYPES.has(event.type)) retried.add(position.key)
+    let rawUsage
+    let source
+    if (event.type === 'assistant/chunk' && event.data?.chunk?.type === 'usage') {
+      rawUsage = event.data.chunk.usage
+      source = 'chunk'
+    } else if (event.type === 'assistant/message' && event.data?.usage !== undefined) {
+      rawUsage = event.data.usage
+      source = 'message'
+    } else {
+      continue
+    }
+    let usage
+    try {
+      usage = childUsageBuckets(rawUsage)
+    } catch {
+      complete = false
+      continue
+    }
+    meteredSteps.add(position.key)
+    const step = steps.get(position.key) ?? {chunks: [], message: null}
+    if (source === 'chunk') step.chunks.push(usage)
+    else step.message = usage
+    steps.set(position.key, step)
+  }
+  const usage = zeroUsage()
+  for (const [key, step] of steps) {
+    if (retried.has(key)) {
+      if (step.chunks.length === 0) complete = false
+      for (const sample of step.chunks) addUsage(usage, sample)
+      continue
+    }
+    if (step.message !== null) {
+      addUsage(usage, step.message)
+      continue
+    }
+    if (step.chunks.length !== 1) {
+      complete = false
+      continue
+    }
+    addUsage(usage, step.chunks[0])
+  }
+  return {usage, complete, meteredSteps}
+}
+
 function childEvidence(agent, result) {
   const events = agent?.session?.events
   if (!Array.isArray(events)) throw new Error('DSH child did not expose a durable Session event log')
   const lifecycle = childLifecycle(events)
-  const usageByStep = new Map()
-  for (const [ordinal, event] of events.entries()) {
-    const seq = event?.seq
-    const seqUsable = Number.isSafeInteger(seq) && seq >= 0
-    let rawUsage
-    if (event?.type === 'assistant/chunk' && event?.data?.chunk?.type === 'usage') {
-      rawUsage = event.data.chunk.usage
-    } else if (event?.type === 'assistant/message' && event?.data?.usage !== undefined) {
-      rawUsage = event.data.usage
-    } else {
-      continue
-    }
-    const step = childStep(event.data, event.type)
-    const sample = {
-      seq: seqUsable ? seq : null,
-      ordinal,
-      buckets: childUsageBuckets(rawUsage),
-    }
-    const previous = usageByStep.get(step.key)
-    if (
-      previous === undefined
-      || (sample.seq !== null && previous.seq !== null && sample.seq > previous.seq)
-      || ((sample.seq === null || previous.seq === null) && sample.ordinal > previous.ordinal)
-    ) {
-      usageByStep.set(step.key, sample)
-    }
-  }
-
-  const usage = {
-    input_tokens: 0,
-    cached_input_tokens: 0,
-    output_tokens: 0,
-    total_tokens: 0,
-  }
-  for (const {buckets} of usageByStep.values()) {
-    for (const [key, increment] of Object.entries(buckets)) {
-      usage[key] = safeTokenCount(usage[key] + increment, `aggregate ${key}`)
-    }
-  }
-
+  const conversation = conversationUsageEvidence(events)
   const terminalReason = lifecycle.terminal?.data?.reason
   const terminalMatches = lifecycle.terminal !== null
     && terminalStopReason(terminalReason) === result.stopReason
@@ -576,7 +952,7 @@ function childEvidence(agent, result) {
     && Array.isArray(result.output)
     && result.output.length === 0
     && result.structured === undefined
-    && usageByStep.size === 0
+    && conversation.meteredSteps.size === 0
     && lifecycle.turnStarts.length === 1
     && lifecycle.stepStarts.length === 1
     && lifecycle.stepEnds.length === 1
@@ -598,7 +974,6 @@ function childEvidence(agent, result) {
       && startStep.step === endStep.step
       && turnEnd.data.turn === startStep.turn
       && lifecycle.terminal === turnEnd
-      && turnEnd.seq === events.length - 1
       && finish.type === 'assistant/chunk'
       && finish.data?.turn === startStep.turn
       && finish.data?.step === startStep.step
@@ -620,7 +995,7 @@ function childEvidence(agent, result) {
     && providerFailure.status === 429
     && Array.isArray(result.output)
     && result.structured === undefined
-    && usage.total_tokens > 0
+    && conversation.usage.total_tokens > 0
     && lifecycle.turnStarts[0].data?.trigger?.kind !== 'retry'
     && lifecycle.retryEvents.length === 0
     && lifecycle.stepStarts.length > 1
@@ -638,8 +1013,8 @@ function childEvidence(agent, result) {
       .filter(event => DSH_STEP_SCOPED_EVENT_TYPES.has(event?.type))
     const finish = terminalStepEvents[0]
     knownTerminalStepQuota = priorSteps.length > 0
-      && priorSteps.every(key => usageByStep.has(key))
-      && !usageByStep.has(startStep.key)
+      && priorSteps.every(key => conversation.meteredSteps.has(key))
+      && !conversation.meteredSteps.has(startStep.key)
       && priorAssistantOutput !== null
       && sameJson(result.output, priorAssistantOutput)
       && terminalStepEvents.length === 1
@@ -649,7 +1024,6 @@ function childEvidence(agent, result) {
       && startStep.step === endStep.step
       && turnEnd.data.turn === startStep.turn
       && lifecycle.terminal === turnEnd
-      && turnEnd.seq === events.length - 1
       && finish.type === 'assistant/chunk'
       && finish.data?.turn === startStep.turn
       && finish.data?.step === startStep.step
@@ -662,22 +1036,150 @@ function childEvidence(agent, result) {
   }
 
   const everyStartedStepMetered = lifecycle.startedSteps.length > 0
-    && lifecycle.startedSteps.every(key => usageByStep.has(key))
+    && lifecycle.startedSteps.every(key => conversation.meteredSteps.has(key))
   const knownQuota = knownPreUsageQuota || knownTerminalStepQuota
   const unprovenExactQuota = result.stopReason === 'error'
     && providerFailure?.code === 'QUOTA'
     && providerFailure.status === 429
     && !knownQuota
   return {
-    usage,
-    usageObserved: usageByStep.size > 0,
     usageComplete: lifecycle.valid
       && terminalMatches
+      && conversation.complete
       && (knownQuota || (everyStartedStepMetered && !unprovenExactQuota)),
     terminalMatches,
     providerFailure,
     knownQuota,
     knownTerminalStepQuota,
+    lifecycleValid: lifecycle.valid,
+    conversationUsage: conversation,
+  }
+}
+
+function adviserStopReason(agent) {
+  const events = agent?.session?.events
+  if (!Array.isArray(events)) return null
+  const terminal = [...events].reverse().find(event => event?.type === 'turn/end')
+  return terminalStopReason(terminal?.data?.reason)
+}
+
+function nativeSubagentEvidence(policy) {
+  const threadIds = [...policy.advisers.keys()]
+  const completed = [...policy.advisers.values()]
+    .filter(adviser => adviserStopReason(adviser.agent) === 'completed').length
+  return {
+    requested: policy.nativeSubagents,
+    spawned: threadIds.length,
+    completed,
+    thread_ids: threadIds,
+    status: policy.nativeSubagents === 0
+      ? 'not-requested'
+      : threadIds.length === 0
+        ? 'not-used'
+        : threadIds.length <= policy.nativeSubagents
+          ? 'observed'
+          : 'limit-exceeded',
+  }
+}
+
+function activationConversationEvidence(primaryEvidence, policy) {
+  const usage = {...primaryEvidence.conversationUsage.usage}
+  let complete = primaryEvidence.conversationUsage.complete
+  let advisersValid = true
+  for (const adviser of policy.advisers.values()) {
+    const stopReason = adviserStopReason(adviser.agent)
+    const evidence = childEvidence(adviser.agent, {
+      stopReason: stopReason ?? 'error',
+      output: [],
+    })
+    addUsage(usage, evidence.conversationUsage.usage)
+    complete = complete && evidence.conversationUsage.complete
+    advisersValid = advisersValid && stopReason === 'completed' && evidence.usageComplete
+  }
+  return {usage, complete, advisersValid}
+}
+
+function attachBudgetAttestation(receipt, ledgerEvidence) {
+  receipt.budget_charge_tokens = ledgerEvidence.chargedTokens
+  receipt.budget_charge_basis = DSH_BUDGET_CHARGE_BASIS
+  receipt.unmetered_attempts = ledgerEvidence.unmeteredAttempts
+  receipt.metered_attempt_tokens = ledgerEvidence.meteredAttemptTokens
+  receipt.unmetered_reservation_tokens = ledgerEvidence.unmeteredReservationTokens
+}
+
+function deniedMutationRequestSha256(execution) {
+  try {
+    const encoded = JSON.stringify(canonicalJson({
+      arguments: execution.arguments ?? null,
+      name: execution.name,
+    }))
+    if (typeof encoded !== 'string') return null
+    return createHash('sha256').update(encoded).digest('hex')
+  } catch {
+    return null
+  }
+}
+
+function deniedMutationAttempt(execution) {
+  if (!DSH_WRITE_TOOLS.includes(execution.name)) return null
+  if (typeof execution.callId !== 'string' || execution.callId.length === 0) return null
+  return {
+    toolName: execution.name,
+    toolCallId: execution.callId,
+    requestSha256: deniedMutationRequestSha256(execution),
+    valid: !DSH_CONTROL_CHARACTER.test(execution.callId)
+      && Buffer.byteLength(execution.callId, 'utf8') <= DSH_DENIED_MUTATION_CALL_ID_MAX_BYTES,
+  }
+}
+
+function durableToolResultIsError(event, callId) {
+  if (event?.type !== 'tool/result') return false
+  const message = event.data?.message
+  if (!isRecord(message) || !Array.isArray(message.content)) return false
+  if (message.source?.callId !== callId) return false
+  return message.content.some(block => (
+    isRecord(block)
+    && block.type === 'tool-result'
+    && block.toolCallId === callId
+    && block.isError === true
+  ))
+}
+
+function deniedMutationReceipt(events, denial) {
+  if (denial === null) return null
+  if (!denial.valid || denial.requestSha256 === null) return undefined
+  const calls = events.filter(event => (
+    event?.type === 'tool/call'
+    && event.data?.callId === denial.toolCallId
+    && event.data?.name === denial.toolName
+  ))
+  const results = events.filter(event => durableToolResultIsError(event, denial.toolCallId))
+  if (calls.length !== 1 || results.length !== 1) return undefined
+  const call = calls[0]
+  const result = results[0]
+  const callStep = childStepOrNull(call.data)
+  const resultStep = childStepOrNull(result.data)
+  if (
+    callStep === null
+    || resultStep === null
+    || callStep.key !== resultStep.key
+    || !Number.isSafeInteger(call.seq)
+    || !Number.isSafeInteger(result.seq)
+    || result.seq <= call.seq
+  ) {
+    return undefined
+  }
+  return {
+    schema_version: 1,
+    kind: 'dsh-denied-mutation',
+    source: 'dsh-host-tool-guard',
+    tool_name: denial.toolName,
+    tool_call_id: denial.toolCallId,
+    tool_call_seq: call.seq,
+    tool_result_seq: result.seq,
+    request_sha256: denial.requestSha256,
+    reason_code: 'mutation-policy-denied',
+    tool_executed: false,
   }
 }
 
@@ -829,9 +1331,18 @@ async function readOnlyActivation(value, workspace, missionPolicy) {
   if (!isRecord(value.options)) {
     throw new Error('DSH RPC activation options must be an object')
   }
+  const nativeSubagents = value.options.native_subagents ?? 0
+  if (
+    !Number.isSafeInteger(nativeSubagents)
+    || nativeSubagents < 0
+    || nativeSubagents > DSH_MAX_NATIVE_SUBAGENTS
+  ) {
+    throw new Error(`DSH activation native_subagents must be an integer from 0 through ${DSH_MAX_NATIVE_SUBAGENTS}`)
+  }
   if (value.schema !== undefined && !isRecord(value.schema)) {
     throw new Error('DSH RPC activation schema must be an object')
   }
+  const activationBudget = exactActivationBudget(value.activation_budget)
   const timeoutSeconds = value.timeout_seconds ?? DSH_MAX_ACTIVATION_TIMEOUT_SECONDS
   if (
     typeof timeoutSeconds !== 'number'
@@ -905,7 +1416,9 @@ async function readOnlyActivation(value, workspace, missionPolicy) {
     outputSchema: value.schema === undefined ? undefined : jsonClone(value.schema, 'DSH output schema'),
     timeoutSeconds,
     modelRole,
+    nativeSubagents,
     transactionArtifacts,
+    activationBudget,
   }
 }
 
@@ -977,9 +1490,37 @@ function transactionWritePathProblem(workspace, lexicalWorkspace, transactionArt
   return undefined
 }
 
-function readOnlyChildGuard(workspace, lexicalWorkspace, activation, execution) {
-  if (execution.name === DSH_STRUCTURED_OUTPUT_TOOL) return undefined
+function readOnlyChildGuard(workspace, lexicalWorkspace, activation, policy, execution) {
+  const primary = execution.agent === policy.primaryAgent
+  if (execution.name === DSH_STRUCTURED_OUTPUT_TOOL) {
+    return primary ? undefined : 'KerSor DSH advisers must return analysis as their ordinary final answer'
+  }
+  if (execution.name === DSH_ADVISER_TOOL) {
+    if (!primary) return 'KerSor DSH advisers cannot delegate'
+    if (activation.nativeSubagents === 0) return 'KerSor DSH activation did not request native advisers'
+    if (!isRecord(execution.arguments) || execution.arguments.run_in_background === true) {
+      return 'KerSor DSH advisers are Host-settled foreground calls and cannot request background execution'
+    }
+    const callId = String(execution.callId ?? '')
+    if (!callId) return 'KerSor DSH adviser delegation requires a stable tool call id'
+    if (!policy.adviserCallIds.has(callId)) {
+      if (policy.adviserCallIds.size >= activation.nativeSubagents) {
+        return 'KerSor DSH activation already requested its full native adviser budget'
+      }
+      policy.adviserCallIds.add(callId)
+    }
+    return undefined
+  }
   if (DSH_WRITE_TOOLS.includes(execution.name)) {
+    if (!primary) return `KerSor DSH adviser denies mutation tool ${JSON.stringify(execution.name)}`
+    if (
+      policy.advisers.size !== activation.nativeSubagents
+      || [...policy.advisers.values()].some(
+        adviser => adviserStopReason(adviser.agent) !== 'completed',
+      )
+    ) {
+      return 'KerSor DSH primary worker must finish every requested read-only adviser before writing'
+    }
     if (activation.transactionArtifacts.length === 0) {
       return `KerSor DSH-native read-only activation denies tool ${JSON.stringify(execution.name)}`
     }
@@ -1038,7 +1579,7 @@ function readOnlyChildGuard(workspace, lexicalWorkspace, activation, execution) 
   return pathInsideWorkspace(workspace, lexicalWorkspace, searchPath, `${execution.name}.path`)
 }
 
-function installChildToolGuidance(agent, transactionArtifacts) {
+function installChildToolGuidance(agent, transactionArtifacts, nativeSubagents = 0) {
   for (const name of ['glob', 'grep']) {
     const definition = agent.ctx.tools.get(name, agent)
     if (definition === undefined) {
@@ -1048,6 +1589,15 @@ function installChildToolGuidance(agent, transactionArtifacts) {
       ...definition,
       description: `${definition.description} ${DSH_ROOT_SEARCH_GUIDANCE}`,
     }))
+  }
+  if (nativeSubagents > 0) {
+    const definition = agent.ctx.tools.get(DSH_ADVISER_TOOL, agent)
+    if (definition === undefined) {
+      throw new Error('KerSor DSH activation requested advisers but the subagent tool is unavailable')
+    }
+    if (isRecord(definition.parameters) && Object.hasOwn(definition.parameters, 'run_in_background')) {
+      throw new Error('KerSor DSH preset must disable background subagent execution at the tool owner')
+    }
   }
   if (transactionArtifacts.length === 0) return
   const artifactList = JSON.stringify(transactionArtifacts.map(artifact => artifact.relative))
@@ -1065,18 +1615,21 @@ function installChildToolGuidance(agent, transactionArtifacts) {
 
 function activationSignal(parent, timeoutSeconds) {
   const controller = new AbortController()
+  let timedOut = false
   const onAbort = () => controller.abort(
     parent.reason instanceof Error ? parent.reason : new Error('KerSor DSH activation cancelled'),
   )
   parent.addEventListener('abort', onAbort, {once: true})
   if (parent.aborted) onAbort()
-  const timer = setTimeout(
-    () => controller.abort(new Error(`KerSor DSH activation timed out after ${timeoutSeconds}s`)),
-    timeoutSeconds * 1_000,
-  )
+  const timer = setTimeout(() => {
+    if (controller.signal.aborted) return
+    timedOut = true
+    controller.abort(new Error(`KerSor DSH activation timed out after ${timeoutSeconds}s`))
+  }, timeoutSeconds * 1_000)
   timer.unref?.()
   return {
     signal: controller.signal,
+    get timedOut() { return timedOut },
     dispose() {
       clearTimeout(timer)
       parent.removeEventListener('abort', onAbort)
@@ -1084,18 +1637,51 @@ function activationSignal(parent, timeoutSeconds) {
   }
 }
 
-async function executeDshActivation(ctx, parent, workspace, lexicalWorkspace, missionPolicy, activationValue, hostSignal) {
+async function executeDshActivation(
+  ctx,
+  parent,
+  workspace,
+  lexicalWorkspace,
+  missionPolicy,
+  activationValue,
+  hostSignal,
+  budgetRuntime,
+) {
   const activation = await readOnlyActivation(activationValue, workspace, missionPolicy)
   const operation = activationSignal(hostSignal, activation.timeoutSeconds)
-  const policy = {
-    guardedAgents: new Set(),
-    guard: execution => readOnlyChildGuard(workspace, lexicalWorkspace, activation, execution),
-    transactionArtifacts: activation.transactionArtifacts,
-  }
+  let policy
   let run
+  let cleanupPromise = null
   try {
+    policy = {
+      guardedAgents: new Set(),
+      deniedMutation: null,
+      transactionArtifacts: activation.transactionArtifacts,
+      nativeSubagents: activation.nativeSubagents,
+      primaryAgent: null,
+      advisers: new Map(),
+      adviserCallIds: new Set(),
+      activationAgents: new Map(),
+      ledger: budgetRuntime.create({
+        activationBudget: activation.activationBudget,
+        signal: operation.signal,
+      }),
+    }
+    policy.guard = execution => {
+      const problem = readOnlyChildGuard(
+        workspace,
+        lexicalWorkspace,
+        activation,
+        policy,
+        execution,
+      )
+      if (problem !== undefined && policy.deniedMutation === null) {
+        policy.deniedMutation = deniedMutationAttempt(execution)
+      }
+      return problem
+    }
     run = await CHILD_POLICY.run(policy, () => ctx.subagents.start('spawn', {
-      label: activation.label,
+      label: `KerSor · ${activation.label}`,
       prompt: activation.prompt,
       parent,
       signal: operation.signal,
@@ -1104,11 +1690,13 @@ async function executeDshActivation(ctx, parent, workspace, lexicalWorkspace, mi
       toolFilter: {allow: [
         ...DSH_READ_TOOLS,
         ...(activation.transactionArtifacts.length > 0 ? DSH_WRITE_TOOLS : []),
+        ...(activation.nativeSubagents > 0 ? [DSH_ADVISER_TOOL] : []),
       ]},
     }))
     if (!run?.localAgent || !policy.guardedAgents.has(run.localAgent)) {
       throw new Error('DSH spawn did not publish a locally guarded child')
     }
+    budgetRuntime.assertBound(policy, run.localAgent)
     if (
       run.localAgent.options?.provider !== DSH_PROVIDER
       || run.localAgent.options?.model !== DSH_MODEL
@@ -1121,7 +1709,35 @@ async function executeDshActivation(ctx, parent, workspace, lexicalWorkspace, mi
     }
     const threadId = String(run.id ?? run.localAgent.id ?? '')
     if (!threadId) throw new Error('DSH spawn did not publish a child thread id')
+    cleanupPromise = budgetRuntime.close(policy, run)
+    await cleanupPromise
     const evidence = childEvidence(run.localAgent, result)
+    const conversationEvidence = activationConversationEvidence(evidence, policy)
+    const nativeSubagents = nativeSubagentEvidence(policy)
+    const ledgerEvidence = policy.ledger.snapshot()
+    const budgetTerminalMatches = ledgerEvidence.denial !== null
+      && result.stopReason === 'error'
+      && evidence.providerFailure?.code === DSH_TOKEN_BUDGET_FINISH_CODE
+      && evidence.providerFailure.message === DSH_TOKEN_BUDGET_ERROR_MESSAGE
+    const usageComplete = (evidence.usageComplete || (
+      budgetTerminalMatches && evidence.lifecycleValid
+    ))
+      && conversationEvidence.complete
+      && conversationEvidence.advisersValid
+      && ledgerEvidence.usageComplete
+      && sameUsage(conversationEvidence.usage, ledgerEvidence.conversationUsage)
+    const upperBoundCoveredUsage = !usageComplete
+      && ledgerEvidence.unmeteredAttempts > 0
+      && !ledgerEvidence.poisoned
+      && evidence.lifecycleValid
+      && sameUsage(conversationEvidence.usage, ledgerEvidence.conversationUsage)
+      && ledgerEvidence.meteredAttemptTokens <= ledgerEvidence.usage.total_tokens
+      && ledgerEvidence.unmeteredReservationTokens
+        >= ledgerEvidence.usage.total_tokens - ledgerEvidence.meteredAttemptTokens
+      && ledgerEvidence.chargedTokens === ledgerEvidence.meteredAttemptTokens
+        + ledgerEvidence.unmeteredReservationTokens
+      && ledgerEvidence.chargedTokens >= ledgerEvidence.usage.total_tokens
+      && ledgerEvidence.chargedTokens <= activation.activationBudget.limitTokens
     const receipt = {
       output: jsonClone(
         evidence.knownTerminalStepQuota ? [] : (result.output ?? []),
@@ -1131,9 +1747,9 @@ async function executeDshActivation(ctx, parent, workspace, lexicalWorkspace, mi
         ? null
         : jsonClone(result.structured, 'DSH child structured output'),
       stop_reason: result.stopReason,
-      usage: evidence.usage,
-      usage_observed: evidence.usageObserved,
-      usage_complete: evidence.usageComplete,
+      usage: ledgerEvidence.usage,
+      usage_observed: ledgerEvidence.usageObserved,
+      usage_complete: usageComplete,
       thread_id: threadId,
       provider: DSH_PROVIDER,
       model: DSH_MODEL,
@@ -1141,10 +1757,76 @@ async function executeDshActivation(ctx, parent, workspace, lexicalWorkspace, mi
       isolation: 'fresh-dsh-subagent',
       artifacts: [],
     }
+    if (
+      nativeSubagents.spawned !== activation.nativeSubagents
+      || nativeSubagents.completed !== activation.nativeSubagents
+      || nativeSubagents.status === 'limit-exceeded'
+    ) {
+      throw dshActivationError(
+        'DSH_NATIVE_SUBAGENTS_INCOMPLETE',
+        'DSH primary worker did not complete the exact requested native adviser set',
+        receipt,
+      )
+    }
     if (!evidence.terminalMatches) {
       throw dshActivationError(
         'DSH_CHILD_EVIDENCE_INVALID',
         'DSH child result did not match its durable terminal',
+        receipt,
+      )
+    }
+    if (operation.timedOut) {
+      if (result.stopReason !== 'aborted') {
+        throw dshActivationError(
+          'DSH_CHILD_EVIDENCE_INVALID',
+          'DSH timed-out child did not publish an aborted terminal',
+          receipt,
+        )
+      }
+      receipt.output = []
+      receipt.structured = null
+      throw dshActivationError(
+        'DSH_CHILD_TIMEOUT',
+        'DSH child activation timed out',
+        receipt,
+      )
+    }
+    if (ledgerEvidence.denial !== null) {
+      const failure = evidence.providerFailure
+      if (!usageComplete) {
+        throw dshActivationError(
+          'DSH_CHILD_USAGE_INCOMPLETE',
+          'DSH child did not publish complete observed token usage',
+          receipt,
+        )
+      }
+      if (
+        result.stopReason !== 'error'
+        || failure?.code !== DSH_TOKEN_BUDGET_FINISH_CODE
+        || failure.message !== DSH_TOKEN_BUDGET_ERROR_MESSAGE
+      ) {
+        throw dshActivationError(
+          'DSH_CHILD_EVIDENCE_INVALID',
+          'DSH child token budget denial did not match its durable terminal',
+          receipt,
+        )
+      }
+      receipt.output = []
+      receipt.structured = null
+      receipt.artifacts = [{
+        schema_version: 1,
+        kind: 'dsh-activation-budget-exhausted',
+        source: 'dsh-host-llm-stream-ledger',
+        reason_code: 'insufficient-context-window-reservation',
+        limit_tokens: ledgerEvidence.denial.limitTokens,
+        charged_tokens: ledgerEvidence.chargedTokens,
+        remaining_tokens: ledgerEvidence.denial.limitTokens - ledgerEvidence.chargedTokens,
+        required_reservation_tokens: ledgerEvidence.denial.requiredReservationTokens,
+        provider_request_started: false,
+      }]
+      throw dshActivationError(
+        DSH_TOKEN_BUDGET_ERROR_CODE,
+        DSH_TOKEN_BUDGET_ERROR_MESSAGE,
         receipt,
       )
     }
@@ -1157,6 +1839,30 @@ async function executeDshActivation(ctx, parent, workspace, lexicalWorkspace, mi
         providerFailure,
       )
     }
+    if (!usageComplete && (!upperBoundCoveredUsage || policy.deniedMutation !== null)) {
+      if (policy.deniedMutation !== null) {
+        receipt.output = []
+        receipt.structured = null
+      }
+      if (upperBoundCoveredUsage) attachBudgetAttestation(receipt, ledgerEvidence)
+      throw dshActivationError(
+        'DSH_CHILD_USAGE_INCOMPLETE',
+        'DSH child did not publish complete observed token usage',
+        receipt,
+      )
+    }
+    const mutationReceipt = deniedMutationReceipt(run.localAgent.session.events, policy.deniedMutation)
+    if (policy.deniedMutation !== null && mutationReceipt === undefined) {
+      throw dshActivationError(
+        'DSH_CHILD_EVIDENCE_INVALID',
+        'DSH denied mutation did not match one durable failed tool result',
+        receipt,
+      )
+    }
+    // A durable error result proves the guard rejected the call before the
+    // mutation tool ran. Keep that failed attempt in the DSH conversation, but
+    // do not discard a later valid candidate merely because the model recovered
+    // from an unavailable helper or scratch-file request.
     if (activation.outputSchema !== undefined && result.structured === undefined) {
       throw dshActivationError(
         'DSH_CHILD_RESULT_INVALID',
@@ -1164,17 +1870,15 @@ async function executeDshActivation(ctx, parent, workspace, lexicalWorkspace, mi
         receipt,
       )
     }
-    if (!evidence.usageComplete) {
-      throw dshActivationError(
-        'DSH_CHILD_USAGE_INCOMPLETE',
-        'DSH child did not publish complete observed token usage',
-        receipt,
-      )
-    }
+    attachBudgetAttestation(receipt, ledgerEvidence)
+    receipt.native_subagents = nativeSubagents
     return receipt
   } finally {
     try {
-      if (run !== undefined) await run.dispose()
+      if (policy !== undefined) {
+        cleanupPromise ??= budgetRuntime.close(policy, run)
+        await cleanupPromise
+      }
     } finally {
       operation.dispose()
     }
@@ -1549,7 +2253,16 @@ async function contractRuntime(contract, workspace, requestedRuntime) {
   return selected
 }
 
-async function createDshRpcHost({ctx, parent, workspace, lexicalWorkspace, runtime, missionPolicy, signal}) {
+async function createDshRpcHost({
+  ctx,
+  parent,
+  workspace,
+  lexicalWorkspace,
+  runtime,
+  missionPolicy,
+  signal,
+  budgetRuntime,
+}) {
   const directory = await mkdtemp(path.join(runtime.temp, 'k-'))
   await chmod(directory, 0o700)
   const socketPath = path.join(directory, 's')
@@ -1576,6 +2289,7 @@ async function createDshRpcHost({ctx, parent, workspace, lexicalWorkspace, runti
       let requestId = 'unknown'
       const connection = new AbortController()
       let activationSettled = false
+      let onTrailingData = null
       const onHostAbort = () => connection.abort(
         controller.signal.reason instanceof Error
           ? controller.signal.reason
@@ -1586,9 +2300,15 @@ async function createDshRpcHost({ctx, parent, workspace, lexicalWorkspace, runti
       }
       controller.signal.addEventListener('abort', onHostAbort, {once: true})
       if (controller.signal.aborted) onHostAbort()
+      socket.once('end', onDisconnect)
       socket.once('close', onDisconnect)
       try {
         const request = parseRpcRequest(await readRpcFrame(socket), nonce)
+        onTrailingData = () => connection.abort(
+          new Error('DSH RPC connection carried bytes after its request frame'),
+        )
+        socket.on('data', onTrailingData)
+        socket.resume()
         requestId = request.request_id
         const result = await executeDshActivation(
           ctx,
@@ -1598,6 +2318,7 @@ async function createDshRpcHost({ctx, parent, workspace, lexicalWorkspace, runti
           missionPolicy,
           request.activation,
           connection.signal,
+          budgetRuntime,
         )
         activationSettled = true
         await writeRpcFrame(socket, {
@@ -1638,6 +2359,8 @@ async function createDshRpcHost({ctx, parent, workspace, lexicalWorkspace, runti
       } finally {
         activationSettled = true
         controller.signal.removeEventListener('abort', onHostAbort)
+        if (onTrailingData !== null) socket.removeListener('data', onTrailingData)
+        socket.removeListener('end', onDisconnect)
         socket.removeListener('close', onDisconnect)
       }
     })()
@@ -1693,17 +2416,17 @@ async function createDshRpcHost({ctx, parent, workspace, lexicalWorkspace, runti
   }
 }
 
-async function topLevelWorkspace(exec) {
-  if (exec.agent === undefined) throw new Error('kersor_evolve requires a calling DSH agent')
-  if (exec.agent.session.header.origin === 'subagent') {
+async function topLevelWorkspace(agent) {
+  if (agent === undefined) throw new Error('kersor_evolve requires a calling DSH agent')
+  if (agent.session.header.origin === 'subagent') {
     throw new Error('kersor_evolve is available only in a top-level DSH conversation')
   }
-  const cwd = exec.agent.session.header.cwd
+  const cwd = agent.session.header.cwd
   if (typeof cwd !== 'string' || !cwd) throw new Error('kersor_evolve requires a DSH workspace')
   return {
     workspace: await realpath(cwd),
     lexicalWorkspace: path.resolve(cwd),
-    session: exec.agent.session,
+    session: agent.session,
   }
 }
 
@@ -1726,6 +2449,11 @@ function executionTurn(session, exec) {
   return toolCallTurn(session, exec.rootCallId)
 }
 
+function isEvolveLaunchEvent(event) {
+  return (event?.type === 'tool/call' && event.data?.name === 'kersor_evolve')
+    || (event?.type === 'command/run' && event.data?.name === COMMAND_NAME)
+}
+
 function hasPriorEvolveCall(session, exec) {
   const events = Array.isArray(session?.events) ? session.events : []
   const currentCallIds = new Set([exec.callId, exec.rootCallId].filter(value => value !== undefined))
@@ -1738,9 +2466,7 @@ function hasPriorEvolveCall(session, exec) {
     }
   }
   if (currentIndex < 0) return false
-  return events.slice(0, currentIndex).some(event => (
-    event?.type === 'tool/call' && event.data?.name === 'kersor_evolve'
-  ))
+  return events.slice(0, currentIndex).some(isEvolveLaunchEvent)
 }
 
 function claimSession(session, exec) {
@@ -1754,6 +2480,27 @@ function claimSession(session, exec) {
   }
   CLAIMED_SESSIONS.add(session)
   CLAIMED_TURNS.set(session, turn)
+}
+
+function commandRunIndex(session, commandId) {
+  const events = Array.isArray(session?.events) ? session.events : []
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event?.type === 'command/run' && event.data?.commandId === commandId) return index
+  }
+  return -1
+}
+
+function claimCommandSession(session, commandId) {
+  if (!isRecord(session)) throw new Error('kersor_evolve requires a stable DSH session')
+  const currentIndex = commandRunIndex(session, commandId)
+  if (currentIndex < 0) throw new Error('kersor_evolve could not bind its DSH command lifecycle')
+  const events = session.events
+  const prior = events.slice(0, currentIndex).some(isEvolveLaunchEvent)
+  if (CLAIMED_SESSIONS.has(session) || prior) {
+    throw new Error('kersor_evolve permits only one launch per top-level DSH session; retry in a new session')
+  }
+  CLAIMED_SESSIONS.add(session)
 }
 
 function claimedTurnGuard(exec) {
@@ -1805,7 +2552,147 @@ function optionalRunDir(value, workspace, resume) {
   return normalized
 }
 
-export function createTool({ctx, timeoutMs = DEFAULT_TIMEOUT_MS} = {}) {
+function optionalPredecessorRun(value, workspace, resume) {
+  if (value === undefined) return null
+  if (resume) throw new Error('kersor_evolve predecessor_run cannot be combined with resume')
+  if (typeof value !== 'string' || !path.isAbsolute(value)) {
+    throw new Error('kersor_evolve predecessor_run must be an absolute path')
+  }
+  const normalized = path.resolve(value)
+  if (!inside(workspace, normalized)) {
+    throw new Error('kersor_evolve predecessor_run must stay inside the current DSH workspace')
+  }
+  return normalized
+}
+
+function commandArguments(rawInput) {
+  let value
+  try {
+    value = JSON.parse(String(rawInput ?? '').trim())
+  } catch (cause) {
+    throw new Error('/kersor-evolve requires one JSON object', {cause})
+  }
+  if (!isRecord(value)) throw new Error('/kersor-evolve requires one JSON object')
+  const allowed = new Set(['contract', 'runtime', 'run_dir', 'resume', 'predecessor_run'])
+  if (Object.keys(value).some(key => !allowed.has(key))) {
+    throw new Error('/kersor-evolve JSON contains an unsupported field')
+  }
+  if (typeof value.contract !== 'string' || !value.contract) {
+    throw new Error('/kersor-evolve JSON requires contract')
+  }
+  if (value.runtime !== 'dsh') {
+    throw new Error('/kersor-evolve runtime must be dsh')
+  }
+  if (value.resume !== undefined && typeof value.resume !== 'boolean') {
+    throw new Error('/kersor-evolve resume must be boolean')
+  }
+  for (const key of ['run_dir', 'predecessor_run']) {
+    if (value[key] !== undefined && typeof value[key] !== 'string') {
+      throw new Error(`/kersor-evolve ${key} must be a string`)
+    }
+  }
+  return value
+}
+
+async function executeEvolve(args, {
+  ctx,
+  budgetRuntime,
+  agent,
+  signal,
+  timeoutMs,
+}) {
+  const {workspace, lexicalWorkspace} = await topLevelWorkspace(agent)
+  const contract = await contractPath(args.contract, workspace, args.runtime)
+  const resume = args.resume === true
+  const runDir = optionalRunDir(args.run_dir, workspace, resume)
+  const predecessorRun = optionalPredecessorRun(args.predecessor_run, workspace, resume)
+  const runtime = await installedRuntime(workspace)
+  const selectedContract = await contractRuntime(contract, workspace, args.runtime)
+  if (selectedContract.runtime === 'dsh' && !ctx?.subagents) {
+    throw new Error('runtime=dsh requires the DSH subagent Host service')
+  }
+  if (selectedContract.runtime === 'dsh' && !budgetRuntime) {
+    throw new Error('runtime=dsh requires the DSH activation token budget Host')
+  }
+  const argv = [
+    runtime.bridge,
+    'evolve',
+    '--host-execution',
+    '--contract',
+    contract,
+    ...(args.runtime === undefined ? [] : ['--runtime', args.runtime]),
+    '--expected-contract-sha256',
+    selectedContract.sha256,
+  ]
+  if (typeof selectedContract.runtime === 'string') {
+    argv.push('--expected-runtime', selectedContract.runtime)
+  }
+  if (runDir !== null) argv.push('--run-dir', runDir)
+  if (predecessorRun !== null) argv.push('--predecessor-run', predecessorRun)
+  if (resume) argv.push('--resume')
+  let rpc = null
+  let completed
+  try {
+    if (selectedContract.runtime === 'dsh') {
+      rpc = await createDshRpcHost({
+        ctx,
+        parent: agent,
+        workspace,
+        lexicalWorkspace,
+        runtime,
+        missionPolicy: selectedContract.missionPolicy,
+        signal,
+        budgetRuntime,
+      })
+    }
+    const process = runHostProcess({
+      command: runtime.python,
+      args: argv,
+      cwd: workspace,
+      environment: rpc === null ? hostEnvironment(runtime) : dshHostEnvironment(runtime, rpc),
+      signal: rpc === null ? signal : rpc.signal,
+      // DSH owns per-activation and evaluator deadlines. One Core run may
+      // contain several, so a process-wide watchdog would kill a valid later
+      // round and discard its transaction.
+      timeoutMs: selectedContract.runtime === 'dsh' ? null : timeoutMs,
+    })
+    if (rpc === null) {
+      completed = await process
+    } else {
+      try {
+        completed = await Promise.race([process, rpc.failure])
+      } catch (error) {
+        await Promise.allSettled([process])
+        throw error
+      }
+    }
+  } finally {
+    if (rpc !== null) await rpc.close()
+  }
+  let terminal
+  try {
+    terminal = parseTerminalJson(completed.stdout)
+  } catch (cause) {
+    const detail = String(completed.stderr || completed.stdout || `exit ${completed.code}`).trim().slice(-4_096)
+    throw new Error(
+      `KerSor Host bridge failed with exit ${completed.code}: ${cause.message}; ${detail}`,
+      {cause},
+    )
+  }
+  const expectedExit = terminal.status === 'completed' ? 0 : 2
+  if (completed.code !== expectedExit) {
+    throw new Error(
+      `KerSor Host bridge returned ${terminal.status} with exit ${completed.code}; expected ${expectedExit}`,
+    )
+  }
+  return terminal
+}
+
+export function createTool({
+  ctx,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  budgetRuntime = ctx?.[DSH_BUDGET_RUNTIME],
+} = {}) {
   return {
     name: 'kersor_evolve',
     description: 'Run exactly one frozen kersor-task-v1 or kersor-mission-v1 contract through the Host-owned KerSor launcher. A Mission stays inside the top-level DSH workspace; a fixed Task may use the canonical parent task.json whose declared workspace is the current workspace. This call owns the rest of the turn.',
@@ -1817,6 +2704,7 @@ export function createTool({ctx, timeoutMs = DEFAULT_TIMEOUT_MS} = {}) {
         runtime: {type: 'string', enum: ['dsh'], description: 'Required DSH Host override for a fixed Task whose portable contract names another default runtime.'},
         run_dir: {type: 'string', description: 'Optional absolute existing Mission run directory for explicit resume.'},
         resume: {type: 'boolean', description: 'Resume exactly run_dir. Defaults to false.'},
+        predecessor_run: {type: 'string', description: 'Optional terminal Fixed Task run whose immutable candidate snapshot seeds one fresh successor run.'},
       },
       required: ['contract'],
     },
@@ -1836,88 +2724,17 @@ export function createTool({ctx, timeoutMs = DEFAULT_TIMEOUT_MS} = {}) {
       presentationMeta: (_args, value) => ({status: value.status}),
     },
     async execute(args, exec) {
-      const {workspace, lexicalWorkspace, session} = await topLevelWorkspace(exec)
-      const contract = await contractPath(args.contract, workspace, args.runtime)
+      const {workspace, session} = await topLevelWorkspace(exec.agent)
+      await contractPath(args.contract, workspace, args.runtime)
       claimSession(session, exec)
       try {
-        const resume = args.resume === true
-        const runDir = optionalRunDir(args.run_dir, workspace, resume)
-        const runtime = await installedRuntime(workspace)
-        const selectedContract = await contractRuntime(contract, workspace, args.runtime)
-        if (selectedContract.runtime === 'dsh' && !ctx?.subagents) {
-          throw new Error('runtime=dsh requires the DSH subagent Host service')
-        }
-        const argv = [
-          runtime.bridge,
-          'evolve',
-          '--host-execution',
-          '--contract',
-          contract,
-          ...(args.runtime === undefined ? [] : ['--runtime', args.runtime]),
-          '--expected-contract-sha256',
-          selectedContract.sha256,
-        ]
-        if (typeof selectedContract.runtime === 'string') {
-          argv.push('--expected-runtime', selectedContract.runtime)
-        }
-        if (runDir !== null) argv.push('--run-dir', runDir)
-        if (resume) argv.push('--resume')
-        let rpc = null
-        let completed
-        try {
-          if (selectedContract.runtime === 'dsh') {
-            rpc = await createDshRpcHost({
-              ctx,
-              parent: exec.agent,
-              workspace,
-              lexicalWorkspace,
-              runtime,
-              missionPolicy: selectedContract.missionPolicy,
-              signal: exec.signal,
-            })
-          }
-          const process = runHostProcess({
-            command: runtime.python,
-            args: argv,
-            cwd: workspace,
-            environment: rpc === null ? hostEnvironment(runtime) : dshHostEnvironment(runtime, rpc),
-            signal: rpc === null ? exec.signal : rpc.signal,
-            // DSH owns a bounded timeout for every activation and Host
-            // evaluator, while one Core run may contain several of them. A
-            // competing process-wide watchdog would kill and roll back a
-            // valid later round. Keep cancellation and output bounds here,
-            // but leave elapsed-time custody with those bounded operations.
-            timeoutMs: selectedContract.runtime === 'dsh' ? null : timeoutMs,
-          })
-          if (rpc === null) {
-            completed = await process
-          } else {
-            try {
-              completed = await Promise.race([process, rpc.failure])
-            } catch (error) {
-              await Promise.allSettled([process])
-              throw error
-            }
-          }
-        } finally {
-          if (rpc !== null) await rpc.close()
-        }
-        let terminal
-        try {
-          terminal = parseTerminalJson(completed.stdout)
-        } catch (cause) {
-          const detail = String(completed.stderr || completed.stdout || `exit ${completed.code}`).trim().slice(-4_096)
-          throw new Error(
-            `KerSor Host bridge failed with exit ${completed.code}: ${cause.message}; ${detail}`,
-            {cause},
-          )
-        }
-        const expectedExit = terminal.status === 'completed' ? 0 : 2
-        if (completed.code !== expectedExit) {
-          throw new Error(
-            `KerSor Host bridge returned ${terminal.status} with exit ${completed.code}; expected ${expectedExit}`,
-          )
-        }
+        const terminal = await executeEvolve(args, {
+          ctx,
+          budgetRuntime,
+          agent: exec.agent,
+          signal: exec.signal,
+          timeoutMs,
+        })
         exec.concludeTurn()
         return terminal
       } catch (error) {
@@ -1938,16 +2755,60 @@ export function createTool({ctx, timeoutMs = DEFAULT_TIMEOUT_MS} = {}) {
   }
 }
 
+export function createCommand({
+  ctx,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  budgetRuntime = ctx?.[DSH_BUDGET_RUNTIME],
+} = {}) {
+  return {
+    name: COMMAND_NAME,
+    engagesSession: true,
+    description: 'Run one frozen KerSor contract directly through the Host without a model request.',
+    input: {hint: '{"contract":"/absolute/task.json","runtime":"dsh"}'},
+    async handler(invocation) {
+      const args = commandArguments(invocation.rawInput)
+      const {workspace, session} = await topLevelWorkspace(invocation.agent)
+      await contractPath(args.contract, workspace, args.runtime)
+      claimCommandSession(session, invocation.commandId)
+      const terminal = await executeEvolve(args, {
+        ctx,
+        budgetRuntime,
+        agent: invocation.agent,
+        signal: invocation.signal,
+        timeoutMs,
+      })
+      const text = JSON.stringify(terminal)
+      return terminal.status === 'completed'
+        ? {kind: 'success', text}
+        : {kind: 'error', text}
+    },
+  }
+}
+
 export function apply(ctx) {
+  const budgetRuntime = createDshBudgetRuntime(ctx)
+  Object.defineProperty(ctx, DSH_BUDGET_RUNTIME, {
+    value: budgetRuntime,
+    configurable: true,
+  })
   ctx.tools.guard(claimedTurnGuard)
   ctx.on('agent/created', ({agent}) => {
-    const policy = CHILD_POLICY.getStore()
+    const policy = CHILD_POLICY.getStore() ?? budgetRuntime.policyFor(agent)
     if (policy === undefined) return
+    const role = budgetRuntime.bind(policy, agent)
+    if (role === 'adviser') {
+      agent.ctx.tools.restrict({allow: [...DSH_READ_TOOLS]})
+    }
     agent.ctx.tools.guard(policy.guard)
-    installChildToolGuidance(agent, policy.transactionArtifacts)
+    installChildToolGuidance(
+      agent,
+      role === 'primary' ? policy.transactionArtifacts : [],
+      role === 'primary' ? policy.nativeSubagents : 0,
+    )
     policy.guardedAgents.add(agent)
-  })
-  ctx.tools.register(createTool({ctx}))
+  }, {global: true})
+  ctx.tools.register(createTool({ctx, budgetRuntime}))
+  ctx.commands.register(createCommand({ctx, budgetRuntime}))
 }
 
 export const __test = Object.freeze({
