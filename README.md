@@ -224,6 +224,21 @@ parent 代写、字段不规范、integration pattern 漂移或 seal 后修改�
 
 已经冻结合同的通用任务不需要先请求模型决定是否启动。在 composer 直接输入 `/kersor-evolve {"contract":"/absolute/path/to/task.json","runtime":"dsh"}`；DSH human-command plane 会在同一 Session 记录 `command/run` 与 `command/done`，并直接进入相同的 Host launcher。模型可见的 `kersor_evolve` tool 继续服务于自然语言任务先由 agent 冻结合同时的兼容路径。两条入口共享验证、RPC、预算与唯一 Session claim，不形成第二个执行实现。
 
+长程实验不要依赖调用终端或聊天回合的前台 PTY。使用 durable launcher 把整个 DSH
+CLI 放进独立 process session，并保存 PID、日志与合同 hash receipt：
+
+```bash
+python3 scripts/launch-task.py \
+  --node /absolute/path/to/node \
+  --dsh-cli /absolute/path/to/dsh/apps/cli/lib/bin.js \
+  --dsh-home /absolute/path/to/.dsh \
+  --contract /absolute/path/to/task.json
+```
+
+默认 receipt 与日志保存在 Task workspace 的 `.kersor-launches/`。这只改变进程
+生命周期 owner；模型 route、Host verifier、transaction、handoff 文档与 candidate gate
+仍走同一条 `kersor_evolve` 实现。
+
 通用任务与优化控制面是两条独立路径。自然语言通用请求由 agent 先只读分析工作区，再把最小权限、Completion 和既有确定性 verifier 冻结到工作区内的 `kersor-task-v1` 或 `kersor-mission-v1`。固定 Task 和 Mission 的 DSH-native 路径都由 Host 侧 `kersor_evolve` 接管；只有用户明确要求外部 Codex Task 时才保留 workspace-confined bridge 与外层写权限证明。`kersor_evolve` 必须是该回合第一且唯一执行动作；它从安装目录冻结 Python 和 bridge、以前台进程处理取消和有界输出，只接受当前顶层 DSH 工作区内的绝对合同路径，或固定 Task 的规范同级 `task.json`，并只返回唯一 JSON terminal。DSH 的每次 activation 和 Host evaluator 分别拥有自己的有界超时；canonical DSH activation 的默认值与上限均为 3600 秒（60 分钟），Host evaluator 仍保持独立的最多 120 秒上限。外层进程不再叠加一个会在后续 round 中误杀正常 Core 工作流的静态短 watchdog。一次有效调用会接管本回合：同一回合中模型已提交的后续工具也由单调 guard 在执行前拒绝；非取消异常被投影为 `status=failed` 业务终态并结束回合，不能由模型改写合同后重试。DSH 的 `turn/end=completed` 只表示该模型回合已结束；只有 `kersor_evolve` 的 Host-owned status 与 Core 终态证据均为 `completed` 时才算成功。DSH Host 还会从受信 Core activation 的规范 phase 推导 `planner`／`worker` 角色，拒绝调用方自报角色，避免成本与轨迹统计错标。外壳启动会 fail closed，避免继承调用 agent 的嵌套 Seatbelt；安装记录的 KerSor core 也必须物理位于工作区外，Host tool 与 bridge 会分别复核。安装器会把当时可信的 Bash／Python／Node／jq 以及 Codex／Claude 可执行文件绝对路径、可选的 Codex auth home 路径写入 preset 私有清单（不复制凭据）；generic bridge 仍会完整校验安装记录 checkout、合同 hash、runtime config、Session 身份与权限。材料化器可以把匹配的可信 runtime config 复制到任务目录，但 bridge 只接受与对应安装配置逐字节相同、常规、单链接且 inode 独立的副本，并在 launch 时再次绑定预期 SHA-256。
 
 Fixed Task 正常终态会由 Core 在 run 内保存不可变 `candidate-snapshot/`。Suite reset 后，新 Session 可在 slash-command JSON 或 tool args 中增加 `"predecessor_run":"/absolute/workspace/.kersor/<run>"`，创建 fresh successor；Host 会验证旧 Task、output、manifest 与 blob 后恢复候选，旧 run 保持只读。`resume:true` 仍只恢复同一个中断 run，不能与 `predecessor_run` 同时使用。
