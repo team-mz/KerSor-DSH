@@ -1999,6 +1999,90 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self.assertIsNone(result["telemetry"]["guards"]["edit"])
         self.assertIsNone(result["telemetry"]["guards"]["write"])
 
+    def test_public_host_runs_fixed_task_with_dynamic_incumbent_gate(self) -> None:
+        self.prepare_dsh_native_core()
+        candidate = self.workspace / "candidate.py"
+        candidate.write_text("baseline = True\n", encoding="utf-8")
+        verifier_request = {
+            "protocol": "command-v1",
+            "argv": ["python3", "../verifier/verify.py", "--candidate-gate"],
+            "cwd": ".",
+            "artifacts": [candidate.name],
+            "timeout_seconds": 1200,
+            "replay": False,
+        }
+        contract = self.root / "task.json"
+        contract_value = {
+                "contract_version": "kersor-task-v1",
+                "workspace": "workspace",
+                "runtime": "codex",
+                "objective": "improve one correct candidate",
+                "max_rounds": 2,
+                "native_subagents": 0,
+                "activation_phase": "Evolve 1",
+                "activation_label": "evolve-1",
+                "activation_options": {"transaction": {
+                    "artifacts": [candidate.name],
+                    "rollback_on_noncompleted_status": True,
+                    "candidate_gate": {
+                        "verifier": "task-incumbent",
+                        "request": verifier_request,
+                        "result_artifact": "incumbent-verifier-result",
+                        "fact_projections": [{
+                            "output_name": "candidate_score",
+                            "result_path": "stdout_json.promotion_score",
+                        }],
+                        "commit_projection": {
+                            "result_path": "stdout_json.promotion_score",
+                            "op": "lt",
+                            "value": 1332,
+                        },
+                    },
+                }},
+                "verifier": {
+                    "argv": ["python3", "../verifier/verify.py"],
+                    "cwd": ".",
+                    "artifacts": [candidate.name],
+                    "feedback": "declared",
+                    "timeout_seconds": 1200,
+                    "incumbent": {
+                        "result_path": "stdout_json.promotion_score",
+                        "direction": "minimize",
+                        "gate_argv": verifier_request["argv"],
+                    },
+                },
+            }
+        contract.write_text(
+            json.dumps(contract_value),
+            encoding="utf-8",
+        )
+
+        result = self.invoke_dsh_native(
+            contract,
+            runtime="dsh",
+            transaction_artifact=candidate,
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["value"]["status"], "completed", result)
+        self.assertEqual(len(result["telemetry"]["starts"]), 1)
+        self.assertIsNone(result["telemetry"]["guards"]["edit"])
+        self.assertIsNone(result["telemetry"]["guards"]["write"])
+
+        contract_value["activation_options"]["transaction"]["candidate_gate"][
+            "commit_projection"
+        ]["value"] = "1332"
+        contract.write_text(json.dumps(contract_value), encoding="utf-8")
+        rejected = self.invoke_dsh_native(
+            contract,
+            runtime="dsh",
+            transaction_artifact=candidate,
+        )
+        self.assertTrue(rejected["ok"], rejected.get("error"))
+        self.assertEqual(rejected["value"]["status"], "failed")
+        self.assertIn("candidate gate does not match", rejected["value"]["error"])
+        self.assertEqual(rejected["telemetry"]["starts"], [])
+
     def test_public_host_runs_exact_read_only_advisers_under_one_activation_ledger(self) -> None:
         self.prepare_dsh_native_core()
         candidate = self.workspace / "candidate.py"

@@ -1232,6 +1232,25 @@ function sameJson(left, right) {
   return JSON.stringify(canonicalJson(left)) === JSON.stringify(canonicalJson(right))
 }
 
+function candidateGateMatches(transactionPolicy, observed) {
+  if (!isRecord(observed)) return false
+  if (transactionPolicy.dynamicCommitValue !== true) {
+    return sameJson(observed, transactionPolicy.candidateGate)
+  }
+  if (
+    !isRecord(observed.commit_projection)
+    || typeof observed.commit_projection.value !== 'number'
+    || !Number.isFinite(observed.commit_projection.value)
+  ) return false
+  return sameJson(
+    {
+      ...observed,
+      commit_projection: {...observed.commit_projection, value: null},
+    },
+    transactionPolicy.candidateGate,
+  )
+}
+
 function safeTransactionArtifact(value) {
   if (typeof value !== 'string' || !value || path.isAbsolute(value)) return false
   const segments = value.split(/[\\/]+/u)
@@ -1397,8 +1416,7 @@ async function readOnlyActivation(value, workspace, missionPolicy) {
     const declared = rollbackMatches.find(item => (
       item.candidateGate === null
         ? !hasCandidateGate
-        : hasCandidateGate && isRecord(transaction.candidate_gate)
-          && sameJson(transaction.candidate_gate, item.candidateGate)
+        : hasCandidateGate && candidateGateMatches(item, transaction.candidate_gate)
     ))
     if (declared === undefined) {
       throw new Error('DSH activation candidate gate does not match the Mission evaluator contract')
@@ -2041,13 +2059,66 @@ async function contractRuntime(contract, workspace, requestedRuntime) {
     if (artifacts.some(runtimeControlArtifact)) {
       throw new Error('runtime=dsh Task artifacts must not target KerSor runtime control paths')
     }
+    const incumbent = verifier.incumbent
+    let candidateGate = null
+    let dynamicCommitValue = false
+    let rollbackOnNoncompletedStatus
+    if (incumbent !== undefined && incumbent !== null) {
+      if (
+        !isRecord(incumbent)
+        || typeof incumbent.result_path !== 'string'
+        || !incumbent.result_path
+        || !['minimize', 'maximize'].includes(incumbent.direction)
+        || !Array.isArray(verifier.argv)
+        || verifier.argv.length === 0
+        || verifier.argv.some(item => typeof item !== 'string')
+        || (incumbent.gate_argv !== undefined && (
+          !Array.isArray(incumbent.gate_argv)
+          || incumbent.gate_argv.length === 0
+          || incumbent.gate_argv.some(item => typeof item !== 'string')
+        ))
+      ) {
+        throw new Error('runtime=dsh Task verifier.incumbent is invalid')
+      }
+      const resultPath = incumbent.result_path
+      const request = {
+        protocol: 'command-v1',
+        argv: [...(incumbent.gate_argv ?? verifier.argv)],
+        cwd: verifier.cwd || '.',
+        artifacts: [...artifacts],
+        ...(verifier.timeout_seconds === undefined
+          ? {}
+          : {timeout_seconds: verifier.timeout_seconds}),
+        ...(verifier.max_output_bytes === undefined
+          ? {}
+          : {max_output_bytes: verifier.max_output_bytes}),
+        replay: false,
+      }
+      candidateGate = {
+        verifier: 'task-incumbent',
+        request,
+        result_artifact: 'incumbent-verifier-result',
+        fact_projections: [{
+          output_name: 'candidate_score',
+          result_path: resultPath,
+        }],
+        commit_projection: {
+          result_path: resultPath,
+          op: incumbent.direction === 'minimize' ? 'lt' : 'gt',
+          value: null,
+        },
+      }
+      dynamicCommitValue = true
+      rollbackOnNoncompletedStatus = true
+    }
     selected.missionPolicy = {
       kind: 'task',
       transactions: [{
         artifacts: [...artifacts],
         verifier: null,
-        candidateGate: null,
-        rollbackOnNoncompletedStatus: undefined,
+        candidateGate,
+        dynamicCommitValue,
+        rollbackOnNoncompletedStatus,
       }],
       protectedFiles,
       protectedRoots: [],
