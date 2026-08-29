@@ -353,6 +353,7 @@ function sameUsage(left, right) {
 }
 
 function exactActivationBudget(value) {
+  if (value === undefined || value === null) return null
   if (!isRecord(value)) throw new Error('DSH RPC activation activation_budget must be an object')
   const keys = Object.keys(value).sort()
   if (
@@ -443,6 +444,10 @@ class DshActivationTokenLedger {
     while (true) {
       if (this.poisoned) return {kind: 'closed'}
       if (this.closed) return {kind: this.denial === null ? 'closed' : 'denied'}
+      if (this.limitTokens === null) {
+        this.inFlight += 1
+        return {kind: 'admitted', reservedTokens: 0}
+      }
       const unreserved = this.limitTokens - this.chargedTokens - this.reservedTokens
       if (unreserved >= requiredTokens) {
         this.reservedTokens += requiredTokens
@@ -602,7 +607,10 @@ function createDshBudgetRuntime(ctx) {
         const complete = valid
           && finishCount === 1
           && (knownZeroQuota || (
-            usage !== null && usage.total_tokens <= reservation.reservedTokens
+            usage !== null && (
+              ledger.limitTokens === null
+              || usage.total_tokens <= reservation.reservedTokens
+            )
           ))
         ledger.settle(reservation, {
           usage: knownZeroQuota ? null : usage,
@@ -615,7 +623,7 @@ function createDshBudgetRuntime(ctx) {
   return {
     create({activationBudget, signal}) {
       return new DshActivationTokenLedger({
-        limitTokens: activationBudget.limitTokens,
+        limitTokens: activationBudget?.limitTokens ?? null,
         signal,
       })
     },
@@ -1744,7 +1752,8 @@ async function executeDshActivation(
       && conversationEvidence.advisersValid
       && ledgerEvidence.usageComplete
       && sameUsage(conversationEvidence.usage, ledgerEvidence.conversationUsage)
-    const upperBoundCoveredUsage = !usageComplete
+    const upperBoundCoveredUsage = activation.activationBudget !== null
+      && !usageComplete
       && ledgerEvidence.unmeteredAttempts > 0
       && !ledgerEvidence.poisoned
       && evidence.lifecycleValid
@@ -1857,7 +1866,11 @@ async function executeDshActivation(
         providerFailure,
       )
     }
-    if (!usageComplete && (!upperBoundCoveredUsage || policy.deniedMutation !== null)) {
+    if (
+      activation.activationBudget !== null
+      && !usageComplete
+      && (!upperBoundCoveredUsage || policy.deniedMutation !== null)
+    ) {
       if (policy.deniedMutation !== null) {
         receipt.output = []
         receipt.structured = null
@@ -1888,7 +1901,9 @@ async function executeDshActivation(
         receipt,
       )
     }
-    attachBudgetAttestation(receipt, ledgerEvidence)
+    if (activation.activationBudget !== null) {
+      attachBudgetAttestation(receipt, ledgerEvidence)
+    }
     receipt.native_subagents = nativeSubagents
     return receipt
   } finally {

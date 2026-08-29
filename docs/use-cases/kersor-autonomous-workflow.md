@@ -39,8 +39,8 @@ For a fixed Task, `native_subagents: 1..4` lets the primary worker ask that many
 independent read-only advisers for analysis before it writes. The installed
 KerSor preset disables background execution at DSH's `tool-subagent` owner, so
 the model-facing tool contains only `description` and `prompt`; the Host waits
-for every adviser, shares one activation budget across the tree, and keeps the
-primary as the sole writer and integrator.
+for every adviser and keeps the primary as the sole writer and integrator. If a
+caller explicitly declares an activation budget, the complete tree shares it.
 
 A rejected out-of-scope mutation is non-terminal only when the durable DSH
 history proves that the guard returned an error and the mutation tool never

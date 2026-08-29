@@ -1709,7 +1709,6 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         (config / "runtime-dsh-autonomous.json").write_text(
             json.dumps({
                 "contract_version": "akw-js-runtime-v1",
-                "budget": {"total_tokens": 1000},
                 "broker": {
                     "type": "dsh-host-rpc",
                     "protocol": "kersor-dsh-host-rpc-v3",
@@ -2274,10 +2273,20 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         self.assertIn("timeout_seconds must be in (0, 3600]", rejected["value"]["error"])
         self.assertEqual(rejected["telemetry"]["starts"], [])
 
-    def test_public_host_requires_exact_activation_budget_before_child_start(self) -> None:
+    def test_public_host_allows_omitted_activation_budget_and_rejects_malformed_ones(self) -> None:
         self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("unbounded-activation")
+        value = json.loads(contract.read_text(encoding="utf-8"))
+        value["omit_activation_budget"] = True
+        contract.write_text(json.dumps(value), encoding="utf-8")
+        accepted = self.invoke_dsh_native(contract)
+        self.assertTrue(accepted["ok"], accepted.get("error"))
+        receipt = accepted["value"]["dsh_result"]
+        self.assertEqual(accepted["value"]["status"], "completed")
+        self.assertNotIn("budget_charge_tokens", receipt)
+        self.assertEqual(accepted["telemetry"]["provider_calls"], 1)
+
         for mutation in (
-            {"omit_activation_budget": True},
             {"activation_budget_override": {
                 "limit_tokens": 1000,
                 "basis": "remaining-workflow-budget",
@@ -2304,6 +2313,29 @@ class KerSorEvolvePluginTests(unittest.TestCase):
                 self.assertIn("activation_budget", response["error"]["message"])
                 self.assertEqual(result["telemetry"]["starts"], [])
                 self.assertEqual(result["telemetry"]["provider_calls"], 0)
+
+    def test_unbounded_activation_keeps_incomplete_usage_observational(self) -> None:
+        self.prepare_dsh_native_core()
+        contract = self.write_dsh_failure_contract("unbounded-incomplete-usage")
+        value = json.loads(contract.read_text(encoding="utf-8"))
+        value["omit_activation_budget"] = True
+        contract.write_text(json.dumps(value), encoding="utf-8")
+
+        result = self.invoke_dsh_native(
+            contract,
+            child_mode="ledger-missing-usage",
+            llm_calls=[{"session_id": "child", "chunks": [
+                {"type": "finish", "reason": {"kind": "stop"}},
+            ]}],
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        receipt = result["value"]["dsh_result"]
+        self.assertEqual(result["value"]["status"], "completed")
+        self.assertFalse(receipt["usage_observed"])
+        self.assertFalse(receipt["usage_complete"])
+        self.assertNotIn("budget_charge_tokens", receipt)
+        self.assertEqual(result["telemetry"]["provider_calls"], 1)
 
     def test_public_host_requires_registration_bound_prepared_stream_seam(self) -> None:
         self.prepare_dsh_native_core()

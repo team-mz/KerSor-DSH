@@ -207,32 +207,15 @@ evaluator whose full request, rollback policy, and candidate gate match the
 frozen Mission; Core runs it while the snapshot is live and commits only an
 accepted candidate. Every activation still uses the owner-only AF_UNIX endpoint
 and a fresh DSH `spawn` child pinned to `deepseek-official/kimi-k2.7-code`.
-`kersor-dsh-host-rpc-v3` requires Core to supply one exact finite
-`activation_budget`. Before provider I/O, the Host admits only calls observed at
-DSH's registration-bound `llm/prepared-stream` seam and reserves the exact
-dispatch context window. DSH adapter registration is the sole owner of that
-window, and this nonce-authenticated personal Host is the budget-metering TCB;
-Core does not duplicate or rederive registration context. Primary-worker and
-adviser requests, retries, automatic title generation, and compaction for every
-Session in the bounded activation tree share one cumulative ledger. A retry step
-adds every provider attempt; a non-retry step uses its final message usage or
-single usage chunk. Missing or malformed usage retains the full reservation and
-marks episode usage incomplete, but does not itself close admission: a
-DSH-owned retry may start only when another exact context reservation fits. The
-Host may return a later successful child output only when every provider attempt
-is covered by either actual usage or its exact reservation and the conservative
-sum remains within the activation budget. That v3 receipt keeps
-`usage_complete=false` and exposes `budget_charge_tokens`, the fixed
-`dsh-host-attested-actual-or-registration-context-reservation-v1` basis, and a positive
-`unmetered_attempts`. `metered_attempt_tokens` and
-`unmetered_reservation_tokens` are the Host attestation. Core validates their
-arithmetic, observed-usage coverage, positive-window lower bound, and activation
-cap; it does not independently prove the registration-owned context. The receipt
-never relabels a reservation as actual usage. Route or
-context-integrity failures still close the ledger immediately. If the next context
-reservation does not fit, no provider call starts and the Host returns
-`DSH_CHILD_TOKEN_BUDGET_EXHAUSTED`; per-request `maxTokens` is not an episode
-budget.
+`kersor-dsh-host-rpc-v3` permits Core to omit `activation_budget`. The Host still
+binds provider calls at DSH's registration-owned `llm/prepared-stream` seam and
+records usage, but incomplete usage remains observational and does not reject a
+completed worker output. When Core explicitly supplies a positive activation
+budget, primary-worker and adviser requests, retries, automatic title generation,
+and compaction share the existing cumulative reservation ledger; its upper-bound
+receipt and typed `DSH_CHILD_TOKEN_BUDGET_EXHAUSTED` semantics remain unchanged.
+Route or context-integrity failures still fail closed in both modes, and
+per-request `maxTokens` is not an episode budget.
 
 If the synchronous guard denies the first `edit` or `write`, a later completed
 child does not turn that denial into success. The Host requires one same-step

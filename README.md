@@ -180,7 +180,8 @@ KerSor preset 在 DSH 原生 `tool-subagent` 配置处关闭后台能力，因�
 拒绝证据仍会 fail closed。
 所有 Agent 的 provider attempts 共用同一个 activation ledger，成功 receipt
 必须列出精确的 requested/spawned/completed 数量与 adviser Session ids。Host
-verifier、事务边界和总 token budget 不因多 Agent 而放宽。
+verifier 与事务边界不因多 Agent 而放宽；若调用方显式声明 token budget，整棵
+adviser 树继续共享同一个有限预算。
 
 不要把 CUDA Workflow 硬套到 Python、VLIW、Verilog 或普通工程任务。任务类型不匹配时，稳定 `optimize` 路径应先确定性拒绝不兼容的已发布 Workflow，再通过有界 workflow authoring 创作 task-native Proposal；workflow evolution 只属于显式 research runner。任务自己的测试命令始终是唯一验收门。
 
@@ -231,9 +232,9 @@ Fixed Task 正常终态会由 Core 在 run 内保存不可变 `candidate-snapsho
 
 Host evaluator 必须使用 `command-v1` 的 `filesystem_policy: "read-only"`、`network_policy: "denied"`、`output_policy: "sealed"`，可选 timeout 必须在 `(0,120]`，可选输出上限必须在 `[1,4194304]`，且不得 `materialize`。安全的 standalone evaluator 由 Core 直接执行；若 agent capability 通过 `candidate_verifier` 引用 evaluator，该 evaluator 才额外要求不可重试、精确的 Host-owned 输出以及与候选事务逐字段绑定的 gate，多个候选 capability 可以共享同一个 evaluator。fact projection 也只能读取 `passed`、`exit_code`、`timed_out` 或 `artifact_set_sha256`，不能投影 stdout／stderr／解析输出。其 argv 与所有后代进程会进入 fail-closed 的真实只读文件系统边界。外部 `runtime=codex|claude` 继续使用这些规则；Claude-compatible 路径只接受 KerSor canonical `config/runtime-claude-autonomous.json`，并依据 capability/transaction artifacts 在精确只读工具集与精确 mutation 工具集之间切换。
 
-DSH-native Mission 接受 `side_effect=none|read`，也接受由 Mission authority 准入、Core 活事务绑定的单文件 `side_effect=write` capability。Planner 与只读 worker 只看见 `read/glob/grep`；事务 Execute worker 才额外获得只指向声明 artifact 的 `edit/write`。路径别名、链接、控制树、Bash、delegation、Workflow 与递归 KerSor 都被拒绝，candidate verifier 仍由 Core 在活快照内执行并决定提交或回滚。`kersor-dsh-host-rpc-v3` 还要求精确有限的 `activation_budget`：Host 只在 DSH registration-bound `llm/prepared-stream` seam 准入 provider 请求，按 actual dispatch 的 exact context window 预留，并把 main request、retry、自动 title 与 compaction 全部计入同一 child ledger。Retry step 累计每次 provider attempt；非 retry step 使用最终 message usage 或唯一 usage chunk。缺失／畸形 usage 不会冒充 actual usage，而是保留该 attempt 的完整 exact reservation 并继续限制后续准入。若 child 最终成功，且每个 attempt 都由 actual usage 或 reservation 覆盖、总 upper-bound charge 不超过 activation budget，Host 可继续提交 output；v3 receipt 同时保留 `usage_complete=false`，并暴露 `budget_charge_tokens`、固定 `dsh-host-attested-actual-or-registration-context-reservation-v1` basis 与正数 `unmetered_attempts`。Route／context integrity 失败仍立即 fail closed；下一次 reservation 放不下时会在 provider I/O 前返回 typed `DSH_CHILD_TOKEN_BUDGET_EXHAUSTED`。Typed `DSH_CHILD_QUOTA` 与 denied mutation 的严格门禁不变。每个顶层 DSH session 仍只能调用一次 `kersor_evolve`。
+DSH-native Mission 接受 `side_effect=none|read`，也接受由 Mission authority 准入、Core 活事务绑定的单文件 `side_effect=write` capability。Planner 与只读 worker 只看见 `read/glob/grep`；事务 Execute worker 才额外获得只指向声明 artifact 的 `edit/write`。路径别名、链接、控制树、Bash、delegation、Workflow 与递归 KerSor 都被拒绝，candidate verifier 仍由 Core 在活快照内执行并决定提交或回滚。`kersor-dsh-host-rpc-v3` 允许省略 `activation_budget`：Host 仍在 registration-bound `llm/prepared-stream` seam 绑定模型 route 并记录 usage，但 usage 缺失或不完整只作为证据，不会否决 completed output。若调用方显式声明正数预算，v3 继续按 actual dispatch context window 为 main request、retry、自动 title 与 compaction 预留，并保留原有 upper-bound charge 与 typed exhaustion 语义。Route／context integrity、Typed `DSH_CHILD_QUOTA` 与 denied mutation 的严格门禁不变。每个顶层 DSH session 仍只能调用一次 `kersor_evolve`。
 
-DSH adapter registration 是 dispatch context window 的唯一 owner，经 nonce 认证的 personal Host 是预算计量 TCB；Core 不复制或重新推导 registration context。V3 receipt 的 `metered_attempt_tokens` 与 `unmetered_reservation_tokens` 是 Host attestation：Core 只校验两者之和等于 charge、reservation 覆盖未归入完整 attempt 的已观测 actual usage、正 context window 下界，以及 activation cap。若 denied mutation 发生时 actual usage 不完整，Host 会清空 output、保留真实 `stop_reason=completed`，并返回精确 `DSH_CHILD_USAGE_INCOMPLETE`；Core 将其作为不可纠正的 remote failure 处理，不进入 permission corrective round。
+显式有限预算下，DSH adapter registration 是 dispatch context window 的唯一 owner，经 nonce 认证的 personal Host 是预算计量 TCB；Core 不复制或重新推导 registration context。V3 receipt 的 `metered_attempt_tokens` 与 `unmetered_reservation_tokens` 是 Host attestation，Core 校验其 charge、coverage 与 activation cap。预算省略时不生成该 attestation，usage completeness 仅作观测；denied mutation 仍由 durable tool-result 与事务边界独立判定。
 
 同步 guard 拒绝首个 `edit`／`write` 时，即使 child 随后报告 completed，Host 也只在同一
 step 找到唯一 durable failed `tool/result` 后生成不含路径的

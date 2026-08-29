@@ -38,7 +38,8 @@ DSH Chat
 固定 Task 可用 `native_subagents: 1..4` 让 primary Worker 在写入前向指定数量的
 独立只读顾问征询分析。安装后的 KerSor preset 在 DSH `tool-subagent` 的权威配置处
 关闭后台执行，因此模型侧工具只包含 `description` 与 `prompt`；Host 等待所有顾问
-结束，整棵树共用一个 activation budget，并保持 primary 是唯一写入者和集成者。
+结束，并保持 primary 是唯一写入者和集成者。若调用方显式声明 activation budget，
+整棵树共同使用该预算。
 
 越界写入只有在 DSH 持久历史证明 Guard 已返回错误、mutation tool 从未执行时才是
 非终止错误。失败调用仍显示在对话里，但之后对声明 artifact 的合法修改仍可交给

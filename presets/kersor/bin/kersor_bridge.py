@@ -618,8 +618,10 @@ def validated_mission_id(value: dict[str, Any]) -> str:
 
 
 def validate_finite_runtime_budget(config: dict[str, Any]) -> None:
-    """Require one finite positive Host-accounted token budget."""
+    """Validate a token budget when one is explicitly configured."""
     budget = config.get("budget")
+    if budget is None:
+        return
     total_tokens = budget.get("total_tokens") if isinstance(budget, dict) else None
     if (
         isinstance(total_tokens, bool)
@@ -628,7 +630,7 @@ def validate_finite_runtime_budget(config: dict[str, Any]) -> None:
         or total_tokens <= 0
     ):
         raise RuntimeError(
-            "generic evolve runtime config must declare a finite positive token budget"
+            "generic evolve runtime token budget must be finite positive when present"
         )
 
 
