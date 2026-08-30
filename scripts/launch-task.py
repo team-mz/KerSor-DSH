@@ -49,6 +49,13 @@ def contract_workspace(contract: pathlib.Path) -> pathlib.Path:
     return workspace
 
 
+def canonical_run(path: pathlib.Path, label: str) -> pathlib.Path:
+    resolved = path.expanduser().resolve(strict=True)
+    if not resolved.is_dir() or resolved.is_symlink():
+        raise ValueError(f"{label} must be one canonical directory: {resolved}")
+    return resolved
+
+
 def atomic_json(path: pathlib.Path, value: dict[str, object]) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}")
     temporary.write_text(
@@ -64,6 +71,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--dsh-cli", type=pathlib.Path, required=True)
     result.add_argument("--dsh-home", type=pathlib.Path, required=True)
     result.add_argument("--contract", type=pathlib.Path, required=True)
+    continuation = result.add_mutually_exclusive_group()
+    continuation.add_argument("--predecessor-run", type=pathlib.Path)
+    continuation.add_argument("--resume-run", type=pathlib.Path)
     result.add_argument("--state-dir", type=pathlib.Path)
     result.add_argument("--ca-file", type=pathlib.Path, default=pathlib.Path("/etc/ssl/cert.pem"))
     return result
@@ -76,13 +86,23 @@ def main(argv: list[str] | None = None) -> int:
         dsh_cli = regular(options.dsh_cli, "DSH CLI")
         contract = regular(options.contract, "Task contract")
         workspace = contract_workspace(contract)
+        predecessor = (
+            canonical_run(options.predecessor_run, "predecessor run")
+            if options.predecessor_run is not None
+            else None
+        )
+        resume = (
+            canonical_run(options.resume_run, "resume run")
+            if options.resume_run is not None
+            else None
+        )
         dsh_home = options.dsh_home.expanduser().resolve(strict=True)
         if not dsh_home.is_dir():
             raise ValueError(f"DSH_HOME is not a directory: {dsh_home}")
         state_dir = (
             options.state_dir.expanduser().resolve()
             if options.state_dir is not None
-            else workspace / ".kersor-launches"
+            else dsh_home / "kersor-launches"
         )
         state_dir.mkdir(parents=True, exist_ok=True)
     except (OSError, ValueError) as exc:
@@ -94,6 +114,8 @@ def main(argv: list[str] | None = None) -> int:
     receipt_path = state_dir / f"{launch_id}.json"
     command = [
         str(node), str(dsh_cli), "--profile", "kersor", "evolve", str(contract),
+        *([] if predecessor is None else ["--predecessor-run", str(predecessor)]),
+        *([] if resume is None else ["--resume-run", str(resume)]),
     ]
     environment = os.environ.copy()
     environment["DSH_HOME"] = str(dsh_home)
@@ -129,6 +151,8 @@ def main(argv: list[str] | None = None) -> int:
             "workspace": str(workspace),
             "contract": str(contract),
             "contract_sha256": hashlib.sha256(contract.read_bytes()).hexdigest(),
+            "predecessor_run": None if predecessor is None else str(predecessor),
+            "resume_run": None if resume is None else str(resume),
             "dsh_home": str(dsh_home),
             "command": command,
             "log": str(log_path),

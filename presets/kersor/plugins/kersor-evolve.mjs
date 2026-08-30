@@ -1270,6 +1270,53 @@ function runtimeControlArtifact(value) {
   return ['.git', '.conformance', '.kersor', '.kersor-autonomous'].includes(head)
 }
 
+async function prepareAgentDocuments(workspace, value) {
+  if (value === undefined) return []
+  if (!Array.isArray(value) || new Set(value.map(item => item?.path)).size !== value.length) {
+    throw new Error('DSH activation documents must be a unique array')
+  }
+  const prepared = []
+  for (const document of value) {
+    if (
+      !isRecord(document)
+      || Object.keys(document).some(key => !['path', 'sha256'].includes(key))
+      || typeof document.path !== 'string'
+      || typeof document.sha256 !== 'string'
+      || !/^[0-9a-f]{64}$/u.test(document.sha256)
+    ) {
+      throw new Error('DSH activation document descriptor is invalid')
+    }
+    const segments = document.path.split(/[\\/]+/u)
+    if (
+      segments.length !== 4
+      || segments[0] !== '.kersor'
+      || segments[1] !== 'agent-documents'
+      || !/^[0-9a-f]{16}$/u.test(segments[2])
+      || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,126}\.md$/u.test(segments[3])
+    ) {
+      throw new Error('DSH activation document must use the Host agent-document namespace')
+    }
+    const absolute = path.resolve(workspace, ...segments)
+    const metadata = await lstat(absolute)
+    const physical = await realpath(absolute)
+    if (
+      !metadata.isFile()
+      || metadata.isSymbolicLink()
+      || metadata.nlink !== 1
+      || physical !== absolute
+      || !inside(workspace, physical)
+    ) {
+      throw new Error('DSH activation document identity is unsafe')
+    }
+    const bytes = await readFile(physical)
+    if (createHash('sha256').update(bytes).digest('hex') !== document.sha256) {
+      throw new Error('DSH activation document hash does not match its Host descriptor')
+    }
+    prepared.push({relative: document.path, absolute, physical, sha256: document.sha256})
+  }
+  return prepared
+}
+
 async function rejectSymlinkSegments(root, relative, label) {
   let current = root
   for (const segment of relative.split(path.sep)) {
@@ -1380,6 +1427,7 @@ async function readOnlyActivation(value, workspace, missionPolicy) {
     throw new Error(`DSH RPC activation timeout_seconds must be in (0, ${DSH_MAX_ACTIVATION_TIMEOUT_SECONDS}]`)
   }
   const modelRole = activationModelRole(value, missionPolicy)
+  const documents = await prepareAgentDocuments(workspace, value.options.documents)
   let transactionArtifacts = []
   const transaction = value.options.transaction
   if (transaction !== undefined && transaction !== null) {
@@ -1444,6 +1492,7 @@ async function readOnlyActivation(value, workspace, missionPolicy) {
     modelRole,
     nativeSubagents,
     transactionArtifacts,
+    documents,
     activationBudget,
   }
 }
@@ -1464,9 +1513,21 @@ function pathInsideWorkspace(workspace, lexicalWorkspace, value, label) {
   return undefined
 }
 
-function runtimeControlReadProblem(workspace, lexicalWorkspace, value, label) {
+function runtimeControlReadProblem(workspace, lexicalWorkspace, value, label, documents = []) {
   if (typeof value !== 'string' || !value.trim()) return `${label} must be a non-empty string`
   const lexical = path.resolve(lexicalWorkspace, value)
+  const allowedDocument = documents.find(document => (
+    value === document.relative
+    || value === document.absolute
+    || document.absolute === lexical
+  ))
+  if (allowedDocument !== undefined) {
+    try {
+      if (realpathSync(lexical) === allowedDocument.physical) return undefined
+    } catch {
+      // The ordinary existence diagnostic remains owned by pathInsideWorkspace.
+    }
+  }
   const lexicalRelative = path.relative(lexicalWorkspace, lexical)
   if (runtimeControlArtifact(lexicalRelative)) {
     return `${label} must not inspect a KerSor or repository runtime-control path`
@@ -1574,6 +1635,7 @@ function readOnlyChildGuard(workspace, lexicalWorkspace, activation, policy, exe
       lexicalWorkspace,
       execution.arguments.file_path,
       'read.file_path',
+      activation.documents,
     ) ?? pathInsideWorkspace(
       workspace,
       lexicalWorkspace,

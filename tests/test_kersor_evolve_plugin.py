@@ -158,6 +158,7 @@ const listeners = new Map()
 const telemetry = {
   starts: [],
   guards: {},
+  agent_document: request.agent_document ?? null,
   scoped_tool_descriptions: {},
   dispose_count: 0,
   provider_calls: 0,
@@ -1383,6 +1384,7 @@ const ctx = {
         grep_symlink_escape: {name: 'grep', arguments: {pattern: 'secret', path: request.escape_symlink}},
         glob_parent_pattern: {name: 'glob', arguments: {pattern: '../*'}},
         read_control: {name: 'read', arguments: {file_path: '.kersor/control.json'}},
+        read_document: {name: 'read', arguments: {file_path: request.agent_document}},
         glob_control: {name: 'glob', arguments: {pattern: '*', path: '.kersor'}},
         grep_control: {name: 'grep', arguments: {pattern: 'secret', path: '.kersor'}},
       }
@@ -1863,6 +1865,7 @@ class KerSorEvolvePluginTests(unittest.TestCase):
         prepared_stream_version: int | None = 1,
         invoke_command: bool = False,
         native_advisers: int = 0,
+        agent_document: str | None = None,
     ) -> dict[str, object]:
         request: dict[str, object] = {
             "module": str(self.module),
@@ -1905,6 +1908,8 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             request["prepared_stream_version"] = prepared_stream_version
         if invoke_command:
             request["invoke_command"] = True
+        if agent_document is not None:
+            request["agent_document"] = agent_document
         completed = subprocess.run(
             [NODE, "--input-type=module", "-e", DSH_NODE_DRIVER],
             input=json.dumps(request),
@@ -2829,6 +2834,51 @@ class KerSorEvolvePluginTests(unittest.TestCase):
             "output_tokens": 7,
             "total_tokens": 23,
         })
+
+    def test_public_host_allows_only_hash_bound_agent_document_reads(self) -> None:
+        self.prepare_dsh_native_core()
+        relative = ".kersor/agent-documents/0123456789abcdef/handoff.md"
+        document = self.workspace / relative
+        document.parent.mkdir(parents=True)
+        document.write_text("# Handoff\n\nHost evidence.\n", encoding="utf-8")
+        descriptor = {
+            "path": relative,
+            "sha256": hashlib.sha256(document.read_bytes()).hexdigest(),
+        }
+        contract = self.write_contract(
+            contract_version="kersor-mission-v1",
+            workspace=str(self.workspace),
+            session=str(self.workspace / ".kersor-autonomous" / "document-read"),
+            runtime="dsh",
+            activation_options={"documents": [descriptor]},
+            mission={
+                "mission_id": "document-read",
+                "goal": "read one Host handoff",
+                "authority": ["read workspace"],
+                "required_artifacts": [],
+                "required_facts": {},
+                "max_revisions": 1,
+            },
+            capabilities=[{"name": "inspect", "side_effect": "read"}],
+        )
+
+        result = self.invoke_dsh_native(
+            contract,
+            guard_probe=True,
+            agent_document=relative,
+        )
+
+        self.assertTrue(result["ok"], result.get("error"))
+        self.assertEqual(result["telemetry"]["agent_document"], relative, result)
+        self.assertIn("read_document", result["telemetry"]["guards"], result)
+        self.assertIsNone(result["telemetry"]["guards"]["read_document"])
+        self.assertIn("runtime-control", result["telemetry"]["guards"]["read_control"])
+
+        document.write_text("drifted\n", encoding="utf-8")
+        rejected = self.invoke_dsh_native(contract, agent_document=relative)
+        self.assertTrue(rejected["ok"], rejected.get("error"))
+        self.assertEqual(rejected["value"]["status"], "failed")
+        self.assertIn("document hash", rejected["value"]["error"])
 
     def test_public_host_projects_execute_phase_as_worker_role(self) -> None:
         self.prepare_dsh_native_core()

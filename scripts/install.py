@@ -54,6 +54,7 @@ STANDARD_SUBAGENT_ENTRY = (
     "      config:\n"
     "        provider: spawn\n"
     "        toolName: subagent\n"
+    "        modelSelectionSettings: true\n"
     "        backgroundMode: continuable"
 )
 KERSOR_SUBAGENT_ENTRY = (

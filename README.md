@@ -235,7 +235,30 @@ python3 scripts/launch-task.py \
   --contract /absolute/path/to/task.json
 ```
 
-默认 receipt 与日志保存在 Task workspace 的 `.kersor-launches/`。这只改变进程
+已结束的 Fixed Task 可以用不可变 candidate snapshot 启动 fresh successor：
+
+```bash
+python3 scripts/launch-task.py \
+  --node /absolute/path/to/node \
+  --dsh-cli /absolute/path/to/dsh/apps/cli/lib/bin.js \
+  --dsh-home /absolute/path/to/.dsh \
+  --contract /absolute/path/to/task.json \
+  --predecessor-run /absolute/workspace/.kersor/prior-run
+```
+
+异常中断的 run 可以从已验证 journal prefix 恢复：
+
+```bash
+python3 scripts/launch-task.py \
+  --node /absolute/path/to/node \
+  --dsh-cli /absolute/path/to/dsh/apps/cli/lib/bin.js \
+  --dsh-home /absolute/path/to/.dsh \
+  --contract /absolute/path/to/task.json \
+  --resume-run /absolute/workspace/.kersor/interrupted-run
+```
+
+默认 receipt 与日志保存在 DSH home 的 `kersor-launches/`，不向 Task workspace
+注入 Host 运行数据。这只改变进程
 生命周期 owner；模型 route、Host verifier、transaction、handoff 文档与 candidate gate
 仍走同一条 `kersor_evolve` 实现。
 

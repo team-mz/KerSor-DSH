@@ -51,6 +51,7 @@ STANDARD = """# The `standard` agent preset.
       config:
         provider: spawn
         toolName: subagent
+        modelSelectionSettings: true
         backgroundMode: continuable
 """
 
@@ -153,6 +154,7 @@ class InstallTests(unittest.TestCase):
         self.assertIn("name: '@deepseek-ai/dsh-kersor/control'", composition)
         self.assertIn("customSkillDirs:", composition)
         self.assertIn("enableRunInBackground: false", composition)
+        self.assertNotIn("modelSelectionSettings: true", composition)
         self.assertIn("backgroundMode: one-shot", composition)
         self.assertNotIn("backgroundMode: continuable", composition)
         self.assertIn(str((destination / "skills").resolve()), composition)
